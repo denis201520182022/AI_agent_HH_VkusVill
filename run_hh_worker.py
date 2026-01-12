@@ -567,7 +567,8 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list):
 
                 # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА ПАПКИ ИНТЕРВЬЮ ---
                 if folder_name == 'interview':
-                    if dialogue.dialogue_state != 'post_qualification_chat':
+                    # Добавляем проверку: не трогать, если это 'forwarded_to_researcher' или уже 'post_qualification_chat'
+                    if dialogue.dialogue_state not in ['post_qualification_chat', 'forwarded_to_researcher']:
                         logger.debug(f"[{response_id}] Обнаружен в папке 'interview'. Принудительный стейт: post_qualification_chat.")
                         dialogue.dialogue_state = 'post_qualification_chat'
                         
