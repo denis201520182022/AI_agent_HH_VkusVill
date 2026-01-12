@@ -1587,7 +1587,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     system_command = {
                         'message_id': f'sys_cmd_recheck_decline_{time.time()}',
                         'role': 'user',
-                        'content': '[SYSTEM COMMAND] Сейчас кандидат не отказывается от вакансии и анкетирования, продолжай дальше.'
+                        'content': '[SYSTEM COMMAND] Сейчас кандидат не отказывается от вакансии и анкетирования, не ставь declined_vacancy, продолжай анкету дальше.'
                     }
                     
                     dialogue.pending_messages = (dialogue.pending_messages or []) + [system_command]
