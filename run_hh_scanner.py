@@ -617,7 +617,7 @@ async def main(target_recruiter_ids=None): # Добавь аргумент
             await asyncio.gather(*[run_with_sem(r_id) for r_id in recruiter_ids])
             
             # Важно: пауза между циклами сканирования, чтобы не спамить API HH
-            await asyncio.sleep(30) 
+            await asyncio.sleep(0) 
     finally:
         await hh_api_real.close_api_client()
         await close_redis()

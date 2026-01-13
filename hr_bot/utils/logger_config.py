@@ -22,7 +22,7 @@ def setup_logging(log_filename: str):
 
     # Настраиваем корневой логгер
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.INFO)
+    root_logger.setLevel(logging.DEBUG)
 
     # Предотвращаем дублирование обработчиков, если функция вызовется повторно
     if root_logger.hasHandlers():
