@@ -86,148 +86,108 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
         return msk_dt.strftime('%Y-%m-%d %H:%M:%S MSK')
     except (ValueError, TypeError):
         return "время не определено"
-
-
-async def get_all_active_vacancies_for_recruiter(recruiter_id: int) -> list:
+async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSession) -> list: # <--- Добавили аргумент db
     """
-    Асинхронно получает список всех активных вакансий для рекрутера,
-    и синхронизирует их с локальной базой данных.
-    Использует кэш: если вакансии синхронизировались менее 10 минут назад, возвращает данные из БД.
+    Асинхронно получает список вакансий. Использует переданную сессию.
     """
-
     function_start_time = time.monotonic()
 
-    async with SessionLocal() as db:
-        try:
-            # Проверяем, нужно ли обновлять данные из API
-            now = datetime.datetime.now(datetime.timezone.utc)
-            cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
+    # УБРАЛИ async with SessionLocal() as db: — используем переданную db
 
-            # Получаем актуальный объект recruiter в этой сессии
-            current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
+    try:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
 
-            if not current_recruiter:
-                logger.error(f"Рекрутер с ID {recruiter_id} не найден в текущей сессии для синхронизации вакансий.")
-                return []
-            logger.debug(f"Получение и синхронизация списка активных вакансий для рекрутера {current_recruiter.name}...")
-            if current_recruiter.vacancies_last_synced_at:
-                time_since_sync = now - current_recruiter.vacancies_last_synced_at
+        # Получаем актуальный объект recruiter в ЭТОЙ (переданной) сессии
+        current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
-                if time_since_sync < cache_expiry_time:
-                    logger.debug(f"Используем кэшированные вакансии для рекрутера {current_recruiter.name}. "
-                                f"Последняя синхронизация: {time_since_sync.total_seconds() / 60:.1f} минут назад.")
-
-                    result = await db.execute(select(Vacancy).filter(
-                        Vacancy.recruiter_id == current_recruiter.id
-                    ))
-                    cached_vacancies = result.scalars().all()
-
-                    cached_vacancies_list = [
-                        {
-                            "id": vacancy.hh_vacancy_id,
-                            "name": vacancy.title,
-                            "area": {"name": vacancy.city} if vacancy.city else {}
-                        }
-                        for vacancy in cached_vacancies
-                    ]
-
-                    logger.debug(f"Возвращено {len(cached_vacancies_list)} вакансий из кэша для рекрутера {current_recruiter.name}.")
-                    return cached_vacancies_list
-
-            logger.debug(f"Кэш устарел или отсутствует. Получаем актуальные данные из API...")
-
-            api_request_start = time.monotonic()
-
-            me_data = await hh_api._make_request(current_recruiter, db, "GET", "me")
-            logger.debug(f"[Recruiter {current_recruiter.name}] API call 'me' took: {time.monotonic() - api_request_start:.2f} sec.")
-            if not me_data or not me_data.get('employer') or not me_data['employer'].get('id'):
-                logger.error(f"Не удалось получить employer_id для рекрутера {current_recruiter.name}.")
-                return []
-            employer_id = me_data['employer']['id']
-
-            all_vacancies_from_api = []
-            page = 0
-            while True:
-                api_request_page_start = time.monotonic()
-                vacancies_page = await hh_api._make_request(
-                    current_recruiter, db, "GET", f"employers/{employer_id}/vacancies/active",
-                    params={'page': page, 'per_page': 20}
-                )
-                logger.debug(f"[Recruiter {current_recruiter.name}] API call 'vacancies/active' page {page} took: {time.monotonic() - api_request_page_start:.2f} sec.")
-                if not vacancies_page or not vacancies_page.get('items'):
-                    break
-
-                all_vacancies_from_api.extend(vacancies_page['items'])
-
-                if page >= vacancies_page.get('pages', 1) - 1:
-                    break
-                page += 1
-
-            if not all_vacancies_from_api:
-                logger.info(f"У рекрутера {current_recruiter.name} сейчас нет активных вакансий. Запускаю очистку старых...")
-            else:
-                logger.info(f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...")
-
-            # Список ID вакансий, которые сейчас активны на HH
-            active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
-
-
-            for vacancy_data in all_vacancies_from_api:
-                hh_vacancy_id = str(vacancy_data.get("id"))
-
-                result = await db.execute(select(Vacancy).filter_by(hh_vacancy_id=hh_vacancy_id))
-                vacancy_in_db = result.scalar_one_or_none()
-
-                if not vacancy_in_db:
-                    new_vacancy = Vacancy(
-                        hh_vacancy_id=hh_vacancy_id,
-                        title=vacancy_data.get("name", "Без названия"),
-                        city=vacancy_data.get("area", {}).get("name"),
-                        recruiter_id=current_recruiter.id
-                    )
-                    db.add(new_vacancy)
-                    logger.info(f"  -> Добавлена новая вакансия в БД: '{new_vacancy.title}' (ID: {hh_vacancy_id})")
-                else:
-                    if (vacancy_in_db.title != vacancy_data.get("name") or
-                        vacancy_in_db.city != vacancy_data.get("area", {}).get("name") or
-                        vacancy_in_db.recruiter_id != current_recruiter.id):
-
-                        vacancy_in_db.title = vacancy_data.get("name", "Без названия")
-                        vacancy_in_db.city = vacancy_data.get("area", {}).get("name")
-                        vacancy_in_db.recruiter_id = current_recruiter.id
-                        logger.debug(f"  -> Обновлены данные для вакансии: '{vacancy_in_db.title}' (ID: {hh_vacancy_id})")
-
-            # Удаляем вакансии, которые больше не активны
-            # Находим вакансии в БД, которые числятся за этим рекрутером, но которых НЕТ в списке active_hh_ids
-
-            stale_vacancies_query = select(Vacancy).filter(
-                Vacancy.recruiter_id == current_recruiter.id,
-                Vacancy.hh_vacancy_id.notin_(active_hh_ids)
-            )
-            stale_result = await db.execute(stale_vacancies_query)
-            stale_vacancies = stale_result.scalars().all()
-
-            for stale_vac in stale_vacancies:
-                logger.info(f"Вакансия {stale_vac.title} ({stale_vac.hh_vacancy_id}) больше не активна у рекрутера {current_recruiter.name}. Отвязываем.")
-                # Вариант А: Просто отвязать (установить NULL)
-                stale_vac.recruiter_id = None
-
-            db_commit_start = time.monotonic()
-            current_recruiter.vacancies_last_synced_at = now
-            await db.commit()
-            logger.debug(f"[Recruiter {current_recruiter.name}] DB commit for vacancies sync took: {time.monotonic() - db_commit_start:.2f} sec.")
-            logger.debug(f"Кэш обновлен. Следующее обновление через {VACANCY_CACHE_DURATION_MINUTES} минут.")
-
-            return all_vacancies_from_api
-
-        except Exception as e:
-            logger.error(f"Ошибка при получении вакансий для рекрутера {recruiter_id}: {e}", exc_info=True)
-            await db.rollback()
+        if not current_recruiter:
+            logger.error(f"Рекрутер с ID {recruiter_id} не найден.")
             return []
-        finally:
-            logger.debug(f"[Recruiter {recruiter_id}] Total function execution time: {time.monotonic() - function_start_time:.2f} sec.")
+            
+        logger.debug(f"Получение и синхронизация списка активных вакансий для рекрутера {current_recruiter.name}...")
+        
+        if current_recruiter.vacancies_last_synced_at:
+            time_since_sync = now - current_recruiter.vacancies_last_synced_at
+            if time_since_sync < cache_expiry_time:
+                logger.debug(f"Используем кэш. Последняя синхронизация: {time_since_sync.total_seconds() / 60:.1f} мин. назад.")
+                result = await db.execute(select(Vacancy).filter(Vacancy.recruiter_id == current_recruiter.id))
+                cached_vacancies = result.scalars().all()
+                return [{"id": v.hh_vacancy_id, "name": v.title, "area": {"name": v.city} if v.city else {}} for v in cached_vacancies]
 
+        logger.debug(f"Кэш устарел. Запрос к API...")
+        api_request_start = time.monotonic()
 
+        # Передаем ту же db в _make_request
+        me_data = await hh_api._make_request(current_recruiter, db, "GET", "me")
+        
+        if not me_data or not me_data.get('employer') or not me_data['employer'].get('id'):
+            logger.error(f"Не удалось получить employer_id.")
+            return []
+        employer_id = me_data['employer']['id']
+
+        all_vacancies_from_api = []
+        page = 0
+        while True:
+            vacancies_page = await hh_api._make_request(
+                current_recruiter, db, "GET", f"employers/{employer_id}/vacancies/active",
+                params={'page': page, 'per_page': 20}
+            )
+            if not vacancies_page or not vacancies_page.get('items'):
+                break
+            all_vacancies_from_api.extend(vacancies_page['items'])
+            if page >= vacancies_page.get('pages', 1) - 1:
+                break
+            page += 1
+
+        logger.info(f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...")
+        active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
+
+        for vacancy_data in all_vacancies_from_api:
+            hh_vacancy_id = str(vacancy_data.get("id"))
+            result = await db.execute(select(Vacancy).filter_by(hh_vacancy_id=hh_vacancy_id))
+            vacancy_in_db = result.scalar_one_or_none()
+
+            if not vacancy_in_db:
+                new_vacancy = Vacancy(
+                    hh_vacancy_id=hh_vacancy_id,
+                    title=vacancy_data.get("name", "Без названия"),
+                    city=vacancy_data.get("area", {}).get("name"),
+                    recruiter_id=current_recruiter.id
+                )
+                db.add(new_vacancy)
+            else:
+                if (vacancy_in_db.title != vacancy_data.get("name") or
+                    vacancy_in_db.city != vacancy_data.get("area", {}).get("name") or
+                    vacancy_in_db.recruiter_id != current_recruiter.id):
+                    
+                    vacancy_in_db.title = vacancy_data.get("name", "Без названия")
+                    vacancy_in_db.city = vacancy_data.get("area", {}).get("name")
+                    vacancy_in_db.recruiter_id = current_recruiter.id
+
+        # Отвязываем старые
+        stale_result = await db.execute(select(Vacancy).filter(
+            Vacancy.recruiter_id == current_recruiter.id,
+            Vacancy.hh_vacancy_id.notin_(active_hh_ids)
+        ))
+        for stale_vac in stale_result.scalars().all():
+            stale_vac.recruiter_id = None
+
+        current_recruiter.vacancies_last_synced_at = now
+        
+        # ВАЖНО: Мы НЕ делаем db.commit() здесь, потому что транзакцией управляет вызывающая функция!
+        # Но делаем flush, чтобы изменения применились в памяти
+        await db.flush() 
+        
+        logger.debug(f"Синхронизация завершена.")
+        return all_vacancies_from_api
+
+    except Exception as e:
+        logger.error(f"Ошибка при синхронизации вакансий: {e}", exc_info=True)
+        # Не делаем rollback всей сессии тут, просто пробрасываем ошибку
+        raise 
+    finally:
+        logger.debug(f"Время выполнения: {time.monotonic() - function_start_time:.2f} sec.")
 
 async def process_new_responses(recruiter_id: int, vacancy_ids: list):
     """Этап 1: Ищет новые отклики по СПИСКУ вакансий."""
@@ -564,7 +524,8 @@ async def handle_scanner_recruiter(rec_id: int):
                 # Если рекрутер заблокирован другим процессом, просто выходим
                 return
 
-            active_vacancies = await get_all_active_vacancies_for_recruiter(rec_id)
+            # Передаем db, который открыт в handle_scanner_recruiter
+            active_vacancies = await get_all_active_vacancies_for_recruiter(rec_id, db)
             if not active_vacancies:
                 return
             vacancy_ids = [v['id'] for v in active_vacancies]
