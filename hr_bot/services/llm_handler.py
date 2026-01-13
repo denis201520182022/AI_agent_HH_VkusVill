@@ -77,7 +77,7 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         # --- ДОБАВЛЕНО: Использование семафора ---
         async with LLM_SEMAPHORE:
             response = await client.chat.completions.create(
-                model="gpt-4o-mini",
+                model="gpt-5-mini",
                 messages=messages,
                 temperature=0.1,
                 max_tokens=2500,
