@@ -28,3 +28,25 @@ systemctl stop hh_reminders
 
 # Этот воркер будет обслуживать ТОЛЬКО рекрутеров 1 и 5
 python run_hh_worker.py --recruiter_ids 1 5
+
+
+
+
+
+
+
+
+# Сборка образов
+docker compose build
+
+# Запуск в фоне
+docker compose up -d
+
+Посмотреть статус всех контейнеров:
+docker compose ps
+
+Посмотреть логи (все вместе):
+docker compose logs -f
+
+
+docker compose logs -f hh_scanner
