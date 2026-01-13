@@ -79,10 +79,10 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
             response = await client.chat.completions.create(
                 model="gpt-5-mini",
                 messages=messages,
-                temperature=0.1,
-                max_completion_tokens=1500,
+                # temperature=1,  # РЕКОМЕНДАЦИЯ: Уберите совсем или поставьте 1
+                max_completion_tokens=2500, # Вы уже исправили это ранее
                 response_format={"type": "json_object"},
-                frequency_penalty=1.0 # <--- ИЗМЕНЕНИЕ 2: Штраф за повторы. Это убьет бесконечные циклы пробелов.
+                # frequency_penalty=1.0 <--- УДАЛИТЬ ЭТУ СТРОКУ, она вызывает ошибку 400
             )
         # ------------------------------------------
 
