@@ -1,0 +1,117 @@
+services:
+  # ---------------------------------------------------------------
+  # PGBOUNCER (Пулер соединений)
+  # ---------------------------------------------------------------
+  pgbouncer:
+    image: edoburu/pgbouncer
+    container_name: hh_pgbouncer
+    restart: always
+    environment:
+      # Настройки подключения к РЕАЛЬНОЙ базе (на хосте)
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=host.docker.internal  # Стучимся на хост-машину
+      - DB_PORT=${DB_PORT}
+      - DB_NAME=${DB_NAME}
+      
+      # Настройки самого PgBouncer
+      - POOL_MODE=transaction
+      - MAX_CLIENT_CONN=1000
+      - DEFAULT_POOL_SIZE=20
+      - LISTEN_PORT=6432
+      - AUTH_TYPE=md5
+    ports:
+      - "6432:6432"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ---------------------------------------------------------------
+  # SCANNER (1 шт, сканирует HH)
+  # ---------------------------------------------------------------
+  hh_scanner:
+    build: .
+    container_name: hh_scanner
+    restart: always
+    command: python run_hh_scanner.py
+    volumes:
+      - ./logs:/app/logs            # Прокидываем логи наружу
+      - ./credentials.json:/app/credentials.json # Google Creds
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      # Переопределяем хост БД на pgbouncer
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # WORKER (Обработчик, можно скейлить)
+  # ---------------------------------------------------------------
+  hh_worker:
+    build: .
+    restart: always
+    # container_name не задаем, чтобы можно было запускать --scale
+    command: python run_hh_worker.py
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+    deploy:
+      mode: replicated
+      replicas: 5  # <--- КОЛИЧЕСТВО ВОРКЕРОВ (Запускаем сразу 5 штук)
+
+  # ---------------------------------------------------------------
+  # REMINDERS (Напоминатор, 1 шт)
+  # ---------------------------------------------------------------
+  hh_reminders:
+    build: .
+    container_name: hh_reminders
+    restart: always
+    command: python run_reminders_worker.py
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # TELEGRAM BOT (Интерфейс управления)
+  # ---------------------------------------------------------------
+  tg_bot:
+    build: .
+    container_name: hh_tg_bot
+    restart: always
+    command: python run_telegram_bot.py
+    volumes:
+      - ./logs:/app/logs
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
