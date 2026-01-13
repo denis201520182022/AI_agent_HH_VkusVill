@@ -189,7 +189,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
     finally:
         logger.debug(f"Время выполнения: {time.monotonic() - function_start_time:.2f} sec.")
 
-async def process_new_responses(recruiter_id: int, vacancy_ids: list):
+async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncSession):
     """Этап 1: Ищет новые отклики по СПИСКУ вакансий."""
     function_start_time = time.monotonic()
 
@@ -380,7 +380,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list):
 
 
 
-async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: AsyncSession): # <-- Добавлен аргумент db
+async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: AsyncSession):
     """Этап 2: Ищет новые сообщения в папках 'Подумать' и 'Собеседование'."""
     function_start_time = time.monotonic()
 
