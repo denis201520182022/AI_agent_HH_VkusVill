@@ -362,12 +362,13 @@ async def check_and_send_inactive_alerts(bot: Bot, health_monitor: TaskHealthMon
                     safe_vacancy_title = escape_markdown(vacancy.title)
                     safe_city = escape_markdown(vacancy.city or 'Не указан')
                     safe_masked_name = escape_markdown(mask_fio(candidate.full_name)) # С маскировкой только отчества
-
+                    safe_phone_number = escape_markdown(candidate.phone_number or "—")
                     message_text = (
                         f"⚠️ Соискатель не отвечает более 2 часов\n\n"
                         f"Вакансия: ✨*{safe_vacancy_title}*✨\n"
                         f"Город: 📍*{safe_city}*📍\n"
                         f"Имя: {safe_masked_name}\n" # Теперь с маскировкой только отчества
+                        f"Номер телефона: {safe_phone_number}\n"
                         f"Ссылка на резюме: [Открыть на HH.ru]({resume_link})\n\n"
                         f"URL: {resume_link}" # Добавляем URL отдельно, т.к. disable_web_page_preview не для документов
                     )
@@ -537,12 +538,13 @@ async def check_and_send_rejected_alerts(bot: Bot, health_monitor: TaskHealthMon
                     safe_vacancy_title = escape_markdown(vacancy.title)
                     safe_city = escape_markdown(vacancy.city or 'Не указан')
                     safe_masked_name = escape_markdown(mask_fio(candidate.full_name)) # С маскировкой только отчества
-
+                    safe_phone_number = escape_markdown(candidate.phone_number or "—")
                     message_text = (
                         f"❌ Кандидату отказано в квалификации\n\n"
                         f"Вакансия: ✨*{safe_vacancy_title}*✨\n"
                         f"Город: 📍*{safe_city}*📍\n"
                         f"Имя: {safe_masked_name}\n" # Теперь с маскировкой только отчества
+                        f"Номер телефона: {safe_phone_number}\n"
                         f"Ссылка на резюме: [Открыть на HH.ru]({resume_link})\n\n"
                         f"URL: {resume_link}"
                     )
