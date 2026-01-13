@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import argparse
 import logging
 import json
 import random
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
 import re
+from hr_bot.utils.redis_lock import close_redis 
 
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
@@ -952,17 +954,28 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         db_fetch_start = time.monotonic()
 
-        # Загружаем dialogue с явной загрузкой связей
-        dialogue = await db.get(
-            Dialogue,
-            dialogue_id,
-            options=[
+        # --- ИЗМЕНЕНИЕ: ЗАГРУЗКА С БЛОКИРОВКОЙ ---
+        # Мы пытаемся захватить строку. Если она занята другим воркером, skip_locked=True вернет None.
+        stmt = (
+            select(Dialogue)
+            .filter_by(id=dialogue_id)
+            .options(
                 selectinload(Dialogue.vacancy),
                 selectinload(Dialogue.candidate),
                 selectinload(Dialogue.rejected_alerts),
                 selectinload(Dialogue.inactive_alerts)
-            ]
+            )
+            .with_for_update(skip_locked=True)
         )
+        
+        result = await db.execute(stmt)
+        dialogue = result.scalar_one_or_none()
+
+        # Если диалог занят другим процессом или удален
+        if not dialogue:
+            logger.debug(f"Dialogue {dialogue_id} is locked by another worker or not found. Skipping.")
+            return
+        # -----------------------------------------
 
         # Загружаем recruiter
         recruiter = await db.get(TrackedRecruiter, recruiter_id)
@@ -2344,7 +2357,7 @@ async def handle_single_recruiter(rec_id: int, prompt_library: dict):
 #     finally:
 #         logger.debug(f"--- Recruiter {recruiter_name} completed: {time.monotonic() - recruiter_processing_start_time:.2f}s ---")
 
-async def run_worker_cycle():
+async def run_worker_cycle(target_recruiter_ids=None):
     """Главный цикл, который запускает независимые асинхронные задачи."""
     cycle_start_time = time.monotonic()
     try:
@@ -2354,7 +2367,11 @@ async def run_worker_cycle():
         all_recruiters_ids = []
         async with SessionLocal() as db: # Эта сессия только для получения списка ID рекрутеров
             try:
-                result = await db.execute(select(TrackedRecruiter.id))
+                query = select(TrackedRecruiter.id)
+                if target_recruiter_ids:
+                    query = query.filter(TrackedRecruiter.id.in_(target_recruiter_ids))
+                
+                result = await db.execute(query)
                 all_recruiters_ids = result.scalars().all()
             finally:
                 pass # Сессия 'db' закрывается здесь.
@@ -2381,7 +2398,7 @@ async def run_worker_cycle():
         logger.info(f"Цикл воркера завершен. Общее время: {cycle_end_time - cycle_start_time:.2f} сек.")
         logger.debug("Цикл воркера завершен.")
 
-async def main():
+async def main(target_recruiter_ids=None):
     """Главная асинхронная функция."""
 
     signal.signal(signal.SIGINT, signal_handler)
@@ -2394,7 +2411,7 @@ async def main():
     try:
         while not shutdown_requested:
             try:
-                await run_worker_cycle()
+                await run_worker_cycle(target_recruiter_ids)
 
                 logger.debug(f"Пауза {CYCLE_PAUSE_SECONDS} секунд перед следующим циклом.")
 
@@ -2412,6 +2429,7 @@ async def main():
         await cleanup() # Очистка LLM ресурсов
         # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
         await hh_api_real.close_api_client()
+        await close_redis()
         # ---------------------------
         # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
         # interview_reminders_task.cancel() # Отмена задачи при завершении
@@ -2419,11 +2437,19 @@ async def main():
         logger.info("HH-Worker полностью остановлен.")
 
 
+
+
 if __name__ == "__main__":
     setup_logging(log_filename="hh_worker.log")
     load_dotenv()
 
+    # Настраиваем чтение аргументов
+    parser = argparse.ArgumentParser(description="HH Worker instance")
+    parser.add_argument('--recruiter_ids', nargs='+', type=int, help='List of recruiter IDs to handle')
+    args = parser.parse_args()
+
+    # Передаем список ID в функцию main
     try:
-        asyncio.run(main())
+        asyncio.run(main(target_recruiter_ids=args.recruiter_ids))
     except (KeyboardInterrupt, SystemExit):
         logger.info("Приложение принудительно завершено.")

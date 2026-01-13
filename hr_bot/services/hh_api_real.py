@@ -13,6 +13,8 @@ from hr_bot.utils.system_notifier import send_system_alert
 import httpx
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from aiolimiter import AsyncLimiter
+from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 HH_API_PER_PAGE_LIMIT = 20
@@ -22,8 +24,10 @@ api_raw_logger = setup_api_logger()
 CLIENT_ID = os.getenv('HH_CLIENT_ID')
 CLIENT_SECRET = os.getenv('HH_CLIENT_SECRET')
 
-MAX_CONCURRENT_REQUESTS = 80
-API_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+GLOBAL_HH_API_LIMIT = int(os.getenv("GLOBAL_HH_API_CONCURRENCY"))
+
+# MAX_CONCURRENT_REQUESTS = 80
+# API_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
 HH_API_RATE_LIMITER = AsyncLimiter(100, 1) # 2 запроса в секунду
 
@@ -45,11 +49,12 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
     if recruiter.access_token and recruiter.token_expires_at and recruiter.token_expires_at > now:
         return recruiter.access_token
 
-    # 2. Получаем или создаем лок для этого рекрутера
-    lock = _refresh_locks.setdefault(recruiter.recruiter_id, asyncio.Lock())
-
-    # 3. Захватываем лок, чтобы только одна задача могла обновлять токен для этого рекрутера
-    async with lock:
+    # 2. РАСПРЕДЕЛЕННАЯ БЛОКИРОВКА ЧЕРЕЗ REDIS
+    # Имя ключа уникально для каждого рекрутера. Limit=1 работает как Mutex.
+    lock_name = f"refresh_token_lock:{recruiter.recruiter_id}"
+    
+    # Пытаемся захватить право на обновление. Ждем, если кто-то уже обновляет.
+    async with DistributedSemaphore(name=lock_name, limit=1, timeout=60):
         # --- ДОБАВЛЕНО: ОБНОВЛЕНИЕ ОБЪЕКТА РЕКРУТЕРА ИЗ БД ---
         await db.refresh(recruiter) # Принудительно обновляем данные рекрутера из БД
         # --- КОНЕЦ ДОБАВЛЕННОГО БЛОКА ---
@@ -87,11 +92,12 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
         )
         api_raw_logger.info(request_log)
 
-        async with HH_API_RATE_LIMITER:
-            async with API_SEMAPHORE:
-                
-                response = await shared_api_client.post(url, data=data)
-
+        try:
+            response = await shared_api_client.post(url, data=data)
+        except Exception as e:
+            logger.error(f"Network error refreshing token: {e}")
+            return None
+        
         response_log = (
             f"<--🚨🚨🚨 TOKEN EXCHANGE RESPONSE\n  Status Code: {response.status_code}\n"
             f"  Headers: {response.headers}\n  Body: {response.text}"
@@ -209,7 +215,8 @@ async def _make_request(
     
 
     async with HH_API_RATE_LIMITER:
-        async with API_SEMAPHORE:
+        # --- ИЗМЕНЕНИЕ: Глобальный семафор ---
+        async with DistributedSemaphore(name="hh_api_global", limit=GLOBAL_HH_API_LIMIT):
             # ИСПОЛЬЗУЕМ ГЛОБАЛЬНЫЙ КЛИЕНТ
             response = await shared_api_client.request(method, url, headers=headers, **kwargs)
 

@@ -1,6 +1,7 @@
 #run_reminders_worker.py
 
 import asyncio
+import argparse
 import time
 import logging
 import json
@@ -16,7 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
 import re
-
+from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
 from hr_bot.services import hh_api_real as hh_api
@@ -78,15 +79,23 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
         async with SessionLocal() as db:
             try:
                 # Загружаем диалог со всеми связями
-                dialogue = await db.get(
-                    Dialogue,
-                    dialogue_id,
-                    options=[
+                stmt = (
+                    select(Dialogue)
+                    .filter_by(id=dialogue_id)
+                    .options(
                         selectinload(Dialogue.candidate),
                         selectinload(Dialogue.vacancy),
                         selectinload(Dialogue.inactive_alerts)
-                    ]
+                    )
+                    .with_for_update(skip_locked=True)
                 )
+                
+                result = await db.execute(stmt)
+                dialogue = result.scalar_one_or_none()
+
+                if not dialogue:
+                    # Диалог занят или не найден
+                    return
                 recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
                 if not dialogue or not recruiter:
@@ -377,21 +386,24 @@ async def check_and_send_interview_reminders():
 
                 # Выбираем напоминания, которые пора отправить
                 # Используем selectinload для всех необходимых связей
-                result = await db_session.execute(
+                stmt = (
                     select(InterviewReminder)
                     .options(
                         selectinload(InterviewReminder.dialogue)
                         .selectinload(Dialogue.vacancy),
                         selectinload(InterviewReminder.dialogue)
                         .selectinload(Dialogue.candidate),
-                        selectinload(InterviewReminder.recruiter) # Загружаем рекрутера напрямую
+                        selectinload(InterviewReminder.recruiter) 
                     )
                     .filter(
                         InterviewReminder.status == 'pending',
                         InterviewReminder.scheduled_send_time_utc <= now_utc
                     )
-                    .limit(20) # Обрабатываем по 20 за раз
+                    .limit(20)
+                    .with_for_update(skip_locked=True) # <--- ВАЖНО: Блокируем строки
                 )
+                
+                result = await db_session.execute(stmt)
                 reminders_to_send = result.scalars().all()
 
                 if not reminders_to_send:
@@ -498,38 +510,47 @@ async def check_and_send_interview_reminders():
 
 
 
-
-
-async def run_reminders_cycle():
-    """Цикл проверки напоминаний (дожимов) по всем рекрутерам."""
+async def run_reminders_cycle(target_recruiter_ids=None):
+    """Цикл проверки напоминаний (дожимов) с фильтрацией по рекрутерам."""
     start_time = time.monotonic()
+    
     async with SessionLocal() as db:
-        # Получаем всех активных рекрутеров
-        result = await db.execute(select(TrackedRecruiter.id))
+        query = select(TrackedRecruiter.id)
+        # --- ИЗМЕНЕНИЕ: Фильтрация ---
+        if target_recruiter_ids:
+            query = query.filter(TrackedRecruiter.id.in_(target_recruiter_ids))
+        # -----------------------------
+        result = await db.execute(query)
         recruiter_ids = result.scalars().all()
     
+    if not recruiter_ids:
+        logger.debug("Нет рекрутеров для проверки напоминаний.")
+        return
+
     # Запускаем process_reminders для каждого рекрутера
-    # Внутри process_reminders уже есть параллельность через семафоры
     for r_id in recruiter_ids:
         async with SessionLocal() as db_session:
             await process_reminders(r_id, db_session)
             await db_session.commit()
     
-    logger.info(f"Цикл 'дожимов' завершен за {time.monotonic() - start_time:.2f} сек.")
+    logger.info(f"Цикл 'дожимов' завершен за {time.monotonic() - start_time:.2f} сек. (Рекрутеров: {len(recruiter_ids)})")
 
-async def main():
+# --- ИСПРАВЛЕНИЕ: Убрали лишний отступ у main (вынесли из предыдущей функции) ---
+async def main(target_recruiter_ids=None):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    logger.info("Reminder Worker запускается...")
+    logger.info(f"Reminder Worker запускается (Рекрутеры: {target_recruiter_ids if target_recruiter_ids else 'Все'})...")
     
-    # 1. Запускаем фоновую задачу для напоминаний о собеседованиях (Интервал 30 сек внутри функции)
+    # 1. Запускаем фоновую задачу для напоминаний о собеседованиях
+    # Она обрабатывает ОБЩУЮ очередь, поэтому фильтрация по рекрутерам ей не обязательна,
+    # но благодаря skip_locked воркеры поделят задачи между собой.
     interview_task = asyncio.create_task(check_and_send_interview_reminders())
     
     try:
         while not shutdown_requested:
-            # 2. Запускаем цикл "дожимов" (раз в 10-15 минут достаточно, чтобы не спамить API)
-            await run_reminders_cycle()
+            # 2. Запускаем цикл "дожимов" с фильтром
+            await run_reminders_cycle(target_recruiter_ids)
             
             # Пауза между проверками "дожимов"
             for _ in range(600): # 10 минут
@@ -539,9 +560,18 @@ async def main():
     finally:
         interview_task.cancel()
         await hh_api_real.close_api_client()
+        await close_redis()
         logger.info("Reminder Worker остановлен.")
 
 if __name__ == "__main__":
     setup_logging(log_filename="reminders_worker.log")
     load_dotenv()
-    asyncio.run(main())
+    
+    parser = argparse.ArgumentParser(description="HH Reminders Worker")
+    parser.add_argument('--recruiter_ids', nargs='+', type=int, help='List of recruiter IDs')
+    args = parser.parse_args()
+
+    try:
+        asyncio.run(main(target_recruiter_ids=args.recruiter_ids))
+    except (KeyboardInterrupt, SystemExit):
+        pass

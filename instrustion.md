@@ -20,3 +20,6 @@ journalctl -u hh_reminders.service -f
 systemctl restart hh_scanner
 systemctl restart hh_worker
 systemctl restart hh_reminders
+
+# Этот воркер будет обслуживать ТОЛЬКО рекрутеров 1 и 5
+python run_hh_worker.py --recruiter_ids 1 5

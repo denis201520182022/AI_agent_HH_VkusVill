@@ -9,6 +9,9 @@ import httpx
 from openai import AsyncOpenAI, APITimeoutError # <--- ДОБАВЛЕНО APITimeoutError
 from tenacity import retry, stop_after_attempt, wait_exponential
 import datetime
+import os # <--- Добавь
+from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -16,9 +19,11 @@ logger = logging.getLogger(__name__)
 # Определяет максимальное количество ОДНОВРЕМЕННЫХ запросов к OpenAI.
 # Начните с небольшого значения, например, 5-10, и постепенно увеличивайте,
 # если производительность позволяет и нет ошибок.
-MAX_CONCURRENT_LLM_REQUESTS = 40 # Например, 5 одновременных запросов
-LLM_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
+# MAX_CONCURRENT_LLM_REQUESTS = 40 # Например, 5 одновременных запросов
+# LLM_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
 # ---------------------------------------------------
+# Получаем лимит из ENV
+GLOBAL_LLM_LIMIT = int(os.getenv("GLOBAL_LLM_CONCURRENCY", 30))
 
 # Загружаем настройки прокси из .env
 SQUID_PROXY_HOST = os.getenv("SQUID_PROXY_HOST")
@@ -74,17 +79,16 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
     try:
         logger.info(f"Отправка запроса к LLM через прокси...")
 
-        # --- ДОБАВЛЕНО: Использование семафора ---
-        async with LLM_SEMAPHORE:
+        # --- ИЗМЕНЕНИЕ: ИСПОЛЬЗУЕМ РАСПРЕДЕЛЕННЫЙ СЕМАФОР ---
+        # name="llm_global" - это имя ключа в Redis (будет semaphore:llm_global)
+        async with DistributedSemaphore(name="llm_global", limit=GLOBAL_LLM_LIMIT):
             response = await client.chat.completions.create(
-                model="gpt-5-mini",
+                model="gpt-4o-mini", # или gpt-5-mini как у тебя было
                 messages=messages,
-                # temperature=1,  # РЕКОМЕНДАЦИЯ: Уберите совсем или поставьте 1
-                max_completion_tokens=2500, # Вы уже исправили это ранее
+                max_completion_tokens=2500,
                 response_format={"type": "json_object"},
-                # frequency_penalty=1.0 <--- УДАЛИТЬ ЭТУ СТРОКУ, она вызывает ошибку 400
             )
-        # ------------------------------------------
+        # ----------------------------------------------------
 
         response_content = response.choices[0].message.content
         finish_reason = response.choices[0].finish_reason  # ### <--- НОВОЕ: Причина остановки
@@ -143,4 +147,5 @@ async def cleanup():
     Вызовите эту функцию в shutdown hook вашего приложения.
     """
     await async_http_client.aclose()
+    await close_redis()
     logger.info("🔒 HTTP клиент закрыт")

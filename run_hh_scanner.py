@@ -2,6 +2,7 @@
 
 import asyncio
 import time
+import argparse
 import logging
 import json
 import random
@@ -16,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
 import re
+from hr_bot.utils.redis_lock import close_redis 
 
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
@@ -316,6 +318,14 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list):
                             full_name=candidate_full_name
                         )
                         db.add(candidate)
+                        try:
+                            await db.flush() # Пытаемся сохранить, чтобы получить ID
+                        except Exception:
+                            await db.rollback() # Если кто-то уже создал его секунду назад
+                            candidate_result = await db.execute(
+                                select(Candidate).filter(Candidate.hh_resume_id == candidate_hh_resume_id)
+                            )
+                            candidate = candidate_result.scalar_one_or_none()
 
                     await db.flush() # Чтобы получить ID кандидата
 
@@ -470,7 +480,9 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list):
                 if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
                     continue
 
-                dialogue_result = await db.execute(select(Dialogue).filter_by(hh_response_id=response_id))
+                dialogue_result = await db.execute(
+                    select(Dialogue).filter_by(hh_response_id=response_id).with_for_update()
+                )
                 dialogue = dialogue_result.scalar_one_or_none()
                 
                 if not dialogue:
@@ -539,27 +551,59 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list):
 
 
 async def handle_scanner_recruiter(rec_id: int):
-    """Только сканирование для одного рекрутера"""
-    active_vacancies = await get_all_active_vacancies_for_recruiter(rec_id)
-    if not active_vacancies:
-        return
-    vacancy_ids = [v['id'] for v in active_vacancies]
-    
-    # Запускаем поиск новых откликов и новых сообщений
-    await asyncio.gather(
-        process_new_responses(rec_id, vacancy_ids),
-        process_ongoing_responses(rec_id, vacancy_ids)
-    )
-async def main():
+    """Только сканирование для одного рекрутера с защитой от параллелизма"""
+    async with SessionLocal() as db:
+        try:
+            # Пытаемся заблокировать строку рекрутера. 
+            # skip_locked=True позволяет другому воркеру просто пропустить этого рекрутера, если он уже занят
+            stmt = select(TrackedRecruiter).filter_by(id=rec_id).with_for_update(skip_locked=True)
+            result = await db.execute(stmt)
+            recruiter = result.scalar_one_or_none()
+
+            if not recruiter:
+                # Если рекрутер заблокирован другим процессом, просто выходим
+                return
+
+            active_vacancies = await get_all_active_vacancies_for_recruiter(rec_id)
+            if not active_vacancies:
+                return
+            vacancy_ids = [v['id'] for v in active_vacancies]
+            
+            # Теперь, когда рекрутер "наш", запускаем задачи
+            await asyncio.gather(
+                process_new_responses(rec_id, vacancy_ids),
+                process_ongoing_responses(rec_id, vacancy_ids)
+            )
+            # Коммит произойдет автоматически при закрытии сессии или можно добавить явно:
+            await db.commit()
+            
+        except Exception as e:
+            logger.error(f"Ошибка при блокировке рекрутера {rec_id}: {e}")
+            await db.rollback()
+
+
+# В начало файла добавь импорт argparse, если его нет (в твоем косте он есть вверху)
+
+async def main(target_recruiter_ids=None): # Добавь аргумент
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
-    logger.info("HH-Scanner (Stages 1 & 2) запущен...")
+    logger.info(f"HH-Scanner запущен для рекрутеров: {target_recruiter_ids if target_recruiter_ids else 'Всех'}")
 
     try:
         while not shutdown_requested:
             async with SessionLocal() as db:
-                result = await db.execute(select(TrackedRecruiter.id))
+                # Фильтруем рекрутеров, если переданы ID
+                query = select(TrackedRecruiter.id)
+                if target_recruiter_ids:
+                    query = query.filter(TrackedRecruiter.id.in_(target_recruiter_ids))
+                
+                result = await db.execute(query)
                 recruiter_ids = result.scalars().all()
+
+            if not recruiter_ids:
+                logger.debug("Нет рекрутеров для сканирования. Жду...")
+                await asyncio.sleep(10)
+                continue
 
             semaphore = asyncio.Semaphore(MAX_CONCURRENT_RECRUITERS)
             
@@ -570,20 +614,24 @@ async def main():
                     except Exception as e:
                         logger.error(f"Scanner error for recruiter {r_id}: {e}")
 
-            if recruiter_ids:
-                await asyncio.gather(*[run_with_sem(r_id) for r_id in recruiter_ids])
+            await asyncio.gather(*[run_with_sem(r_id) for r_id in recruiter_ids])
             
-            # РАСКОММЕНТИРУЙ ЭТО! Пауза между сканированиями.
-            #await asyncio.sleep(20) 
+            # Важно: пауза между циклами сканирования, чтобы не спамить API HH
+            await asyncio.sleep(30) 
     finally:
         await hh_api_real.close_api_client()
+        await close_redis()
         logger.info("HH-Scanner остановлен.")
 
-# ДОБАВЬ ЭТОТ БЛОК В КОНЕЦ:
 if __name__ == "__main__":
     setup_logging(log_filename="hh_scanner.log")
     load_dotenv()
+    
+    parser = argparse.ArgumentParser(description="HH Scanner Service")
+    parser.add_argument('--recruiter_ids', nargs='+', type=int, help='List of recruiter IDs')
+    args = parser.parse_args()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(target_recruiter_ids=args.recruiter_ids))
     except (KeyboardInterrupt, SystemExit):
         pass
