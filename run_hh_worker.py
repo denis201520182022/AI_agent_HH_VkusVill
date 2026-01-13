@@ -2370,8 +2370,7 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("HH-Worker запускается...")
-    # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
-    interview_reminders_task = asyncio.create_task(check_and_send_interview_reminders())
+    
     # --- КОНЕЦ ДОБАВЛЕНИЯ ---
     try:
         while not shutdown_requested:
