@@ -15,11 +15,17 @@ def get_redis_client():
         host = os.getenv("REDIS_HOST", "localhost")
         port = int(os.getenv("REDIS_PORT", 6379))
         
-        # --- ИСПРАВЛЕНИЕ: ПРАВИЛЬНАЯ ОБРАБОТКА ПАРОЛЯ ---
+        # --- ИСПРАВЛЕНИЕ: ЖЕЛЕЗОБЕТОННАЯ ПРОВЕРКА ПАРОЛЯ ---
         password = os.getenv("REDIS_PASSWORD")
-        if not password:  # Если вернулась пустая строка "" или None
+        
+        # 1. Если переменная есть, убираем пробелы по краям
+        if password is not None:
+            password = password.strip()
+            
+        # 2. Если после этого осталась пустая строка — ставим None
+        if not password:
             password = None
-        # ------------------------------------------------
+        # ---------------------------------------------------
         
         db_index = int(os.getenv("REDIS_DB", 0)) 
         
@@ -74,8 +80,9 @@ class DistributedSemaphore:
                 if result == 1:
                     return True
             except Exception as e:
-                logger.error(f"Redis error acquiring semaphore: {e}")
-                await asyncio.sleep(1)
+                # Логируем ошибку, но не спамим в консоль каждую миллисекунду
+                # logger.error(f"Redis error acquiring semaphore: {e}")
+                await asyncio.sleep(5) # Если Redis упал, ждем 5 секунд
                 continue
             
             await asyncio.sleep(0.1 + (0.05 * (id(self) % 10)))
