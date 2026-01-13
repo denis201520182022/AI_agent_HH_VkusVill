@@ -196,318 +196,318 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list):
     recruiter = None
     recruiter_name_for_logging = f"ID {recruiter_id}"
 
-    async with SessionLocal() as db:
-        try:
-            recruiter = await db.get(TrackedRecruiter, recruiter_id)
-            if not recruiter:
-                logger.warning(f"process_new_responses: Рекрутер с ID {recruiter_id} не найден.")
-                return
-            recruiter_name_for_logging = recruiter.name
-            cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-            logger.debug(f"Используем дату старта для рекрутера {recruiter.name}: {cutoff_date}")
-            if not vacancy_ids:
-                logger.error("Этап 1: Нет активных вакансий для проверки 'Неразобранных'.")
-                return
+    
+    try:
+        recruiter = await db.get(TrackedRecruiter, recruiter_id)
+        if not recruiter:
+            logger.warning(f"process_new_responses: Рекрутер с ID {recruiter_id} не найден.")
+            return
+        recruiter_name_for_logging = recruiter.name
+        cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+        logger.debug(f"Используем дату старта для рекрутера {recruiter.name}: {cutoff_date}")
+        if not vacancy_ids:
+            logger.error("Этап 1: Нет активных вакансий для проверки 'Неразобранных'.")
+            return
 
-            logger.debug(f"Этап 1: Проверка 'Неразобранных' для {len(vacancy_ids)} вакансий...")
+        logger.debug(f"Этап 1: Проверка 'Неразобранных' для {len(vacancy_ids)} вакансий...")
 
-            new_responses_with_vacancy_ids = await hh_api.get_responses_from_folder(
-                recruiter, db, 'response', vacancy_ids, since_datetime=cutoff_date
-            )
+        new_responses_with_vacancy_ids = await hh_api.get_responses_from_folder(
+            recruiter, db, 'response', vacancy_ids, since_datetime=cutoff_date
+        )
 
-            for resp, associated_vacancy_id_str in new_responses_with_vacancy_ids:
-                # Используем SAVEPOINT для каждого кандидата, чтобы ошибка в одном не ломала всю транзакцию
-                try:
-                    response_id = resp.get('id')
+        for resp, associated_vacancy_id_str in new_responses_with_vacancy_ids:
+            # Используем SAVEPOINT для каждого кандидата, чтобы ошибка в одном не ломала всю транзакцию
+            try:
+                response_id = resp.get('id')
 
-                    # --- БЕЗОПАСНЫЙ ДОСТУП К ДАННЫМ РЕЗЮМЕ ---
-                    resume_info = resp.get('resume')
-                    if not resume_info:
-                        logger.warning(f"Отклик {response_id} без резюме. Пропуск.")
-                        continue
-
-                    candidate_first_name = resume_info.get('first_name', 'Неизвестно')
-                    candidate_last_name = resume_info.get('last_name', '')
-                    candidate_full_name = f"{candidate_first_name} {candidate_last_name}".strip()
-                    candidate_hh_resume_id = resume_info.get('id')
-                    # -----------------------------------------
-
-                    if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
-                        continue
-
-                    # Проверка существования
-                    exists_query = select(func.count()).select_from(Dialogue).filter_by(hh_response_id=response_id)
-                    result = await db.execute(exists_query)
-                    if result.scalar() > 0:
-                        continue
-
-                    # Проверка лимитов
-                    settings_result = await db.execute(
-                        select(AppSettings).filter_by(id=1).with_for_update()
-                    )
-                    settings = settings_result.scalar_one_or_none()
-
-                    if not settings:
-                        logger.error("Настройки AppSettings не найдены в БД!")
-                        continue
-
-                    # ПРОВЕРКА БАЛАНСА
-                    if settings.balance < settings.cost_per_dialogue:
-                        logger.warning(f"Недостаточно средств на балансе ({settings.balance}). Отклик {response_id} пропущен.")
-                        continue
-
-                    logger.info(f"\nНайден новый отклик {response_id} ({candidate_full_name}).")
-
-                    vacancy_in_db_result = await db.execute(
-                        select(Vacancy).filter(Vacancy.hh_vacancy_id == associated_vacancy_id_str)
-                    )
-                    vacancy_in_db = vacancy_in_db_result.scalar_one_or_none()
-
-                    if not vacancy_in_db:
-                        logger.error(f"Вакансия {associated_vacancy_id_str} не найдена в БД. Пропуск.")
-                        continue
-
-                    # Работа с кандидатом
-                    candidate_result = await db.execute(
-                        select(Candidate).filter(Candidate.hh_resume_id == candidate_hh_resume_id)
-                    )
-                    candidate = candidate_result.scalar_one_or_none()
-                    if not candidate:
-                        candidate = Candidate(
-                            hh_resume_id=candidate_hh_resume_id,
-                            full_name=candidate_full_name
-                        )
-                        db.add(candidate)
-                        try:
-                            await db.flush() # Пытаемся сохранить, чтобы получить ID
-                        except Exception:
-                            await db.rollback() # Если кто-то уже создал его секунду назад
-                            candidate_result = await db.execute(
-                                select(Candidate).filter(Candidate.hh_resume_id == candidate_hh_resume_id)
-                            )
-                            candidate = candidate_result.scalar_one_or_none()
-
-                    await db.flush() # Чтобы получить ID кандидата
-
-                    response_created_at_str = resp.get('created_at')
-                    response_created_at_dt = None
-                    if response_created_at_str:
-                        try:
-                            response_created_at_dt = datetime.datetime.fromisoformat(response_created_at_str)
-                        except (ValueError, TypeError):
-                            logger.warning(f"Не удалось распознать дату отклика: {response_created_at_str}")
-                    # <<< КОНЕЦ ИСПРАВЛЕНИЯ >>>
-
-                    # Создаем диалог
-                    dialogue = Dialogue(
-                        hh_response_id=response_id,
-                        candidate_id=candidate.id,
-                        vacancy_id=vacancy_in_db.id,
-                        recruiter_id=recruiter_id,
-                        status='new',
-                        dialogue_state='initial_processing',
-                        response_created_at=response_created_at_dt # <<< ИСПОЛЬЗУЕМ ОБЪЕКТ DATETIME
-                    )
-                    db.add(dialogue)
-
-                    # --- КРИТИЧЕСКИЙ МОМЕНТ: ПЕРЕМЕЩЕНИЕ ---
-                    # Сначала перемещаем, чтобы зафиксировать намерение
-                    await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')
-
-                    # СПИСАНИЕ СРЕДСТВ + СТАТИСТИКА
-                    cost = settings.cost_per_dialogue
-                    settings.balance -= cost
-                    settings.total_spent_on_dialogues += cost # Увеличиваем счетчик диалогов
-
-                    # Пытаемся получить сообщения, но ошибка здесь НЕ ДОЛЖНА отменять создание диалога
-                    try:
-                        messages_data = await hh_api.get_messages(recruiter, db, resp['messages_url'])
-                        messages = [
-                            {
-                                'message_id': str(m.get('id')),
-                                'role': 'user',
-                                'content': m['text'],
-                                'timestamp_msk': _format_timestamp_to_msk(m.get('created_at')) # <-- ДОБАВЛЕНО
-                            }
-                            for m in messages_data if m.get('text')
-                        ]
-                    except Exception as msg_err:
-                        logger.error(f"Ошибка получения сообщений для {response_id}: {msg_err}. Использую заглушку.")
-                        messages = []
-
-                    if not messages:
-                        # Если сопроводительного нет, берем время самого отклика
-                        now_msk = datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
-                        messages = [{
-                            'message_id': f'no_msg_{response_id}',
-                            'role': 'user',
-                            'content': "[SYSTEM COMMAND] Кандидат откликнулся без сопроводительного письма. Поздоровайся и предложи задать вопросы",
-                            'timestamp_msk': _format_timestamp_to_msk(resp.get('created_at', now_msk)) # <-- ДОБАВЛЕНО
-                        }]
-
-                    dialogue.pending_messages = messages
-                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-
-                    await statistics_manager.update_stats(db, vacancy_in_db.id, responses=1, started_dialogs=1)
-
-                    # --- ВАЖНО: КОММИТИМ СРАЗУ ДЛЯ КАЖДОГО КАНДИДАТА ---
-                    # Это гарантирует, что если мы перенесли его в consider, он сохранится в БД
-                    await db.commit()
-                    logger.info(f"✅ Диалог {response_id} успешно сохранен в БД.")
-
-                    # Проверка лимита для уведомления
-                    # УВЕДОМЛЕНИЕ О НИЗКОМ БАЛАНСЕ
-                    if settings.balance < settings.low_balance_threshold and not settings.low_limit_notified:
-                        asyncio.create_task(send_system_alert(
-                            f"⚠️ Внимание! Баланс ниже {settings.low_balance_threshold} руб. "
-                            f"Текущий остаток: {settings.balance} руб.", alert_type="balance"
-                        ))
-                        settings.low_limit_notified = True
-
-                    # Если баланс пополнили выше порога, сбрасываем флаг (опционально, но удобно)
-                    if settings.balance >= settings.low_balance_threshold:
-                        settings.low_limit_notified = False
-
-                except Exception as e:
-                    logger.error(f"Ошибка при обработке отклика {resp.get('id')}: {e}", exc_info=True)
-                    await db.rollback() # Откат только для текущего отклика
+                # --- БЕЗОПАСНЫЙ ДОСТУП К ДАННЫМ РЕЗЮМЕ ---
+                resume_info = resp.get('resume')
+                if not resume_info:
+                    logger.warning(f"Отклик {response_id} без резюме. Пропуск.")
                     continue
 
-        except Exception as e:
-            logger.error(f"Критическая ошибка в process_new_responses: {e}", exc_info=True)
-        finally:
-            logger.debug(f"process_new_responses завершено за {time.monotonic() - function_start_time:.2f}s")
+                candidate_first_name = resume_info.get('first_name', 'Неизвестно')
+                candidate_last_name = resume_info.get('last_name', '')
+                candidate_full_name = f"{candidate_first_name} {candidate_last_name}".strip()
+                candidate_hh_resume_id = resume_info.get('id')
+                # -----------------------------------------
+
+                if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
+                    continue
+
+                # Проверка существования
+                exists_query = select(func.count()).select_from(Dialogue).filter_by(hh_response_id=response_id)
+                result = await db.execute(exists_query)
+                if result.scalar() > 0:
+                    continue
+
+                # Проверка лимитов
+                settings_result = await db.execute(
+                    select(AppSettings).filter_by(id=1).with_for_update()
+                )
+                settings = settings_result.scalar_one_or_none()
+
+                if not settings:
+                    logger.error("Настройки AppSettings не найдены в БД!")
+                    continue
+
+                # ПРОВЕРКА БАЛАНСА
+                if settings.balance < settings.cost_per_dialogue:
+                    logger.warning(f"Недостаточно средств на балансе ({settings.balance}). Отклик {response_id} пропущен.")
+                    continue
+
+                logger.info(f"\nНайден новый отклик {response_id} ({candidate_full_name}).")
+
+                vacancy_in_db_result = await db.execute(
+                    select(Vacancy).filter(Vacancy.hh_vacancy_id == associated_vacancy_id_str)
+                )
+                vacancy_in_db = vacancy_in_db_result.scalar_one_or_none()
+
+                if not vacancy_in_db:
+                    logger.error(f"Вакансия {associated_vacancy_id_str} не найдена в БД. Пропуск.")
+                    continue
+
+                # Работа с кандидатом
+                candidate_result = await db.execute(
+                    select(Candidate).filter(Candidate.hh_resume_id == candidate_hh_resume_id)
+                )
+                candidate = candidate_result.scalar_one_or_none()
+                if not candidate:
+                    candidate = Candidate(
+                        hh_resume_id=candidate_hh_resume_id,
+                        full_name=candidate_full_name
+                    )
+                    db.add(candidate)
+                    try:
+                        await db.flush() # Пытаемся сохранить, чтобы получить ID
+                    except Exception:
+                        await db.rollback() # Если кто-то уже создал его секунду назад
+                        candidate_result = await db.execute(
+                            select(Candidate).filter(Candidate.hh_resume_id == candidate_hh_resume_id)
+                        )
+                        candidate = candidate_result.scalar_one_or_none()
+
+                await db.flush() # Чтобы получить ID кандидата
+
+                response_created_at_str = resp.get('created_at')
+                response_created_at_dt = None
+                if response_created_at_str:
+                    try:
+                        response_created_at_dt = datetime.datetime.fromisoformat(response_created_at_str)
+                    except (ValueError, TypeError):
+                        logger.warning(f"Не удалось распознать дату отклика: {response_created_at_str}")
+                # <<< КОНЕЦ ИСПРАВЛЕНИЯ >>>
+
+                # Создаем диалог
+                dialogue = Dialogue(
+                    hh_response_id=response_id,
+                    candidate_id=candidate.id,
+                    vacancy_id=vacancy_in_db.id,
+                    recruiter_id=recruiter_id,
+                    status='new',
+                    dialogue_state='initial_processing',
+                    response_created_at=response_created_at_dt # <<< ИСПОЛЬЗУЕМ ОБЪЕКТ DATETIME
+                )
+                db.add(dialogue)
+
+                # --- КРИТИЧЕСКИЙ МОМЕНТ: ПЕРЕМЕЩЕНИЕ ---
+                # Сначала перемещаем, чтобы зафиксировать намерение
+                await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')
+
+                # СПИСАНИЕ СРЕДСТВ + СТАТИСТИКА
+                cost = settings.cost_per_dialogue
+                settings.balance -= cost
+                settings.total_spent_on_dialogues += cost # Увеличиваем счетчик диалогов
+
+                # Пытаемся получить сообщения, но ошибка здесь НЕ ДОЛЖНА отменять создание диалога
+                try:
+                    messages_data = await hh_api.get_messages(recruiter, db, resp['messages_url'])
+                    messages = [
+                        {
+                            'message_id': str(m.get('id')),
+                            'role': 'user',
+                            'content': m['text'],
+                            'timestamp_msk': _format_timestamp_to_msk(m.get('created_at')) # <-- ДОБАВЛЕНО
+                        }
+                        for m in messages_data if m.get('text')
+                    ]
+                except Exception as msg_err:
+                    logger.error(f"Ошибка получения сообщений для {response_id}: {msg_err}. Использую заглушку.")
+                    messages = []
+
+                if not messages:
+                    # Если сопроводительного нет, берем время самого отклика
+                    now_msk = datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+                    messages = [{
+                        'message_id': f'no_msg_{response_id}',
+                        'role': 'user',
+                        'content': "[SYSTEM COMMAND] Кандидат откликнулся без сопроводительного письма. Поздоровайся и предложи задать вопросы",
+                        'timestamp_msk': _format_timestamp_to_msk(resp.get('created_at', now_msk)) # <-- ДОБАВЛЕНО
+                    }]
+
+                dialogue.pending_messages = messages
+                dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+
+                await statistics_manager.update_stats(db, vacancy_in_db.id, responses=1, started_dialogs=1)
+
+                # --- ВАЖНО: КОММИТИМ СРАЗУ ДЛЯ КАЖДОГО КАНДИДАТА ---
+                # Это гарантирует, что если мы перенесли его в consider, он сохранится в БД
+                await db.commit()
+                logger.info(f"✅ Диалог {response_id} успешно сохранен в БД.")
+
+                # Проверка лимита для уведомления
+                # УВЕДОМЛЕНИЕ О НИЗКОМ БАЛАНСЕ
+                if settings.balance < settings.low_balance_threshold and not settings.low_limit_notified:
+                    asyncio.create_task(send_system_alert(
+                        f"⚠️ Внимание! Баланс ниже {settings.low_balance_threshold} руб. "
+                        f"Текущий остаток: {settings.balance} руб.", alert_type="balance"
+                    ))
+                    settings.low_limit_notified = True
+
+                # Если баланс пополнили выше порога, сбрасываем флаг (опционально, но удобно)
+                if settings.balance >= settings.low_balance_threshold:
+                    settings.low_limit_notified = False
+
+            except Exception as e:
+                logger.error(f"Ошибка при обработке отклика {resp.get('id')}: {e}", exc_info=True)
+                await db.rollback() # Откат только для текущего отклика
+                continue
+
+    except Exception as e:
+        logger.error(f"Критическая ошибка в process_new_responses: {e}", exc_info=True)
+    finally:
+        logger.debug(f"process_new_responses завершено за {time.monotonic() - function_start_time:.2f}s")
 
 
 
-async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list):
+async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: AsyncSession): # <-- Добавлен аргумент db
     """Этап 2: Ищет новые сообщения в папках 'Подумать' и 'Собеседование'."""
     function_start_time = time.monotonic()
 
     recruiter = None
     recruiter_name_for_logging = f"ID {recruiter_id}" # Значение по умолчанию на случай, если рекрутер не найден
-    async with SessionLocal() as db:
-        try:
-            recruiter = await db.get(TrackedRecruiter, recruiter_id)
-            if not recruiter:
-                logger.warning(f"process_ongoing_responses: Рекрутер с ID {recruiter_id} не найден.")
-                return
+    
+    try:
+        recruiter = await db.get(TrackedRecruiter, recruiter_id)
+        if not recruiter:
+            logger.warning(f"process_ongoing_responses: Рекрутер с ID {recruiter_id} не найден.")
+            return
 
-            # --- ЗАГРУЗКА ЗДЕСЬ ---
-            recruiter_name_for_logging = recruiter.name
-            # --- КОНЕЦ ЗАГРУЗКИ ---
-            cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
+        # --- ЗАГРУЗКА ЗДЕСЬ ---
+        recruiter_name_for_logging = recruiter.name
+        # --- КОНЕЦ ЗАГРУЗКИ ---
+        cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
 
-            if not vacancy_ids:
-                logger.warning("Этап 2: Нет активных вакансий для проверки обновлений.")
-                return
+        if not vacancy_ids:
+            logger.warning("Этап 2: Нет активных вакансий для проверки обновлений.")
+            return
 
-            logger.debug(
-                f"Этап 2: Проверка обновлений в папках 'Подумать' и 'Собеседование' "
-                f"для {len(vacancy_ids)} вакансий..."
+        logger.debug(
+            f"Этап 2: Проверка обновлений в папках 'Подумать' и 'Собеседование' "
+            f"для {len(vacancy_ids)} вакансий..."
+        )
+
+        api_get_responses_gather_start = time.monotonic()
+
+        consider_task = hh_api.get_responses_from_folder(
+            recruiter, db, 'consider', vacancy_ids,
+            since_datetime=cutoff_date,
+            check_for_updates=True
+        )
+        interview_task = hh_api.get_responses_from_folder(
+            recruiter, db, 'interview', vacancy_ids,
+            since_datetime=cutoff_date,
+            check_for_updates=True
+        )
+
+        # Выполняем запросы параллельно
+        consider_results, interview_results = await asyncio.gather(consider_task, interview_task)
+        
+        logger.debug(
+            f"[Recruiter {recruiter_name_for_logging}] API calls took: "
+            f"{time.monotonic() - api_get_responses_gather_start:.2f} sec. "
+            f"Found {len(consider_results)} in consider, {len(interview_results)} in interview."
+        )
+
+        # Объединяем результаты в один список, помечая источник
+        # Каждая запись: (название_папки, (данные_отклика, id_вакансии))
+        tagged_responses = [('consider', item) for item in consider_results]
+        tagged_responses.extend([('interview', item) for item in interview_results])
+
+        for folder_name, (resp, _) in tagged_responses:
+            response_id = resp.get('id')
+
+            if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
+                continue
+
+            dialogue_result = await db.execute(
+                select(Dialogue).filter_by(hh_response_id=response_id).with_for_update()
             )
+            dialogue = dialogue_result.scalar_one_or_none()
+            
+            if not dialogue:
+                logger.debug(f"Найдено обновление для отклика {response_id}, которого нет в нашей БД. Пропускаем.")
+                continue
 
-            api_get_responses_gather_start = time.monotonic()
+            # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА ПАПКИ ИНТЕРВЬЮ ---
+            if folder_name == 'interview':
+                # Добавляем проверку: не трогать, если это 'forwarded_to_researcher' или уже 'post_qualification_chat'
+                if dialogue.dialogue_state not in ['post_qualification_chat', 'forwarded_to_researcher']:
+                    logger.debug(f"[{response_id}] Обнаружен в папке 'interview'. Принудительный стейт: post_qualification_chat.")
+                    dialogue.dialogue_state = 'post_qualification_chat'
+                    
+            # -----------------------------------------------------
 
-            consider_task = hh_api.get_responses_from_folder(
-                recruiter, db, 'consider', vacancy_ids,
-                since_datetime=cutoff_date,
-                check_for_updates=True
-            )
-            interview_task = hh_api.get_responses_from_folder(
-                recruiter, db, 'interview', vacancy_ids,
-                since_datetime=cutoff_date,
-                check_for_updates=True
-            )
-
-            # Выполняем запросы параллельно
-            consider_results, interview_results = await asyncio.gather(consider_task, interview_task)
+            api_get_messages_start = time.monotonic()
+            all_messages_from_api = await hh_api.get_messages(recruiter, db, resp['messages_url'])
             
             logger.debug(
-                f"[Recruiter {recruiter_name_for_logging}] API calls took: "
-                f"{time.monotonic() - api_get_responses_gather_start:.2f} sec. "
-                f"Found {len(consider_results)} in consider, {len(interview_results)} in interview."
+                f"[Recruiter {recruiter.name}, Dialogue {response_id}] "
+                f"API get_messages took: {time.monotonic() - api_get_messages_start:.2f} sec."
             )
 
-            # Объединяем результаты в один список, помечая источник
-            # Каждая запись: (название_папки, (данные_отклика, id_вакансии))
-            tagged_responses = [('consider', item) for item in consider_results]
-            tagged_responses.extend([('interview', item) for item in interview_results])
+            saved_message_ids = {str(h.get('message_id')) for h in (dialogue.history or [])}
+            pending_message_ids = {
+                str(p.get('message_id'))
+                for p in (dialogue.pending_messages or [])
+                if isinstance(p, dict)
+            }
+            seen_ids = saved_message_ids.union(pending_message_ids)
 
-            for folder_name, (resp, _) in tagged_responses:
-                response_id = resp.get('id')
-
-                if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
-                    continue
-
-                dialogue_result = await db.execute(
-                    select(Dialogue).filter_by(hh_response_id=response_id).with_for_update()
-                )
-                dialogue = dialogue_result.scalar_one_or_none()
-                
-                if not dialogue:
-                    logger.debug(f"Найдено обновление для отклика {response_id}, которого нет в нашей БД. Пропускаем.")
-                    continue
-
-                # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА ПАПКИ ИНТЕРВЬЮ ---
-                if folder_name == 'interview':
-                    # Добавляем проверку: не трогать, если это 'forwarded_to_researcher' или уже 'post_qualification_chat'
-                    if dialogue.dialogue_state not in ['post_qualification_chat', 'forwarded_to_researcher']:
-                        logger.debug(f"[{response_id}] Обнаружен в папке 'interview'. Принудительный стейт: post_qualification_chat.")
-                        dialogue.dialogue_state = 'post_qualification_chat'
-                        
-                # -----------------------------------------------------
-
-                api_get_messages_start = time.monotonic()
-                all_messages_from_api = await hh_api.get_messages(recruiter, db, resp['messages_url'])
-                
-                logger.debug(
-                    f"[Recruiter {recruiter.name}, Dialogue {response_id}] "
-                    f"API get_messages took: {time.monotonic() - api_get_messages_start:.2f} sec."
-                )
-
-                saved_message_ids = {str(h.get('message_id')) for h in (dialogue.history or [])}
-                pending_message_ids = {
-                    str(p.get('message_id'))
-                    for p in (dialogue.pending_messages or [])
-                    if isinstance(p, dict)
+            new_messages_for_pending = [
+                {
+                    'message_id': str(msg.get('id')),
+                    'role': 'user',
+                    'content': msg['text'],
+                    'timestamp_msk': _format_timestamp_to_msk(msg.get('created_at'))
                 }
-                seen_ids = saved_message_ids.union(pending_message_ids)
+                for msg in all_messages_from_api
+                if (msg.get('text') and
+                    str(msg.get('id')) not in seen_ids and
+                    msg.get('author', {}).get('participant_type') == 'applicant')
+            ]
 
-                new_messages_for_pending = [
-                    {
-                        'message_id': str(msg.get('id')),
-                        'role': 'user',
-                        'content': msg['text'],
-                        'timestamp_msk': _format_timestamp_to_msk(msg.get('created_at'))
-                    }
-                    for msg in all_messages_from_api
-                    if (msg.get('text') and
-                        str(msg.get('id')) not in seen_ids and
-                        msg.get('author', {}).get('participant_type') == 'applicant')
-                ]
+            if new_messages_for_pending:
+                if dialogue.reminder_level > 0:
+                    dialogue.reminder_level = 0
 
-                if new_messages_for_pending:
-                    if dialogue.reminder_level > 0:
-                        dialogue.reminder_level = 0
+                dialogue.pending_messages = (dialogue.pending_messages or []) + new_messages_for_pending
+                dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
 
-                    dialogue.pending_messages = (dialogue.pending_messages or []) + new_messages_for_pending
-                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                logger.info(f"Добавлено {len(new_messages_for_pending)} новых сообщений в диалог {response_id}.")
 
-                    logger.info(f"Добавлено {len(new_messages_for_pending)} новых сообщений в диалог {response_id}.")
-
-            await db.flush()
-            await db.commit()
-            
-        except Exception as e:
-            logger.error(f"Error in process_ongoing_responses: {e}", exc_info=True)
-            await db.rollback()
-            raise
-        finally:
-            logger.debug(
-                f"[Recruiter {recruiter_name_for_logging}] "
-                f"process_ongoing_responses finished in {time.monotonic() - function_start_time:.2f}s"
-            )
+        await db.flush()
+        await db.commit()
+        
+    except Exception as e:
+        logger.error(f"Error in process_ongoing_responses: {e}", exc_info=True)
+        await db.rollback()
+        raise
+    finally:
+        logger.debug(
+            f"[Recruiter {recruiter_name_for_logging}] "
+            f"process_ongoing_responses finished in {time.monotonic() - function_start_time:.2f}s"
+        )
 
 
 async def handle_scanner_recruiter(rec_id: int):
@@ -515,7 +515,6 @@ async def handle_scanner_recruiter(rec_id: int):
     async with SessionLocal() as db:
         try:
             # Пытаемся заблокировать строку рекрутера. 
-            # skip_locked=True позволяет другому воркеру просто пропустить этого рекрутера, если он уже занят
             stmt = select(TrackedRecruiter).filter_by(id=rec_id).with_for_update(skip_locked=True)
             result = await db.execute(stmt)
             recruiter = result.scalar_one_or_none()
@@ -524,24 +523,22 @@ async def handle_scanner_recruiter(rec_id: int):
                 # Если рекрутер заблокирован другим процессом, просто выходим
                 return
 
-            # Передаем db, который открыт в handle_scanner_recruiter
+            # Передаем db!
             active_vacancies = await get_all_active_vacancies_for_recruiter(rec_id, db)
             if not active_vacancies:
                 return
             vacancy_ids = [v['id'] for v in active_vacancies]
             
-            # Теперь, когда рекрутер "наш", запускаем задачи
-            await asyncio.gather(
-                process_new_responses(rec_id, vacancy_ids),
-                process_ongoing_responses(rec_id, vacancy_ids)
-            )
-            # Коммит произойдет автоматически при закрытии сессии или можно добавить явно:
+            # ВАЖНО: Запускаем последовательно и передаем db!
+            # Убираем gather, так как нельзя использовать одну сессию параллельно
+            await process_new_responses(rec_id, vacancy_ids, db)
+            await process_ongoing_responses(rec_id, vacancy_ids, db)
+            
             await db.commit()
             
         except Exception as e:
             logger.error(f"Ошибка при блокировке рекрутера {rec_id}: {e}")
             await db.rollback()
-
 
 # В начало файла добавь импорт argparse, если его нет (в твоем косте он есть вверху)
 
