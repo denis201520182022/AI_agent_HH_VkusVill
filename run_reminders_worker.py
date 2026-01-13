@@ -52,6 +52,9 @@ REMINDER_END_HOUR_LOCAL = 20 # Например, 20:00 вечера (напом�
 PRICE_PER_MILLION_INPUT_TOKENS = 0.150  # $0.150 за 1M входных токенов (gpt-4o-mini)
 PRICE_PER_MILLION_OUTPUT_TOKENS = 0.600 # $0.600 за 1M выходных токенов (gpt-4o-mini)
 
+# ВОТ ЭТУ СТРОКУ НУЖНО ДОБАВИТЬ:
+shutdown_requested = False
+
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 except ZoneInfoNotFoundError:

@@ -1822,429 +1822,429 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
         logger.debug(f"[Recruiter {recruiter_id}] process_pending_dialogues: {time.monotonic() - function_start_time:.2f}s")
 
 
-async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, semaphore: asyncio.Semaphore):
-    """
-    Обрабатывает напоминание для одного диалога в изолированной сессии.
-    """
-    async with semaphore:
-        async with SessionLocal() as db:
-            try:
-                # Загружаем диалог со всеми связями
-                dialogue = await db.get(
-                    Dialogue,
-                    dialogue_id,
-                    options=[
-                        selectinload(Dialogue.candidate),
-                        selectinload(Dialogue.vacancy),
-                        selectinload(Dialogue.inactive_alerts)
-                    ]
-                )
-                recruiter = await db.get(TrackedRecruiter, recruiter_id)
+# async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, semaphore: asyncio.Semaphore):
+#     """
+#     Обрабатывает напоминание для одного диалога в изолированной сессии.
+#     """
+#     async with semaphore:
+#         async with SessionLocal() as db:
+#             try:
+#                 # Загружаем диалог со всеми связями
+#                 dialogue = await db.get(
+#                     Dialogue,
+#                     dialogue_id,
+#                     options=[
+#                         selectinload(Dialogue.candidate),
+#                         selectinload(Dialogue.vacancy),
+#                         selectinload(Dialogue.inactive_alerts)
+#                     ]
+#                 )
+#                 recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
-                if not dialogue or not recruiter:
-                    return
+#                 if not dialogue or not recruiter:
+#                     return
 
-                # Проверка: если диалог уже не in_progress (мог измениться параллельно), выходим
-                EXCLUDED_REMINDER_STATUSES = ['declined_interview', 'declined_vacancy' 'call_later', 'refusal']
-                if (dialogue.status not in ['in_progress'] or
-                    dialogue.dialogue_state in EXCLUDED_REMINDER_STATUSES or
-                    dialogue.reminder_level >= 6): # Теперь до 6 уровня включительно
-                    return
+#                 # Проверка: если диалог уже не in_progress (мог измениться параллельно), выходим
+#                 EXCLUDED_REMINDER_STATUSES = ['declined_interview', 'declined_vacancy' 'call_later', 'refusal']
+#                 if (dialogue.status not in ['in_progress'] or
+#                     dialogue.dialogue_state in EXCLUDED_REMINDER_STATUSES or
+#                     dialogue.reminder_level >= 6): # Теперь до 6 уровня включительно
+#                     return
 
-                now = datetime.datetime.now(datetime.timezone.utc)
-                dialogue_hh_id = dialogue.hh_response_id
+#                 now = datetime.datetime.now(datetime.timezone.utc)
+#                 dialogue_hh_id = dialogue.hh_response_id
 
-                # --- API ЗАПРОС (самое долгое место) ---
-                current_folder_on_hh = await hh_api.get_negotiation_current_folder(
-                    recruiter, db, dialogue_hh_id
-                )
+#                 # --- API ЗАПРОС (самое долгое место) ---
+#                 current_folder_on_hh = await hh_api.get_negotiation_current_folder(
+#                     recruiter, db, dialogue_hh_id
+#                 )
 
-                # Логика обработки папки
-                if current_folder_on_hh is None:
-                    # Отклик удален или не найден
-                    return
-                elif current_folder_on_hh == 404:
-                    # Вакансия закрыта
-                    logger.info(f"Вакансия для диалога {dialogue_hh_id} закрыта. Обновляю статус.")
-                    dialogue.status = 'timed_out'
-                    dialogue.reminder_level = 6
-                    await db.commit()
-                    return
+#                 # Логика обработки папки
+#                 if current_folder_on_hh is None:
+#                     # Отклик удален или не найден
+#                     return
+#                 elif current_folder_on_hh == 404:
+#                     # Вакансия закрыта
+#                     logger.info(f"Вакансия для диалога {dialogue_hh_id} закрыта. Обновляю статус.")
+#                     dialogue.status = 'timed_out'
+#                     dialogue.reminder_level = 6
+#                     await db.commit()
+#                     return
 
-                elif current_folder_on_hh != 'consider':
-                    # Кандидат перемещен вручную рекрутером
-                    logger.info(f"Диалог {dialogue_hh_id} перемещен в '{current_folder_on_hh}'. Отключаю напоминания.")
-                    dialogue.status = 'recruiter_handled'
-                    dialogue.reminder_level = 3
+#                 elif current_folder_on_hh != 'consider':
+#                     # Кандидат перемещен вручную рекрутером
+#                     logger.info(f"Диалог {dialogue_hh_id} перемещен в '{current_folder_on_hh}'. Отключаю напоминания.")
+#                     dialogue.status = 'recruiter_handled'
+#                     dialogue.reminder_level = 3
 
-                    if dialogue.inactive_alerts and dialogue.inactive_alerts.status == 'pending':
-                        dialogue.inactive_alerts.status = 'cancelled'
-                        dialogue.inactive_alerts.processed_at = now
+#                     if dialogue.inactive_alerts and dialogue.inactive_alerts.status == 'pending':
+#                         dialogue.inactive_alerts.status = 'cancelled'
+#                         dialogue.inactive_alerts.processed_at = now
 
-                    await db.commit()
-                    return
+#                     await db.commit()
+#                     return
 
-                # Логика времени
-                dialogue_last_updated = dialogue.last_updated or dialogue.created_at
-                time_since_update = now - dialogue_last_updated
+#                 # Логика времени
+#                 dialogue_last_updated = dialogue.last_updated or dialogue.created_at
+#                 time_since_update = now - dialogue_last_updated
 
-                reminder_messages = []
-                next_level = None
-                should_timeout = False
+#                 reminder_messages = []
+#                 next_level = None
+#                 should_timeout = False
 
-                # Определение действия
-                if dialogue.reminder_level == 0 and time_since_update > datetime.timedelta(minutes=30):
-                    reminder_messages = [
-                        "Напишу вам ещё раз, вдруг моё прошлое сообщение затерялось где-то между делами:-). ",
-                        "Вакансия интересна или что-то смутило? Если что-то смущает, попробую разъяснить спорные моменты и подобрать для вас варианты ."
-                    ]
-                    next_level = 1
+#                 # Определение действия
+#                 if dialogue.reminder_level == 0 and time_since_update > datetime.timedelta(minutes=30):
+#                     reminder_messages = [
+#                         "Напишу вам ещё раз, вдруг моё прошлое сообщение затерялось где-то между делами:-). ",
+#                         "Вакансия интересна или что-то смутило? Если что-то смущает, попробую разъяснить спорные моменты и подобрать для вас варианты ."
+#                     ]
+#                     next_level = 1
 
-                elif dialogue.reminder_level == 1 and time_since_update > datetime.timedelta(minutes=60):
-                    reminder_messages = [
-                        "Пишу вам ещё раз, вдруг не увидели предыдущее сообщение. Если вам сейчас неудобно или вы думаете -  напишите, пожалуйста, чтобы я понимала, как лучше вам помочь."
-                    ]
-                    next_level = 2
+#                 elif dialogue.reminder_level == 1 and time_since_update > datetime.timedelta(minutes=60):
+#                     reminder_messages = [
+#                         "Пишу вам ещё раз, вдруг не увидели предыдущее сообщение. Если вам сейчас неудобно или вы думаете -  напишите, пожалуйста, чтобы я понимала, как лучше вам помочь."
+#                     ]
+#                     next_level = 2
 
-                elif dialogue.reminder_level == 2 and time_since_update > datetime.timedelta(minutes=30):
-                    should_timeout = True
+#                 elif dialogue.reminder_level == 2 and time_since_update > datetime.timedelta(minutes=30):
+#                     should_timeout = True
 
-                # --- НОВЫЕ УРОВНИ ---
-                # elif dialogue.reminder_level == 3 and time_since_update > datetime.timedelta(days=7):
-                #     reminder_messages = ["Добрый день. Если вы еще находитесь в поиске работы, то будем рады пригласить вас пройти собеседование. Готовы продолжить диалог?"]
-                #     next_level = 4
+#                 # --- НОВЫЕ УРОВНИ ---
+#                 # elif dialogue.reminder_level == 3 and time_since_update > datetime.timedelta(days=7):
+#                 #     reminder_messages = ["Добрый день. Если вы еще находитесь в поиске работы, то будем рады пригласить вас пройти собеседование. Готовы продолжить диалог?"]
+#                 #     next_level = 4
 
-                # elif dialogue.reminder_level == 4 and time_since_update > datetime.timedelta(days=21):
-                #     reminder_messages = ["Добрый день. Вы трудоустроились? Если еще рассматриваете варианты, будем рады предложить вам пройти собеседование. А так же ответить на все вопросы, которые у вас есть. "]
-                #     next_level = 5
+#                 # elif dialogue.reminder_level == 4 and time_since_update > datetime.timedelta(days=21):
+#                 #     reminder_messages = ["Добрый день. Вы трудоустроились? Если еще рассматриваете варианты, будем рады предложить вам пройти собеседование. А так же ответить на все вопросы, которые у вас есть. "]
+#                 #     next_level = 5
 
-                # elif dialogue.reminder_level == 5 and time_since_update > datetime.timedelta(days=51):
-                #     reminder_messages = ["Еще раз добрый день. Как ваши дела? Хотели бы сообщить вам, что вакансия вновь актуальна и если вы в поиске или задумываетесь о смене работы, мы с удовольствием пригласили бы вас на собеседование"]
-                #     next_level = 6
+#                 # elif dialogue.reminder_level == 5 and time_since_update > datetime.timedelta(days=51):
+#                 #     reminder_messages = ["Еще раз добрый день. Как ваши дела? Хотели бы сообщить вам, что вакансия вновь актуальна и если вы в поиске или задумываетесь о смене работы, мы с удовольствием пригласили бы вас на собеседование"]
+#                 #     next_level = 6
 
-                # Выполнение действия
-                if should_timeout:
-                    # ТВОЕ ТРЕБОВАНИЕ: Если запись уже есть, ничего не делаем с таблицей молчунов
-                    if not dialogue.inactive_alerts:
-                        db.add(InactiveNotificationQueue(dialogue_id=dialogue.id, status='pending'))
-                        logger.info(f"Диалог {dialogue_hh_id} впервые добавлен в InactiveNotificationQueue.")
-                    else:
-                        logger.debug(f"Диалог {dialogue_hh_id} уже зафиксирован в таблице молчунов. Повторная запись не требуется.")
+#                 # Выполнение действия
+#                 if should_timeout:
+#                     # ТВОЕ ТРЕБОВАНИЕ: Если запись уже есть, ничего не делаем с таблицей молчунов
+#                     if not dialogue.inactive_alerts:
+#                         db.add(InactiveNotificationQueue(dialogue_id=dialogue.id, status='pending'))
+#                         logger.info(f"Диалог {dialogue_hh_id} впервые добавлен в InactiveNotificationQueue.")
+#                     else:
+#                         logger.debug(f"Диалог {dialogue_hh_id} уже зафиксирован в таблице молчунов. Повторная запись не требуется.")
 
-                    # Но статус самого диалога и уровень напоминания обновляем в любом случае,
-                    # чтобы пошел отсчет 7 дней для уровня 4.
-                    dialogue.status = 'timed_out'
-                    dialogue.reminder_level = 3
-                    dialogue.last_updated = now
-                    await db.commit()
+#                     # Но статус самого диалога и уровень напоминания обновляем в любом случае,
+#                     # чтобы пошел отсчет 7 дней для уровня 4.
+#                     dialogue.status = 'timed_out'
+#                     dialogue.reminder_level = 3
+#                     dialogue.last_updated = now
+#                     await db.commit()
 
-                elif reminder_messages:
-                    logger.info(f"Отправка напоминания уровня {next_level} для диалога {dialogue_hh_id}.")
+#                 elif reminder_messages:
+#                     logger.info(f"Отправка напоминания уровня {next_level} для диалога {dialogue_hh_id}.")
 
-                    # 1. Определяем типы напоминаний
-                    is_long_reminder = next_level in [4, 5, 6]
-                    # ТВОЕ ТРЕБОВАНИЕ: Списываем деньги только один раз (при переходе на 4 уровень)
-                    should_charge = (next_level == 4) 
+#                     # 1. Определяем типы напоминаний
+#                     is_long_reminder = next_level in [4, 5, 6]
+#                     # ТВОЕ ТРЕБОВАНИЕ: Списываем деньги только один раз (при переходе на 4 уровень)
+#                     should_charge = (next_level == 4) 
                     
-                    settings = None
+#                     settings = None
 
-                    # 2. Проверяем баланс только если это ПЕРВОЕ долгое напоминание
-                    if should_charge:
-                        # Добавляем .with_for_update()
-                        settings_res = await db.execute(
-                            select(AppSettings).filter_by(id=1).with_for_update()
-                        )
-                        settings = settings_res.scalar_one_or_none()
+#                     # 2. Проверяем баланс только если это ПЕРВОЕ долгое напоминание
+#                     if should_charge:
+#                         # Добавляем .with_for_update()
+#                         settings_res = await db.execute(
+#                             select(AppSettings).filter_by(id=1).with_for_update()
+#                         )
+#                         settings = settings_res.scalar_one_or_none()
                         
-                        if not settings or settings.balance < settings.cost_per_long_reminder:
-                            logger.warning(f"Баланс пуст. Первое долгое напоминание для {dialogue_hh_id} отменено.")
-                            return 
+#                         if not settings or settings.balance < settings.cost_per_long_reminder:
+#                             logger.warning(f"Баланс пуст. Первое долгое напоминание для {dialogue_hh_id} отменено.")
+#                             return 
 
-                    all_sent = True
-                    for msg in reminder_messages:
-                        status_code = await hh_api.send_message(recruiter, db, dialogue_hh_id, msg)
+#                     all_sent = True
+#                     for msg in reminder_messages:
+#                         status_code = await hh_api.send_message(recruiter, db, dialogue_hh_id, msg)
 
-                        if status_code == 200:
-                            # Записываем сообщение в историю
-                            new_history_entry = {
-                                'role': 'assistant', 
-                                'content': msg,
-                                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
-                            }
-                            current_history = list(dialogue.history) if dialogue.history else []
-                            current_history.append(new_history_entry)
+#                         if status_code == 200:
+#                             # Записываем сообщение в историю
+#                             new_history_entry = {
+#                                 'role': 'assistant', 
+#                                 'content': msg,
+#                                 'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+#                             }
+#                             current_history = list(dialogue.history) if dialogue.history else []
+#                             current_history.append(new_history_entry)
 
-                            # Добавляем системную команду (для всех уровней 4, 5, 6)
-                            if is_long_reminder:
-                                system_instruction = {
-                                    'role': 'user',
-                                    'content': (
-                                        "[SYSTEM COMMAND] если кандидат ответит после этого сообщения, то ты должен "
-                                        "продолжить диалог по плану разговора, опираясь на текущее состояние (state), "
-                                        "и не забывай перед переходом к анкете спросить про вопросы и ответить на них!"
-                                    )
-                                }
-                                current_history.append(system_instruction)
+#                             # Добавляем системную команду (для всех уровней 4, 5, 6)
+#                             if is_long_reminder:
+#                                 system_instruction = {
+#                                     'role': 'user',
+#                                     'content': (
+#                                         "[SYSTEM COMMAND] если кандидат ответит после этого сообщения, то ты должен "
+#                                         "продолжить диалог по плану разговора, опираясь на текущее состояние (state), "
+#                                         "и не забывай перед переходом к анкете спросить про вопросы и ответить на них!"
+#                                     )
+#                                 }
+#                                 current_history.append(system_instruction)
                             
-                            dialogue.history = current_history[-150:]
+#                             dialogue.history = current_history[-150:]
 
-                            # 3. СПИСЫВАЕМ ДЕНЬГИ (только если это уровень 4)
-                            # 3. СПИСЫВАЕМ ДЕНЬГИ + СТАТИСТИКА
-                            if should_charge and settings:
-                                cost = settings.cost_per_long_reminder
-                                settings.balance -= cost
-                                settings.total_spent_on_reminders += cost # Увеличиваем счетчик напоминалок
-                                logger.info(f"ЕДИНОВРЕМЕННОЕ СПИСАНИЕ: {cost} руб. Всего на дожимы потрачено: {settings.total_spent_on_reminders}")
-                        elif status_code == 403:
-                             # Вакансия закрыта или доступ запрещен
-                             dialogue.reminder_level = 6
-                             dialogue.status = 'vacancy_closed'
-                             await db.commit()
-                             all_sent = False
-                             break # Прерываем цикл
-                        else:
-                            all_sent = False # Ошибка отправки
+#                             # 3. СПИСЫВАЕМ ДЕНЬГИ (только если это уровень 4)
+#                             # 3. СПИСЫВАЕМ ДЕНЬГИ + СТАТИСТИКА
+#                             if should_charge and settings:
+#                                 cost = settings.cost_per_long_reminder
+#                                 settings.balance -= cost
+#                                 settings.total_spent_on_reminders += cost # Увеличиваем счетчик напоминалок
+#                                 logger.info(f"ЕДИНОВРЕМЕННОЕ СПИСАНИЕ: {cost} руб. Всего на дожимы потрачено: {settings.total_spent_on_reminders}")
+#                         elif status_code == 403:
+#                              # Вакансия закрыта или доступ запрещен
+#                              dialogue.reminder_level = 6
+#                              dialogue.status = 'vacancy_closed'
+#                              await db.commit()
+#                              all_sent = False
+#                              break # Прерываем цикл
+#                         else:
+#                             all_sent = False # Ошибка отправки
 
-                    # Если не было критической ошибки (403), обновляем уровень и время
-                    if all_sent or status_code == 200:
-                        dialogue.reminder_level = next_level
-                        dialogue.last_updated = now
-                        await db.commit()
+#                     # Если не было критической ошибки (403), обновляем уровень и время
+#                     if all_sent or status_code == 200:
+#                         dialogue.reminder_level = next_level
+#                         dialogue.last_updated = now
+#                         await db.commit()
 
-            except Exception as e:
-                logger.error(f"Ошибка в задаче напоминания для диалога {dialogue_id}: {e}")
-                # Не рейзим ошибку, чтобы не поломать gather
+#             except Exception as e:
+#                 logger.error(f"Ошибка в задаче напоминания для диалога {dialogue_id}: {e}")
+#                 # Не рейзим ошибку, чтобы не поломать gather
 
 
-async def process_reminders(recruiter_id: int, db: AsyncSession):
-    """
-    Этап 4: Параллельная отправка напоминаний.
-    Аргумент db здесь используется только для получения списка ID,
-    далее каждый таск создает свою сессию.
-    """
-    function_start_time = time.monotonic()
+# async def process_reminders(recruiter_id: int, db: AsyncSession):
+#     """
+#     Этап 4: Параллельная отправка напоминаний.
+#     Аргумент db здесь используется только для получения списка ID,
+#     далее каждый таск создает свою сессию.
+#     """
+#     function_start_time = time.monotonic()
 
-    # Семафор для ограничения одновременных проверок напоминаний (чтобы не убить базу)
-    # Можно использовать тот же MAX_CONCURRENT_DIALOGUES или создать свой
-    REMINDER_SEMAPHORE = asyncio.Semaphore(20)
+#     # Семафор для ограничения одновременных проверок напоминаний (чтобы не убить базу)
+#     # Можно использовать тот же MAX_CONCURRENT_DIALOGUES или создать свой
+#     REMINDER_SEMAPHORE = asyncio.Semaphore(20)
 
-    try:
-        # 1. Проверка времени (быстро)
-        if SPB_TIMEZONE is None:
-            return
+#     try:
+#         # 1. Проверка времени (быстро)
+#         if SPB_TIMEZONE is None:
+#             return
 
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        current_time_spb = now_utc.astimezone(SPB_TIMEZONE)
+#         now_utc = datetime.datetime.now(datetime.timezone.utc)
+#         current_time_spb = now_utc.astimezone(SPB_TIMEZONE)
 
-        if not (REMINDER_START_HOUR_LOCAL <= current_time_spb.hour < REMINDER_END_HOUR_LOCAL):
-            # Вне рабочего времени просто выходим, не нагружая базу
-            return
+#         if not (REMINDER_START_HOUR_LOCAL <= current_time_spb.hour < REMINDER_END_HOUR_LOCAL):
+#             # Вне рабочего времени просто выходим, не нагружая базу
+#             return
 
-        # 2. Быстрая выборка ТОЛЬКО ID кандидатов, которым (возможно) нужны напоминания
-        # Мы не грузим здесь объекты целиком, только ID
-        EXCLUDED_REMINDER_STATUSES = ['declined_vacancy', 'declined_interview', 'call_later', 'refusal']
+#         # 2. Быстрая выборка ТОЛЬКО ID кандидатов, которым (возможно) нужны напоминания
+#         # Мы не грузим здесь объекты целиком, только ID
+#         EXCLUDED_REMINDER_STATUSES = ['declined_vacancy', 'declined_interview', 'call_later', 'refusal']
 
-        result = await db.execute(
-            select(Dialogue.id)
-            .filter(
-                Dialogue.recruiter_id == recruiter_id,
-                # ИЗМЕНЕНИЕ: Разрешаем обработку и для тех, кто уже в статусе timed_out,
-                # но еще не достиг финального уровня напоминаний
-                Dialogue.status.in_(['in_progress']), 
+#         result = await db.execute(
+#             select(Dialogue.id)
+#             .filter(
+#                 Dialogue.recruiter_id == recruiter_id,
+#                 # ИЗМЕНЕНИЕ: Разрешаем обработку и для тех, кто уже в статусе timed_out,
+#                 # но еще не достиг финального уровня напоминаний
+#                 Dialogue.status.in_(['in_progress']), 
 
-                Dialogue.dialogue_state.notin_(EXCLUDED_REMINDER_STATUSES),
-                Dialogue.reminder_level < 6 # 6 — это будет последнее напоминание (21 день)
-            )
-        )
-        candidate_ids_to_check = result.scalars().all()
+#                 Dialogue.dialogue_state.notin_(EXCLUDED_REMINDER_STATUSES),
+#                 Dialogue.reminder_level < 6 # 6 — это будет последнее напоминание (21 день)
+#             )
+#         )
+#         candidate_ids_to_check = result.scalars().all()
 
-        if not candidate_ids_to_check:
-            return
+#         if not candidate_ids_to_check:
+#             return
 
-        logger.debug(f"Запуск параллельной проверки напоминаний для {len(candidate_ids_to_check)} диалогов...")
+#         logger.debug(f"Запуск параллельной проверки напоминаний для {len(candidate_ids_to_check)} диалогов...")
 
-        # 3. Создаем задачи для параллельного выполнения
-        tasks = [
-            _process_single_reminder_task(d_id, recruiter_id, REMINDER_SEMAPHORE)
-            for d_id in candidate_ids_to_check
-        ]
+#         # 3. Создаем задачи для параллельного выполнения
+#         tasks = [
+#             _process_single_reminder_task(d_id, recruiter_id, REMINDER_SEMAPHORE)
+#             for d_id in candidate_ids_to_check
+#         ]
 
-        # 4. Запускаем и ждем выполнения (return_exceptions=True чтобы ошибка в одном не крашила всё)
-        await asyncio.gather(*tasks, return_exceptions=True)
+#         # 4. Запускаем и ждем выполнения (return_exceptions=True чтобы ошибка в одном не крашила всё)
+#         await asyncio.gather(*tasks, return_exceptions=True)
 
-    except Exception as e:
-        logger.error(f"Ошибка в process_reminders (диспетчер): {e}", exc_info=True)
-    finally:
-        logger.debug(
-            f"[Recruiter ID {recruiter_id}] "
-            f"process_reminders finished in {time.monotonic() - function_start_time:.2f}s"
-        )
+#     except Exception as e:
+#         logger.error(f"Ошибка в process_reminders (диспетчер): {e}", exc_info=True)
+#     finally:
+#         logger.debug(
+#             f"[Recruiter ID {recruiter_id}] "
+#             f"process_reminders finished in {time.monotonic() - function_start_time:.2f}s"
+#         )
 
-async def check_and_send_interview_reminders():
-    """
-    Фоновая задача, которая проверяет очередь InterviewReminder
-    и рассылает запланированные уведомления кандидатам на HH.ru.
-    """
-    logger.info("Фоновый обработчик напоминаний о собеседованиях запущен.")
+# async def check_and_send_interview_reminders():
+#     """
+#     Фоновая задача, которая проверяет очередь InterviewReminder
+#     и рассылает запланированные уведомления кандидатам на HH.ru.
+#     """
+#     logger.info("Фоновый обработчик напоминаний о собеседованиях запущен.")
 
-    # Шаблоны сообщений (это черновик, нужны будут точные тексты)
-    MESSAGE_TEMPLATES = {
-        '2_hours_before': (
-            "Здравствуйте! Напоминаю, что у вас запланировано собеседование по вакансии "
-            "'{vacancy_title}' сегодня в {interview_time_spb} по московскому времени. "
-            "Пожалуйста, будьте готовы."
-        ),
-        '1_day_before_20h_spb': (
-            "Добрый вечер! Напоминаю, что завтра, {interview_date_spb} в {interview_time_spb} "
-            "по московскому времени, у вас назначено собеседование по вакансии '{vacancy_title}'. "
-            "Если у вас есть вопросы, напишите нам."
-        ),
-        'day_of_9h_spb': (
-            "Доброе утро! Сегодня, {interview_date_spb} в {interview_time_spb} "
-            "по московскому времени, состоится ваше собеседование по вакансии '{vacancy_title}'. "
-            "Будем ждать вас!"
-        )
-    }
+#     # Шаблоны сообщений (это черновик, нужны будут точные тексты)
+#     MESSAGE_TEMPLATES = {
+#         '2_hours_before': (
+#             "Здравствуйте! Напоминаю, что у вас запланировано собеседование по вакансии "
+#             "'{vacancy_title}' сегодня в {interview_time_spb} по московскому времени. "
+#             "Пожалуйста, будьте готовы."
+#         ),
+#         '1_day_before_20h_spb': (
+#             "Добрый вечер! Напоминаю, что завтра, {interview_date_spb} в {interview_time_spb} "
+#             "по московскому времени, у вас назначено собеседование по вакансии '{vacancy_title}'. "
+#             "Если у вас есть вопросы, напишите нам."
+#         ),
+#         'day_of_9h_spb': (
+#             "Доброе утро! Сегодня, {interview_date_spb} в {interview_time_spb} "
+#             "по московскому времени, состоится ваше собеседование по вакансии '{vacancy_title}'. "
+#             "Будем ждать вас!"
+#         )
+#     }
 
-    # Определяем часовой пояс Санкт-Петербурга
-    try:
-        SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
-    except ZoneInfoNotFoundError: # <--- Нужно импортировать ZoneInfoNotFoundError в hh_worker/main.py тоже
-        logger.critical("Часовой пояс 'Europe/Moscow' не найден. Напоминания не будут отправляться.")
-        SPB_TIMEZONE = None
-        return
+#     # Определяем часовой пояс Санкт-Петербурга
+#     try:
+#         SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
+#     except ZoneInfoNotFoundError: # <--- Нужно импортировать ZoneInfoNotFoundError в hh_worker/main.py тоже
+#         logger.critical("Часовой пояс 'Europe/Moscow' не найден. Напоминания не будут отправляться.")
+#         SPB_TIMEZONE = None
+#         return
 
-    while True:
-        if shutdown_requested:
-            logger.info("Задача отправки напоминаний о собеседованиях остановлена из-за запроса на завершение работы.")
-            break
+#     while True:
+#         if shutdown_requested:
+#             logger.info("Задача отправки напоминаний о собеседованиях остановлена из-за запроса на завершение работы.")
+#             break
 
-        if SPB_TIMEZONE is None:
-            await asyncio.sleep(60) # Ждем, если часовой пояс не определен
-            continue
+#         if SPB_TIMEZONE is None:
+#             await asyncio.sleep(60) # Ждем, если часовой пояс не определен
+#             continue
 
-        async with SessionLocal() as db_session:
-            try:
-                now_utc = datetime.datetime.now(datetime.timezone.utc)
+#         async with SessionLocal() as db_session:
+#             try:
+#                 now_utc = datetime.datetime.now(datetime.timezone.utc)
 
-                # Выбираем напоминания, которые пора отправить
-                # Используем selectinload для всех необходимых связей
-                result = await db_session.execute(
-                    select(InterviewReminder)
-                    .options(
-                        selectinload(InterviewReminder.dialogue)
-                        .selectinload(Dialogue.vacancy),
-                        selectinload(InterviewReminder.dialogue)
-                        .selectinload(Dialogue.candidate),
-                        selectinload(InterviewReminder.recruiter) # Загружаем рекрутера напрямую
-                    )
-                    .filter(
-                        InterviewReminder.status == 'pending',
-                        InterviewReminder.scheduled_send_time_utc <= now_utc
-                    )
-                    .limit(20) # Обрабатываем по 20 за раз
-                )
-                reminders_to_send = result.scalars().all()
+#                 # Выбираем напоминания, которые пора отправить
+#                 # Используем selectinload для всех необходимых связей
+#                 result = await db_session.execute(
+#                     select(InterviewReminder)
+#                     .options(
+#                         selectinload(InterviewReminder.dialogue)
+#                         .selectinload(Dialogue.vacancy),
+#                         selectinload(InterviewReminder.dialogue)
+#                         .selectinload(Dialogue.candidate),
+#                         selectinload(InterviewReminder.recruiter) # Загружаем рекрутера напрямую
+#                     )
+#                     .filter(
+#                         InterviewReminder.status == 'pending',
+#                         InterviewReminder.scheduled_send_time_utc <= now_utc
+#                     )
+#                     .limit(20) # Обрабатываем по 20 за раз
+#                 )
+#                 reminders_to_send = result.scalars().all()
 
-                if not reminders_to_send:
-                    # logger.debug("[Interview Reminders] Нет ожидающих напоминаний. Пауза.")
-                    await asyncio.sleep(30) # Пауза, если нет задач
-                    continue
+#                 if not reminders_to_send:
+#                     # logger.debug("[Interview Reminders] Нет ожидающих напоминаний. Пауза.")
+#                     await asyncio.sleep(30) # Пауза, если нет задач
+#                     continue
 
-                logger.info(f"[Interview Reminders] Найдено {len(reminders_to_send)} напоминаний для отправки.")
+#                 logger.info(f"[Interview Reminders] Найдено {len(reminders_to_send)} напоминаний для отправки.")
 
-                for reminder in reminders_to_send:
-                    try:
-                        dialogue = reminder.dialogue
-                        recruiter = reminder.recruiter # Объект рекрутера уже загружен
-                        vacancy = dialogue.vacancy
-                        candidate = dialogue.candidate
+#                 for reminder in reminders_to_send:
+#                     try:
+#                         dialogue = reminder.dialogue
+#                         recruiter = reminder.recruiter # Объект рекрутера уже загружен
+#                         vacancy = dialogue.vacancy
+#                         candidate = dialogue.candidate
 
-                        if not dialogue or not recruiter or not vacancy or not candidate:
-                            logger.error(
-                                f"Не удалось загрузить связанные объекты для напоминания {reminder.id}. "
-                                f"Dialogue: {bool(dialogue)}, Recruiter: {bool(recruiter)}, "
-                                f"Vacancy: {bool(vacancy)}, Candidate: {bool(candidate)}"
-                            )
-                            reminder.status = 'error'
-                            reminder.processed_at = now_utc
-                            await db_session.commit()
-                            continue
+#                         if not dialogue or not recruiter or not vacancy or not candidate:
+#                             logger.error(
+#                                 f"Не удалось загрузить связанные объекты для напоминания {reminder.id}. "
+#                                 f"Dialogue: {bool(dialogue)}, Recruiter: {bool(recruiter)}, "
+#                                 f"Vacancy: {bool(vacancy)}, Candidate: {bool(candidate)}"
+#                             )
+#                             reminder.status = 'error'
+#                             reminder.processed_at = now_utc
+#                             await db_session.commit()
+#                             continue
 
-                        if not recruiter.access_token:
-                            logger.error(f"У рекрутера {recruiter.name} (ID: {recruiter.id}) нет access_token. Не могу отправить напоминание {reminder.id}.")
-                            reminder.status = 'error'
-                            reminder.processed_at = now_utc
-                            await db_session.commit()
-                            continue
+#                         if not recruiter.access_token:
+#                             logger.error(f"У рекрутера {recruiter.name} (ID: {recruiter.id}) нет access_token. Не могу отправить напоминание {reminder.id}.")
+#                             reminder.status = 'error'
+#                             reminder.processed_at = now_utc
+#                             await db_session.commit()
+#                             continue
 
-                        # Форматируем дату и время собеседования для сообщения
-                        interview_datetime_spb = reminder.interview_datetime_utc.astimezone(SPB_TIMEZONE)
-                        interview_date_spb = interview_datetime_spb.strftime("%d.%m.%Y")
-                        interview_time_spb = interview_datetime_spb.strftime("%H:%M")
+#                         # Форматируем дату и время собеседования для сообщения
+#                         interview_datetime_spb = reminder.interview_datetime_utc.astimezone(SPB_TIMEZONE)
+#                         interview_date_spb = interview_datetime_spb.strftime("%d.%m.%Y")
+#                         interview_time_spb = interview_datetime_spb.strftime("%H:%M")
 
-                        # Получаем шаблон сообщения
-                        template = MESSAGE_TEMPLATES.get(reminder.notification_type)
-                        if not template:
-                            logger.error(f"Не найден шаблон сообщения для типа уведомления '{reminder.notification_type}'. Напоминание {reminder.id} не будет отправлено.")
-                            reminder.status = 'error'
-                            reminder.processed_at = now_utc
-                            await db_session.commit()
-                            continue
+#                         # Получаем шаблон сообщения
+#                         template = MESSAGE_TEMPLATES.get(reminder.notification_type)
+#                         if not template:
+#                             logger.error(f"Не найден шаблон сообщения для типа уведомления '{reminder.notification_type}'. Напоминание {reminder.id} не будет отправлено.")
+#                             reminder.status = 'error'
+#                             reminder.processed_at = now_utc
+#                             await db_session.commit()
+#                             continue
 
-                        message_text = template.format(
-                            vacancy_title=vacancy.title,
-                            candidate_full_name=candidate.full_name, # Можно использовать, если нужно
-                            interview_date_spb=interview_date_spb,
-                            interview_time_spb=interview_time_spb
-                        )
+#                         message_text = template.format(
+#                             vacancy_title=vacancy.title,
+#                             candidate_full_name=candidate.full_name, # Можно использовать, если нужно
+#                             interview_date_spb=interview_date_spb,
+#                             interview_time_spb=interview_time_spb
+#                         )
 
-                        logger.info(f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}...")
+#                         logger.info(f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}...")
 
-                        # Отправка сообщения кандидату через HH API
-                        # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-                        send_result = await hh_api.send_message(
-                            recruiter=recruiter,
-                            db=db_session,
-                            negotiation_id=dialogue.hh_response_id,
-                            message_text=message_text
-                        )
+#                         # Отправка сообщения кандидату через HH API
+#                         # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
+#                         send_result = await hh_api.send_message(
+#                             recruiter=recruiter,
+#                             db=db_session,
+#                             negotiation_id=dialogue.hh_response_id,
+#                             message_text=message_text
+#                         )
 
-                        if send_result == 200:
-                            # УСПЕХ
-                            reminder.status = 'sent'
-                            logger.info(f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}.")
+#                         if send_result == 200:
+#                             # УСПЕХ
+#                             reminder.status = 'sent'
+#                             logger.info(f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}.")
 
-                        elif send_result == 403:
-                            # ВАКАНСИЯ ЗАКРЫТА
-                            reminder.status = 'cancelled' # Отменяем, так как отправлять бессмысленно
-                            logger.warning(
-                                f"Напоминание {reminder.id} ОТМЕНЕНО: Вакансия закрыта/в архиве. "
-                                f"Кандидат: {candidate.full_name}, Диалог: {dialogue.hh_response_id}"
-                            )
+#                         elif send_result == 403:
+#                             # ВАКАНСИЯ ЗАКРЫТА
+#                             reminder.status = 'cancelled' # Отменяем, так как отправлять бессмысленно
+#                             logger.warning(
+#                                 f"Напоминание {reminder.id} ОТМЕНЕНО: Вакансия закрыта/в архиве. "
+#                                 f"Кандидат: {candidate.full_name}, Диалог: {dialogue.hh_response_id}"
+#                             )
 
-                        else:
-                            # ПРОЧИЕ ОШИБКИ (False или другие коды)
-                            reminder.status = 'error'
-                            logger.error(f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error).")
-                        # -----------------------
+#                         else:
+#                             # ПРОЧИЕ ОШИБКИ (False или другие коды)
+#                             reminder.status = 'error'
+#                             logger.error(f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error).")
+#                         # -----------------------
 
-                        reminder.processed_at = now_utc
-                        await db_session.commit() # Коммитим каждое напоминание отдельно для надежности
+#                         reminder.processed_at = now_utc
+#                         await db_session.commit() # Коммитим каждое напоминание отдельно для надежности
 
-                    except Exception as e:
-                        logger.error(f"Ошибка при обработке напоминания {reminder.id}: {e}", exc_info=True)
-                        if reminder.id: # Убедимся, что reminder объект существует
-                            reminder.status = 'error'
-                            reminder.processed_at = now_utc
-                            await db_session.commit() # Попытаемся сохранить статус ошибки
-                        else:
-                            await db_session.rollback() # Откатываем, если ошибка до создания reminder
-            except Exception as e:
-                logger.critical(f"Критическая ошибка в фоновом обработчике напоминаний о собеседованиях: {e}", exc_info=True)
-                await db_session.rollback() # Откат при ошибке верхнего уровня
+#                     except Exception as e:
+#                         logger.error(f"Ошибка при обработке напоминания {reminder.id}: {e}", exc_info=True)
+#                         if reminder.id: # Убедимся, что reminder объект существует
+#                             reminder.status = 'error'
+#                             reminder.processed_at = now_utc
+#                             await db_session.commit() # Попытаемся сохранить статус ошибки
+#                         else:
+#                             await db_session.rollback() # Откатываем, если ошибка до создания reminder
+#             except Exception as e:
+#                 logger.critical(f"Критическая ошибка в фоновом обработчике напоминаний о собеседованиях: {e}", exc_info=True)
+#                 await db_session.rollback() # Откат при ошибке верхнего уровня
 
-        await asyncio.sleep(30) # Пауза между циклами проверки
+#         await asyncio.sleep(30) # Пауза между циклами проверки
 
 
 
@@ -2310,15 +2310,15 @@ async def handle_single_recruiter(rec_id: int, prompt_library: dict):
             # Не прерываем - идем к напоминаниям
 
         # ЭТАП 4: Напоминания (ОТДЕЛЬНАЯ сессия - независимая операция)
-        async with SessionLocal() as reminders_db:
-            try:
-                reminders_start = time.monotonic()
-                await process_reminders(rec_id, reminders_db)
-                await reminders_db.commit()
-                logger.debug(f"[{recruiter_name}] Reminders phase: {time.monotonic() - reminders_start:.2f}s")
-            except Exception as e:
-                logger.error(f"[{recruiter_name}] Reminders phase failed: {e}", exc_info=True)
-                await reminders_db.rollback()
+        # async with SessionLocal() as reminders_db:
+        #     try:
+        #         reminders_start = time.monotonic()
+        #         await process_reminders(rec_id, reminders_db)
+        #         await reminders_db.commit()
+        #         logger.debug(f"[{recruiter_name}] Reminders phase: {time.monotonic() - reminders_start:.2f}s")
+        #     except Exception as e:
+        #         logger.error(f"[{recruiter_name}] Reminders phase failed: {e}", exc_info=True)
+        #         await reminders_db.rollback()
 
     except Exception as e:
         logger.error(f"Critical error in handle_single_recruiter {rec_id}: {e}", exc_info=True)
@@ -2370,7 +2370,8 @@ async def main():
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("HH-Worker запускается...")
-    
+    # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
+    # interview_reminders_task = asyncio.create_task(check_and_send_interview_reminders())
     # --- КОНЕЦ ДОБАВЛЕНИЯ ---
     try:
         while not shutdown_requested:
