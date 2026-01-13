@@ -1,15 +1,12 @@
-# hr_bot/utils/redis_lock.py
-
 import asyncio
 import logging
 import time
 import os
 from redis.asyncio import Redis
-from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
 
-# Инициализация глобального клиента Redis (будет создан при первом вызове)
+# Инициализация глобального клиента Redis
 _redis_client = None
 
 def get_redis_client():
@@ -17,13 +14,20 @@ def get_redis_client():
     if _redis_client is None:
         host = os.getenv("REDIS_HOST", "localhost")
         port = int(os.getenv("REDIS_PORT", 6379))
-        password = os.getenv("REDIS_PASSWORD", None)
-        db = int(os.getenv("REDIS_DB", 0))
+        
+        # --- ИСПРАВЛЕНИЕ: ПРАВИЛЬНАЯ ОБРАБОТКА ПАРОЛЯ ---
+        password = os.getenv("REDIS_PASSWORD")
+        if not password:  # Если вернулась пустая строка "" или None
+            password = None
+        # ------------------------------------------------
+        
+        db_index = int(os.getenv("REDIS_DB", 0)) 
+        
         _redis_client = Redis(
             host=host, 
             port=port, 
-            password=password,
-            db=db, 
+            password=password, 
+            db=db_index,
             decode_responses=True
         )
     return _redis_client
@@ -31,14 +35,12 @@ def get_redis_client():
 class DistributedSemaphore:
     """
     Распределенный семафор на базе Redis.
-    Гарантирует, что во всей системе (среди всех воркеров)
-    одновременно выполняется не более `limit` операций.
     """
     def __init__(self, name: str, limit: int, timeout: int = 60):
         self.client = get_redis_client()
         self.name = f"semaphore:{name}"
         self.limit = limit
-        self.timeout = timeout # Время жизни ключа (на случай краша воркера)
+        self.timeout = timeout 
 
     async def __aenter__(self):
         await self.acquire()
@@ -50,9 +52,6 @@ class DistributedSemaphore:
     async def acquire(self):
         """Пытается захватить слот. Если слотов нет — ждет."""
         while True:
-            # Lua скрипт для атомарной проверки и инкремента
-            # Если текущее значение < лимита: инкрементируем, обновляем TTL, возвращаем 1 (успех)
-            # Иначе: возвращаем 0 (неудача)
             lua_script = """
             local current = redis.call('get', KEYS[1])
             if current == false then
@@ -69,17 +68,20 @@ class DistributedSemaphore:
                 return 0
             end
             """
-            result = await self.client.eval(lua_script, 1, self.name, self.limit, self.timeout)
+            try:
+                result = await self.client.eval(lua_script, 1, self.name, self.limit, self.timeout)
+                
+                if result == 1:
+                    return True
+            except Exception as e:
+                logger.error(f"Redis error acquiring semaphore: {e}")
+                await asyncio.sleep(1)
+                continue
             
-            if result == 1:
-                # logger.debug(f"Acquired semaphore {self.name}")
-                return True
-            
-            # Если не удалось захватить, ждем немного и пробуем снова
-            await asyncio.sleep(0.1 + (0.05 * (id(self) % 10))) # Небольшой джиттер
+            await asyncio.sleep(0.1 + (0.05 * (id(self) % 10)))
 
     async def release(self):
-        """Освобождает слот (декремент)."""
+        """Освобождает слот."""
         lua_script = """
         local current = redis.call('get', KEYS[1])
         if current == false then
@@ -93,8 +95,10 @@ class DistributedSemaphore:
             end
         end
         """
-        await self.client.eval(lua_script, 1, self.name)
-        # logger.debug(f"Released semaphore {self.name}")
+        try:
+            await self.client.eval(lua_script, 1, self.name)
+        except Exception as e:
+            logger.error(f"Redis error releasing semaphore: {e}")
 
 async def close_redis():
     """Закрывает соединение при остановке приложения"""
