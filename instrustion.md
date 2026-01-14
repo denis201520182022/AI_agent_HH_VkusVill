@@ -56,3 +56,15 @@ docker compose logs -f
 
 docker compose logs -f hh_scanner
 docker compose restart hh_scanner
+
+
+
+
+# 1. Останавливаем и удаляем текущие контейнеры и сеть
+docker compose down
+
+# 2. Собираем заново без использования кэша
+docker compose build --no-cache
+
+# 3. Запускаем
+docker compose up -d
