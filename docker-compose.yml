@@ -22,7 +22,50 @@ services:
       - "6432:6432"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+  # ==========================================
+  # РЕКРУТЕР 1 (ID: 1)
+  # ==========================================
+  scanner_r1:
+    build: .
+    container_name: hh_scanner_r1
+    restart: always
+    # ЗАПУСКАЕМ ТОЛЬКО ДЛЯ ID 1
+    command: python run_hh_scanner.py --recruiter_ids 1
+    # Копируем настройки из обычного сканера:
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
 
+  worker_r1:
+    build: .
+    restart: always # container_name не нужен, если захочешь скейлить этот воркер
+    # ЗАПУСКАЕМ ТОЛЬКО ДЛЯ ID 1
+    command: python run_hh_worker.py --recruiter_ids 1
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+      
   # ---------------------------------------------------------------
   # SCANNER (Общий)
   # ---------------------------------------------------------------
