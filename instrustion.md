@@ -57,7 +57,7 @@ docker compose logs -f
 docker compose logs -f hh_scanner
 docker compose restart hh_scanner
 
-
+docker compose logs -f hh_scanner_r1
 
 
 # 1. Останавливаем и удаляем текущие контейнеры и сеть
@@ -68,3 +68,7 @@ docker compose build --no-cache
 
 # 3. Запускаем
 docker compose up -d
+
+
+
+http://212.193.26.118:3000

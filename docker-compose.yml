@@ -65,7 +65,7 @@ services:
       - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
-      
+
   # ---------------------------------------------------------------
   # SCANNER (Общий)
   # ---------------------------------------------------------------
@@ -177,3 +177,58 @@ services:
       - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
+
+    # ---------------------------------------------------------------
+  # LOKI (База данных логов)
+  # ---------------------------------------------------------------
+  loki:
+    image: grafana/loki:2.9.2
+    container_name: monitoring_loki
+    restart: always
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    volumes:
+      - ./monitoring/loki/local-config.yaml:/etc/loki/local-config.yaml
+    depends_on:
+      - pgbouncer # Просто чтобы запускался вместе с основной пачкой
+
+  # ---------------------------------------------------------------
+  # PROMTAIL (Сборщик логов)
+  # ---------------------------------------------------------------
+  promtail:
+    image: grafana/promtail:2.9.2
+    container_name: monitoring_promtail
+    restart: always
+    volumes:
+      # Пробрасываем сокет Docker, чтобы Promtail видел другие контейнеры
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./monitoring/promtail/docker-config.yaml:/etc/promtail/config.yaml
+    command: -config.file=/etc/promtail/config.yaml
+    depends_on:
+      - loki
+
+  # ---------------------------------------------------------------
+  # GRAFANA (Визуализация)
+  # ---------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:latest
+    container_name: monitoring_grafana
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      # Логин и пароль для входа (можешь поменять)
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      # Автоматическое подключение Loki
+      - ./monitoring/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
+      # Сохраняем настройки графаны (дашборды и т.д.) даже после перезапуска
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - loki
+
+# Не забудь добавить volumes в самый конец файла (корневой уровень)
+volumes:
+  grafana_data:
