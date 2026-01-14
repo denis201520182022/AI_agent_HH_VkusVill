@@ -18,7 +18,7 @@ from decimal import Decimal
 import difflib
 import re
 from hr_bot.utils.redis_lock import close_redis 
-
+from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
 from hr_bot.services import hh_api_real as hh_api
@@ -2445,6 +2445,7 @@ async def main(target_recruiter_ids=None):
 if __name__ == "__main__":
     setup_logging(log_filename="hh_worker.log")
     load_dotenv()
+    init_sentry()
 
     # Настраиваем чтение аргументов
     parser = argparse.ArgumentParser(description="HH Worker instance")

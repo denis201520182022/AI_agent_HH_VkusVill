@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 # --- ДОБАВЛЕН НОВЫЙ ИМПОРТ ДЛЯ РАБОТЫ С ФАЙЛАМИ В ПАМЯТИ ---
 from aiogram.types import BufferedInputFile
 # --- КОНЕЦ НОВОГО ИМПОРТА ---
+from hr_bot.utils.sentry_config import init_sentry
 
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, SyncSessionLocal, Candidate, NotificationQueue, Dialogue, Vacancy, InactiveNotificationQueue, RejectedNotificationQueue
@@ -675,6 +676,7 @@ async def main():
     """Главная функция запуска бота."""
     setup_logging(log_filename="telegram_bot.log")
     load_dotenv()
+    
 
     bot = Bot(
         token=os.getenv("TELEGRAM_BOT_TOKEN"),
@@ -712,6 +714,7 @@ async def main():
 
 if __name__ == '__main__':
     try:
+        init_sentry()
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен вручную.")

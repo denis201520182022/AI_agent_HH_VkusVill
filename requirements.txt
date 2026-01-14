@@ -17,3 +17,4 @@ aiolimiter
 asyncpg
 xlsxwriter
 redis
+sentry-sdk[asyncio,sqlalchemy,httpx]
