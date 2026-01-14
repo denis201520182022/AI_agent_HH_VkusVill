@@ -19,7 +19,7 @@ import difflib
 import re
 from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.sentry_config import init_sentry
-
+from hr_bot.utils.metrics import start_metrics_server
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
 from hr_bot.services import hh_api_real as hh_api
@@ -37,9 +37,18 @@ from hr_bot.utils.system_notifier import send_system_alert
 from sqlalchemy import func, select, delete, update  
 from hr_bot.services import interview_reminder_manager
 from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
+from hr_bot.utils.metrics import start_metrics_server
+# Если в metrics.py еще нет этих метрик, их лучше добавить туда.
+# Но для простоты предположим, что мы добавляем их или используем универсальные.
+# Давай добавим специфичные метрики для сканера:
+from prometheus_client import Counter, Gauge
 # ... остальные импорты
 
 logger = logging.getLogger(__name__)
+
+VACANCIES_ACTIVE_GAUGE = Gauge('hh_bot_vacancies_active_count', 'Number of active vacancies found', ['recruiter_id'])
+NEW_RESPONSES_TOTAL = Counter('hh_bot_new_responses_total', 'Total new responses found', ['recruiter_id', 'vacancy_id'])
+MESSAGES_RECEIVED_TOTAL = Counter('hh_bot_messages_received_total', 'Total incoming messages from candidates', ['recruiter_id'])
 
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 13, 11, 0, 0, tzinfo=datetime.timezone.utc)
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 16, 13, 56, 0, tzinfo=datetime.timezone.utc)
@@ -141,7 +150,13 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 break
             page += 1
 
-        logger.info(f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...")
+        vac_count = len(all_vacancies_from_api)
+        VACANCIES_ACTIVE_GAUGE.labels(recruiter_id=str(recruiter_id)).set(vac_count) # <--- МЕТРИКА
+        
+        logger.info(
+            f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...",
+            extra={"recruiter_id": recruiter_id, "active_vacancies_count": vac_count, "action": "sync_vacancies"}
+        )
         active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
 
         for vacancy_data in all_vacancies_from_api:
@@ -232,7 +247,14 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 candidate_full_name = f"{candidate_first_name} {candidate_last_name}".strip()
                 candidate_hh_resume_id = resume_info.get('id')
                 # -----------------------------------------
-
+                log_extra = {
+                    "recruiter_id": recruiter_id,
+                    "vacancy_id": associated_vacancy_id_str, # HH ID вакансии
+                    "hh_response_id": response_id,
+                    "candidate_resume_id": candidate_hh_resume_id,
+                    "candidate_name": candidate_full_name,
+                    "worker": "scanner"
+                }
                 if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
                     continue
 
@@ -257,7 +279,12 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     logger.warning(f"Недостаточно средств на балансе ({settings.balance}). Отклик {response_id} пропущен.")
                     continue
 
-                logger.info(f"\nНайден новый отклик {response_id} ({candidate_full_name}).")
+                NEW_RESPONSES_TOTAL.labels(recruiter_id=str(recruiter_id), vacancy_id=str(associated_vacancy_id_str)).inc() # <--- МЕТРИКА
+
+                logger.info(
+                    f"Найден новый отклик {response_id} ({candidate_full_name}).",
+                    extra={**log_extra, "action": "new_response_found"}
+                )
 
                 vacancy_in_db_result = await db.execute(
                     select(Vacancy).filter(Vacancy.hh_vacancy_id == associated_vacancy_id_str)
@@ -354,7 +381,10 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 # --- ВАЖНО: КОММИТИМ СРАЗУ ДЛЯ КАЖДОГО КАНДИДАТА ---
                 # Это гарантирует, что если мы перенесли его в consider, он сохранится в БД
                 await db.commit()
-                logger.info(f"✅ Диалог {response_id} успешно сохранен в БД.")
+                logger.info(
+                    f"✅ Диалог {response_id} успешно сохранен в БД.",
+                    extra={**log_extra, "action": "dialogue_created", "status": "success"}
+                )
 
                 # Проверка лимита для уведомления
                 # УВЕДОМЛЕНИЕ О НИЗКОМ БАЛАНСЕ
@@ -370,7 +400,12 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     settings.low_limit_notified = False
 
             except Exception as e:
-                logger.error(f"Ошибка при обработке отклика {resp.get('id')}: {e}", exc_info=True)
+                error_ctx = log_extra if 'log_extra' in locals() else {"recruiter_id": recruiter_id, "hh_response_id": resp.get('id')}
+                logger.error(
+                    f"Ошибка при обработке отклика {resp.get('id')}: {e}", 
+                    exc_info=True,
+                    extra={**error_ctx, "action": "process_new_response_error"}
+                )
                 await db.rollback() # Откат только для текущего отклика
                 continue
 
@@ -449,7 +484,14 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
             if not dialogue:
                 logger.debug(f"Найдено обновление для отклика {response_id}, которого нет в нашей БД. Пропускаем.")
                 continue
-
+            log_extra = {
+                "recruiter_id": recruiter_id,
+                "dialogue_id": dialogue.id,
+                "hh_response_id": response_id,
+                "vacancy_id": dialogue.vacancy_id,
+                "folder": folder_name,
+                "worker": "scanner"
+            }
             # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА ПАПКИ ИНТЕРВЬЮ ---
             if folder_name == 'interview':
                 # Добавляем проверку: не трогать, если это 'forwarded_to_researcher' или уже 'post_qualification_chat'
@@ -475,7 +517,7 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
             }
             seen_ids = saved_message_ids.union(pending_message_ids)
 
-            new_messages_for_pending = [
+            new_msgs = [
                 {
                     'message_id': str(msg.get('id')),
                     'role': 'user',
@@ -488,20 +530,30 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
                     msg.get('author', {}).get('participant_type') == 'applicant')
             ]
 
-            if new_messages_for_pending:
+            if new_msgs:
                 if dialogue.reminder_level > 0:
                     dialogue.reminder_level = 0
 
-                dialogue.pending_messages = (dialogue.pending_messages or []) + new_messages_for_pending
+                dialogue.pending_messages = (dialogue.pending_messages or []) + new_msgs
                 dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
 
-                logger.info(f"Добавлено {len(new_messages_for_pending)} новых сообщений в диалог {response_id}.")
+                msg_count = len(new_msgs)
+                MESSAGES_RECEIVED_TOTAL.labels(recruiter_id=str(recruiter_id)).inc(msg_count) # <--- МЕТРИКА
+
+                logger.info(
+                    f"Добавлено {msg_count} новых сообщений в диалог {response_id}.",
+                    extra={**log_extra, "new_messages_count": msg_count, "action": "messages_received"}
+                )
 
         await db.flush()
         await db.commit()
         
     except Exception as e:
-        logger.error(f"Error in process_ongoing_responses: {e}", exc_info=True)
+        logger.error(
+            f"Error in process_ongoing_responses: {e}", 
+            exc_info=True,
+            extra={"recruiter_id": recruiter_id, "action": "ongoing_scan_error"}
+        )
         await db.rollback()
         raise
     finally:
@@ -538,7 +590,10 @@ async def handle_scanner_recruiter(rec_id: int):
             await db.commit()
             
         except Exception as e:
-            logger.error(f"Ошибка при блокировке рекрутера {rec_id}: {e}")
+            logger.error(
+                f"Ошибка при блокировке рекрутера {rec_id}: {e}",
+                extra={"recruiter_id": rec_id, "action": "lock_recruiter_error"}
+            )
             await db.rollback()
 
 # В начало файла добавь импорт argparse, если его нет (в твоем косте он есть вверху)
@@ -586,6 +641,7 @@ if __name__ == "__main__":
     setup_logging(log_filename="hh_scanner.log")
     load_dotenv()
     init_sentry()
+    start_metrics_server(8000)
     
     parser = argparse.ArgumentParser(description="HH Scanner Service")
     parser.add_argument('--recruiter_ids', nargs='+', type=int, help='List of recruiter IDs')

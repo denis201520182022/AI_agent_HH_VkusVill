@@ -228,6 +228,16 @@ services:
       - grafana_data:/var/lib/grafana
     depends_on:
       - loki
+    prometheus:
+    image: prom/prometheus:latest
+    container_name: monitoring_prometheus
+    restart: always
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+    depends_on:
+      - hh_worker # Просто чтобы не стартовал раньше сети
 
 # Не забудь добавить volumes в самый конец файла (корневой уровень)
 volumes:

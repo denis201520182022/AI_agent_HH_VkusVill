@@ -18,3 +18,5 @@ asyncpg
 xlsxwriter
 redis
 sentry-sdk[asyncio,sqlalchemy,httpx]
+python-json-logger>=2.0.7
+prometheus-client

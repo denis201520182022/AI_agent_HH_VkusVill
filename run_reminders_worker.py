@@ -25,7 +25,7 @@ from hr_bot.services import hh_api_real as hh_api
 from hr_bot.services import knowledge_base
 from hr_bot.services import llm_handler
 from hr_bot.db import statistics_manager
-
+from hr_bot.utils.metrics import start_metrics_server, MESSAGES_SENT_TOTAL
 from hr_bot.utils.pii_masker import extract_and_mask_pii
 from hr_bot.utils.system_notifier import send_system_alert
 from hr_bot.utils.resh_in_code import check_candidate_eligibility, is_candidate_profile_complete
@@ -97,6 +97,15 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                 if not dialogue:
                     # Диалог занят или не найден
                     return
+
+                log_extra = {
+                    "dialogue_id": dialogue.id,
+                    "recruiter_id": recruiter_id,
+                    "hh_response_id": dialogue.hh_response_id,
+                    "vacancy_id": dialogue.vacancy_id,
+                    "worker": "reminders"
+                }
+
                 recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
                 if not dialogue or not recruiter:
@@ -197,7 +206,10 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     await db.commit()
 
                 elif reminder_messages:
-                    logger.info(f"Отправка напоминания уровня {next_level} для диалога {dialogue_hh_id}.")
+                    logger.info(
+                        f"Отправка напоминания уровня {next_level} для диалога {dialogue_hh_id}.",
+                        extra={**log_extra, "reminder_level": next_level, "action": "send_nudge"}
+                    )
 
                     # 1. Определяем типы напоминаний
                     is_long_reminder = next_level in [4, 5, 6]
@@ -252,7 +264,10 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                                 cost = settings.cost_per_long_reminder
                                 settings.balance -= cost
                                 settings.total_spent_on_reminders += cost # Увеличиваем счетчик напоминалок
-                                logger.info(f"ЕДИНОВРЕМЕННОЕ СПИСАНИЕ: {cost} руб. Всего на дожимы потрачено: {settings.total_spent_on_reminders}")
+                                logger.info(
+                                    f"ЕДИНОВРЕМЕННОЕ СПИСАНИЕ: {cost} руб. Всего на дожимы потрачено: {settings.total_spent_on_reminders}",
+                                    extra={**log_extra, "cost": float(cost), "action": "charge_balance"}
+                                )
                         elif status_code == 403:
                              # Вакансия закрыта или доступ запрещен
                              dialogue.reminder_level = 6
@@ -266,6 +281,7 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     # Если не было критической ошибки (403), обновляем уровень и время
                     if all_sent or status_code == 200:
                         dialogue.reminder_level = next_level
+                        MESSAGES_SENT_TOTAL.inc()
                         dialogue.last_updated = now
                         await db.commit()
 
@@ -439,6 +455,15 @@ async def check_and_send_interview_reminders():
                             await db_session.commit()
                             continue
 
+                        log_extra = {
+                            "dialogue_id": dialogue.id,
+                            "recruiter_id": recruiter.id,
+                            "hh_response_id": dialogue.hh_response_id,
+                            "vacancy_id": vacancy.id,
+                            "candidate_id": candidate.id,
+                            "notification_type": reminder.notification_type,
+                            "worker": "interview_reminders"
+                        }
                         # Форматируем дату и время собеседования для сообщения
                         interview_datetime_spb = reminder.interview_datetime_utc.astimezone(SPB_TIMEZONE)
                         interview_date_spb = interview_datetime_spb.strftime("%d.%m.%Y")
@@ -460,7 +485,10 @@ async def check_and_send_interview_reminders():
                             interview_time_spb=interview_time_spb
                         )
 
-                        logger.info(f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}...")
+                        logger.info(
+                            f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}...",
+                            extra={**log_extra, "action": "sending_interview_reminder"}
+                        )
 
                         # Отправка сообщения кандидату через HH API
                         # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
@@ -474,7 +502,12 @@ async def check_and_send_interview_reminders():
                         if send_result == 200:
                             # УСПЕХ
                             reminder.status = 'sent'
-                            logger.info(f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}.")
+
+                            MESSAGES_SENT_TOTAL.inc() # <--- МЕТРИКА
+                            logger.info(
+                                f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}.",
+                                extra={**log_extra, "action": "interview_reminder_sent", "status": "success"}
+                            )
 
                         elif send_result == 403:
                             # ВАКАНСИЯ ЗАКРЫТА
@@ -487,7 +520,10 @@ async def check_and_send_interview_reminders():
                         else:
                             # ПРОЧИЕ ОШИБКИ (False или другие коды)
                             reminder.status = 'error'
-                            logger.error(f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error).")
+                            logger.error(
+                                f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error).",
+                                extra={**log_extra, "action": "interview_reminder_failed", "status": "error"}
+                            )
                         # -----------------------
 
                         reminder.processed_at = now_utc
@@ -568,6 +604,7 @@ if __name__ == "__main__":
     setup_logging(log_filename="reminders_worker.log")
     load_dotenv()
     init_sentry()
+    start_metrics_server(8000)
     
     parser = argparse.ArgumentParser(description="HH Reminders Worker")
     parser.add_argument('--recruiter_ids', nargs='+', type=int, help='List of recruiter IDs')

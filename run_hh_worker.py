@@ -25,7 +25,7 @@ from hr_bot.services import hh_api_real as hh_api
 from hr_bot.services import knowledge_base
 from hr_bot.services import llm_handler
 from hr_bot.db import statistics_manager
-
+from hr_bot.utils.metrics import start_metrics_server
 from hr_bot.utils.pii_masker import extract_and_mask_pii
 from hr_bot.utils.system_notifier import send_system_alert
 from hr_bot.utils.resh_in_code import check_candidate_eligibility, is_candidate_profile_complete
@@ -35,6 +35,7 @@ from hr_bot.services.llm_handler import cleanup
 from hr_bot.utils.system_notifier import send_system_alert
 from sqlalchemy import func, select, delete, update  
 from hr_bot.services import interview_reminder_manager
+from hr_bot.utils.metrics import start_metrics_server, E2E_RESPONSE_LATENCY, MESSAGES_SENT_TOTAL
 from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
 # ... остальные импорты
 
@@ -177,457 +178,6 @@ def signal_handler(sig, frame):
     logger.info("Получен сигнал остановки. Завершаем работу...")
     shutdown_requested = True
 
-
-# async def get_all_active_vacancies_for_recruiter(recruiter_id: int) -> list:
-#     """
-#     Асинхронно получает список всех активных вакансий для рекрутера,
-#     и синхронизирует их с локальной базой данных.
-#     Использует кэш: если вакансии синхронизировались менее 10 минут назад, возвращает данные из БД.
-#     """
-
-#     function_start_time = time.monotonic()
-
-#     async with SessionLocal() as db:
-#         try:
-#             # Проверяем, нужно ли обновлять данные из API
-#             now = datetime.datetime.now(datetime.timezone.utc)
-#             cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
-
-#             # Получаем актуальный объект recruiter в этой сессии
-#             current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
-
-#             if not current_recruiter:
-#                 logger.error(f"Рекрутер с ID {recruiter_id} не найден в текущей сессии для синхронизации вакансий.")
-#                 return []
-#             logger.debug(f"Получение и синхронизация списка активных вакансий для рекрутера {current_recruiter.name}...")
-#             if current_recruiter.vacancies_last_synced_at:
-#                 time_since_sync = now - current_recruiter.vacancies_last_synced_at
-
-#                 if time_since_sync < cache_expiry_time:
-#                     logger.debug(f"Используем кэшированные вакансии для рекрутера {current_recruiter.name}. "
-#                                 f"Последняя синхронизация: {time_since_sync.total_seconds() / 60:.1f} минут назад.")
-
-#                     result = await db.execute(select(Vacancy).filter(
-#                         Vacancy.recruiter_id == current_recruiter.id
-#                     ))
-#                     cached_vacancies = result.scalars().all()
-
-#                     cached_vacancies_list = [
-#                         {
-#                             "id": vacancy.hh_vacancy_id,
-#                             "name": vacancy.title,
-#                             "area": {"name": vacancy.city} if vacancy.city else {}
-#                         }
-#                         for vacancy in cached_vacancies
-#                     ]
-
-#                     logger.debug(f"Возвращено {len(cached_vacancies_list)} вакансий из кэша для рекрутера {current_recruiter.name}.")
-#                     return cached_vacancies_list
-
-#             logger.debug(f"Кэш устарел или отсутствует. Получаем актуальные данные из API...")
-
-#             api_request_start = time.monotonic()
-
-#             me_data = await hh_api._make_request(current_recruiter, db, "GET", "me")
-#             logger.debug(f"[Recruiter {current_recruiter.name}] API call 'me' took: {time.monotonic() - api_request_start:.2f} sec.")
-#             if not me_data or not me_data.get('employer') or not me_data['employer'].get('id'):
-#                 logger.error(f"Не удалось получить employer_id для рекрутера {current_recruiter.name}.")
-#                 return []
-#             employer_id = me_data['employer']['id']
-
-#             all_vacancies_from_api = []
-#             page = 0
-#             while True:
-#                 api_request_page_start = time.monotonic()
-#                 vacancies_page = await hh_api._make_request(
-#                     current_recruiter, db, "GET", f"employers/{employer_id}/vacancies/active",
-#                     params={'page': page, 'per_page': 20}
-#                 )
-#                 logger.debug(f"[Recruiter {current_recruiter.name}] API call 'vacancies/active' page {page} took: {time.monotonic() - api_request_page_start:.2f} sec.")
-#                 if not vacancies_page or not vacancies_page.get('items'):
-#                     break
-
-#                 all_vacancies_from_api.extend(vacancies_page['items'])
-
-#                 if page >= vacancies_page.get('pages', 1) - 1:
-#                     break
-#                 page += 1
-
-#             if not all_vacancies_from_api:
-#                 logger.info(f"У рекрутера {current_recruiter.name} сейчас нет активных вакансий. Запускаю очистку старых...")
-#             else:
-#                 logger.info(f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...")
-
-#             # Список ID вакансий, которые сейчас активны на HH
-#             active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
-
-
-#             for vacancy_data in all_vacancies_from_api:
-#                 hh_vacancy_id = str(vacancy_data.get("id"))
-
-#                 result = await db.execute(select(Vacancy).filter_by(hh_vacancy_id=hh_vacancy_id))
-#                 vacancy_in_db = result.scalar_one_or_none()
-
-#                 if not vacancy_in_db:
-#                     new_vacancy = Vacancy(
-#                         hh_vacancy_id=hh_vacancy_id,
-#                         title=vacancy_data.get("name", "Без названия"),
-#                         city=vacancy_data.get("area", {}).get("name"),
-#                         recruiter_id=current_recruiter.id
-#                     )
-#                     db.add(new_vacancy)
-#                     logger.info(f"  -> Добавлена новая вакансия в БД: '{new_vacancy.title}' (ID: {hh_vacancy_id})")
-#                 else:
-#                     if (vacancy_in_db.title != vacancy_data.get("name") or
-#                         vacancy_in_db.city != vacancy_data.get("area", {}).get("name") or
-#                         vacancy_in_db.recruiter_id != current_recruiter.id):
-
-#                         vacancy_in_db.title = vacancy_data.get("name", "Без названия")
-#                         vacancy_in_db.city = vacancy_data.get("area", {}).get("name")
-#                         vacancy_in_db.recruiter_id = current_recruiter.id
-#                         logger.debug(f"  -> Обновлены данные для вакансии: '{vacancy_in_db.title}' (ID: {hh_vacancy_id})")
-
-#             # Удаляем вакансии, которые больше не активны
-#             # Находим вакансии в БД, которые числятся за этим рекрутером, но которых НЕТ в списке active_hh_ids
-
-#             stale_vacancies_query = select(Vacancy).filter(
-#                 Vacancy.recruiter_id == current_recruiter.id,
-#                 Vacancy.hh_vacancy_id.notin_(active_hh_ids)
-#             )
-#             stale_result = await db.execute(stale_vacancies_query)
-#             stale_vacancies = stale_result.scalars().all()
-
-#             for stale_vac in stale_vacancies:
-#                 logger.info(f"Вакансия {stale_vac.title} ({stale_vac.hh_vacancy_id}) больше не активна у рекрутера {current_recruiter.name}. Отвязываем.")
-#                 # Вариант А: Просто отвязать (установить NULL)
-#                 stale_vac.recruiter_id = None
-
-#             db_commit_start = time.monotonic()
-#             current_recruiter.vacancies_last_synced_at = now
-#             await db.commit()
-#             logger.debug(f"[Recruiter {current_recruiter.name}] DB commit for vacancies sync took: {time.monotonic() - db_commit_start:.2f} sec.")
-#             logger.debug(f"Кэш обновлен. Следующее обновление через {VACANCY_CACHE_DURATION_MINUTES} минут.")
-
-#             return all_vacancies_from_api
-
-#         except Exception as e:
-#             logger.error(f"Ошибка при получении вакансий для рекрутера {recruiter_id}: {e}", exc_info=True)
-#             await db.rollback()
-#             return []
-#         finally:
-#             logger.debug(f"[Recruiter {recruiter_id}] Total function execution time: {time.monotonic() - function_start_time:.2f} sec.")
-
-
-
-# async def process_new_responses(recruiter_id: int, vacancy_ids: list):
-#     """Этап 1: Ищет новые отклики по СПИСКУ вакансий."""
-#     function_start_time = time.monotonic()
-
-#     recruiter = None
-#     recruiter_name_for_logging = f"ID {recruiter_id}"
-
-#     async with SessionLocal() as db:
-#         try:
-#             recruiter = await db.get(TrackedRecruiter, recruiter_id)
-#             if not recruiter:
-#                 logger.warning(f"process_new_responses: Рекрутер с ID {recruiter_id} не найден.")
-#                 return
-#             recruiter_name_for_logging = recruiter.name
-#             cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-#             logger.debug(f"Используем дату старта для рекрутера {recruiter.name}: {cutoff_date}")
-#             if not vacancy_ids:
-#                 logger.error("Этап 1: Нет активных вакансий для проверки 'Неразобранных'.")
-#                 return
-
-#             logger.debug(f"Этап 1: Проверка 'Неразобранных' для {len(vacancy_ids)} вакансий...")
-
-#             new_responses_with_vacancy_ids = await hh_api.get_responses_from_folder(
-#                 recruiter, db, 'response', vacancy_ids, since_datetime=cutoff_date
-#             )
-
-#             for resp, associated_vacancy_id_str in new_responses_with_vacancy_ids:
-#                 # Используем SAVEPOINT для каждого кандидата, чтобы ошибка в одном не ломала всю транзакцию
-#                 try:
-#                     response_id = resp.get('id')
-
-#                     # --- БЕЗОПАСНЫЙ ДОСТУП К ДАННЫМ РЕЗЮМЕ ---
-#                     resume_info = resp.get('resume')
-#                     if not resume_info:
-#                         logger.warning(f"Отклик {response_id} без резюме. Пропуск.")
-#                         continue
-
-#                     candidate_first_name = resume_info.get('first_name', 'Неизвестно')
-#                     candidate_last_name = resume_info.get('last_name', '')
-#                     candidate_full_name = f"{candidate_first_name} {candidate_last_name}".strip()
-#                     candidate_hh_resume_id = resume_info.get('id')
-#                     # -----------------------------------------
-
-#                     if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
-#                         continue
-
-#                     # Проверка существования
-#                     exists_query = select(func.count()).select_from(Dialogue).filter_by(hh_response_id=response_id)
-#                     result = await db.execute(exists_query)
-#                     if result.scalar() > 0:
-#                         continue
-
-#                     # Проверка лимитов
-#                     settings_result = await db.execute(
-#                         select(AppSettings).filter_by(id=1).with_for_update()
-#                     )
-#                     settings = settings_result.scalar_one_or_none()
-
-#                     if not settings:
-#                         logger.error("Настройки AppSettings не найдены в БД!")
-#                         continue
-
-#                     # ПРОВЕРКА БАЛАНСА
-#                     if settings.balance < settings.cost_per_dialogue:
-#                         logger.warning(f"Недостаточно средств на балансе ({settings.balance}). Отклик {response_id} пропущен.")
-#                         continue
-
-#                     logger.info(f"\nНайден новый отклик {response_id} ({candidate_full_name}).")
-
-#                     vacancy_in_db_result = await db.execute(
-#                         select(Vacancy).filter(Vacancy.hh_vacancy_id == associated_vacancy_id_str)
-#                     )
-#                     vacancy_in_db = vacancy_in_db_result.scalar_one_or_none()
-
-#                     if not vacancy_in_db:
-#                         logger.error(f"Вакансия {associated_vacancy_id_str} не найдена в БД. Пропуск.")
-#                         continue
-
-#                     # Работа с кандидатом
-#                     candidate_result = await db.execute(
-#                         select(Candidate).filter(Candidate.hh_resume_id == candidate_hh_resume_id)
-#                     )
-#                     candidate = candidate_result.scalar_one_or_none()
-#                     if not candidate:
-#                         candidate = Candidate(
-#                             hh_resume_id=candidate_hh_resume_id,
-#                             full_name=candidate_full_name
-#                         )
-#                         db.add(candidate)
-
-#                     await db.flush() # Чтобы получить ID кандидата
-
-#                     response_created_at_str = resp.get('created_at')
-#                     response_created_at_dt = None
-#                     if response_created_at_str:
-#                         try:
-#                             response_created_at_dt = datetime.datetime.fromisoformat(response_created_at_str)
-#                         except (ValueError, TypeError):
-#                             logger.warning(f"Не удалось распознать дату отклика: {response_created_at_str}")
-#                     # <<< КОНЕЦ ИСПРАВЛЕНИЯ >>>
-
-#                     # Создаем диалог
-#                     dialogue = Dialogue(
-#                         hh_response_id=response_id,
-#                         candidate_id=candidate.id,
-#                         vacancy_id=vacancy_in_db.id,
-#                         recruiter_id=recruiter_id,
-#                         status='new',
-#                         dialogue_state='initial_processing',
-#                         response_created_at=response_created_at_dt # <<< ИСПОЛЬЗУЕМ ОБЪЕКТ DATETIME
-#                     )
-#                     db.add(dialogue)
-
-#                     # --- КРИТИЧЕСКИЙ МОМЕНТ: ПЕРЕМЕЩЕНИЕ ---
-#                     # Сначала перемещаем, чтобы зафиксировать намерение
-#                     await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')
-
-#                     # СПИСАНИЕ СРЕДСТВ + СТАТИСТИКА
-#                     cost = settings.cost_per_dialogue
-#                     settings.balance -= cost
-#                     settings.total_spent_on_dialogues += cost # Увеличиваем счетчик диалогов
-
-#                     # Пытаемся получить сообщения, но ошибка здесь НЕ ДОЛЖНА отменять создание диалога
-#                     try:
-#                         messages_data = await hh_api.get_messages(recruiter, db, resp['messages_url'])
-#                         messages = [
-#                             {
-#                                 'message_id': str(m.get('id')),
-#                                 'role': 'user',
-#                                 'content': m['text'],
-#                                 'timestamp_msk': _format_timestamp_to_msk(m.get('created_at')) # <-- ДОБАВЛЕНО
-#                             }
-#                             for m in messages_data if m.get('text')
-#                         ]
-#                     except Exception as msg_err:
-#                         logger.error(f"Ошибка получения сообщений для {response_id}: {msg_err}. Использую заглушку.")
-#                         messages = []
-
-#                     if not messages:
-#                         # Если сопроводительного нет, берем время самого отклика
-#                         now_msk = datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
-#                         messages = [{
-#                             'message_id': f'no_msg_{response_id}',
-#                             'role': 'user',
-#                             'content': "[SYSTEM COMMAND] Кандидат откликнулся без сопроводительного письма. Поздоровайся и предложи задать вопросы",
-#                             'timestamp_msk': _format_timestamp_to_msk(resp.get('created_at', now_msk)) # <-- ДОБАВЛЕНО
-#                         }]
-
-#                     dialogue.pending_messages = messages
-#                     dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-
-#                     await statistics_manager.update_stats(db, vacancy_in_db.id, responses=1, started_dialogs=1)
-
-#                     # --- ВАЖНО: КОММИТИМ СРАЗУ ДЛЯ КАЖДОГО КАНДИДАТА ---
-#                     # Это гарантирует, что если мы перенесли его в consider, он сохранится в БД
-#                     await db.commit()
-#                     logger.info(f"✅ Диалог {response_id} успешно сохранен в БД.")
-
-#                     # Проверка лимита для уведомления
-#                     # УВЕДОМЛЕНИЕ О НИЗКОМ БАЛАНСЕ
-#                     if settings.balance < settings.low_balance_threshold and not settings.low_limit_notified:
-#                         asyncio.create_task(send_system_alert(
-#                             f"⚠️ Внимание! Баланс ниже {settings.low_balance_threshold} руб. "
-#                             f"Текущий остаток: {settings.balance} руб.", alert_type="balance"
-#                         ))
-#                         settings.low_limit_notified = True
-
-#                     # Если баланс пополнили выше порога, сбрасываем флаг (опционально, но удобно)
-#                     if settings.balance >= settings.low_balance_threshold:
-#                         settings.low_limit_notified = False
-
-#                 except Exception as e:
-#                     logger.error(f"Ошибка при обработке отклика {resp.get('id')}: {e}", exc_info=True)
-#                     await db.rollback() # Откат только для текущего отклика
-#                     continue
-
-#         except Exception as e:
-#             logger.error(f"Критическая ошибка в process_new_responses: {e}", exc_info=True)
-#         finally:
-#             logger.debug(f"process_new_responses завершено за {time.monotonic() - function_start_time:.2f}s")
-
-
-
-# async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list):
-#     """Этап 2: Ищет новые сообщения в папках 'Подумать' и 'Собеседование'."""
-#     function_start_time = time.monotonic()
-
-#     recruiter = None
-#     recruiter_name_for_logging = f"ID {recruiter_id}" # Значение по умолчанию на случай, если рекрутер не найден
-#     async with SessionLocal() as db:
-#         try:
-#             recruiter = await db.get(TrackedRecruiter, recruiter_id)
-#             if not recruiter:
-#                 logger.warning(f"process_ongoing_responses: Рекрутер с ID {recruiter_id} не найден.")
-#                 return
-
-#             # --- ЗАГРУЗКА ЗДЕСЬ ---
-#             recruiter_name_for_logging = recruiter.name
-#             # --- КОНЕЦ ЗАГРУЗКИ ---
-#             cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-
-#             if not vacancy_ids:
-#                 logger.warning("Этап 2: Нет активных вакансий для проверки обновлений.")
-#                 return
-
-#             logger.debug(
-#                 f"Этап 2: Проверка обновлений в папках 'Подумать' и 'Собеседование' "
-#                 f"для {len(vacancy_ids)} вакансий..."
-#             )
-
-#             api_get_responses_gather_start = time.monotonic()
-
-#             consider_task = hh_api.get_responses_from_folder(
-#                 recruiter, db, 'consider', vacancy_ids,
-#                 since_datetime=cutoff_date,
-#                 check_for_updates=True
-#             )
-#             interview_task = hh_api.get_responses_from_folder(
-#                 recruiter, db, 'interview', vacancy_ids,
-#                 since_datetime=cutoff_date,
-#                 check_for_updates=True
-#             )
-
-#             # Выполняем запросы параллельно
-#             consider_results, interview_results = await asyncio.gather(consider_task, interview_task)
-            
-#             logger.debug(
-#                 f"[Recruiter {recruiter_name_for_logging}] API calls took: "
-#                 f"{time.monotonic() - api_get_responses_gather_start:.2f} sec. "
-#                 f"Found {len(consider_results)} in consider, {len(interview_results)} in interview."
-#             )
-
-#             # Объединяем результаты в один список, помечая источник
-#             # Каждая запись: (название_папки, (данные_отклика, id_вакансии))
-#             tagged_responses = [('consider', item) for item in consider_results]
-#             tagged_responses.extend([('interview', item) for item in interview_results])
-
-#             for folder_name, (resp, _) in tagged_responses:
-#                 response_id = resp.get('id')
-
-#                 if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
-#                     continue
-
-#                 dialogue_result = await db.execute(select(Dialogue).filter_by(hh_response_id=response_id))
-#                 dialogue = dialogue_result.scalar_one_or_none()
-                
-#                 if not dialogue:
-#                     logger.debug(f"Найдено обновление для отклика {response_id}, которого нет в нашей БД. Пропускаем.")
-#                     continue
-
-#                 # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА ПАПКИ ИНТЕРВЬЮ ---
-#                 if folder_name == 'interview':
-#                     # Добавляем проверку: не трогать, если это 'forwarded_to_researcher' или уже 'post_qualification_chat'
-#                     if dialogue.dialogue_state not in ['post_qualification_chat', 'forwarded_to_researcher']:
-#                         logger.debug(f"[{response_id}] Обнаружен в папке 'interview'. Принудительный стейт: post_qualification_chat.")
-#                         dialogue.dialogue_state = 'post_qualification_chat'
-                        
-#                 # -----------------------------------------------------
-
-#                 api_get_messages_start = time.monotonic()
-#                 all_messages_from_api = await hh_api.get_messages(recruiter, db, resp['messages_url'])
-                
-#                 logger.debug(
-#                     f"[Recruiter {recruiter.name}, Dialogue {response_id}] "
-#                     f"API get_messages took: {time.monotonic() - api_get_messages_start:.2f} sec."
-#                 )
-
-#                 saved_message_ids = {str(h.get('message_id')) for h in (dialogue.history or [])}
-#                 pending_message_ids = {
-#                     str(p.get('message_id'))
-#                     for p in (dialogue.pending_messages or [])
-#                     if isinstance(p, dict)
-#                 }
-#                 seen_ids = saved_message_ids.union(pending_message_ids)
-
-#                 new_messages_for_pending = [
-#                     {
-#                         'message_id': str(msg.get('id')),
-#                         'role': 'user',
-#                         'content': msg['text'],
-#                         'timestamp_msk': _format_timestamp_to_msk(msg.get('created_at'))
-#                     }
-#                     for msg in all_messages_from_api
-#                     if (msg.get('text') and
-#                         str(msg.get('id')) not in seen_ids and
-#                         msg.get('author', {}).get('participant_type') == 'applicant')
-#                 ]
-
-#                 if new_messages_for_pending:
-#                     if dialogue.reminder_level > 0:
-#                         dialogue.reminder_level = 0
-
-#                     dialogue.pending_messages = (dialogue.pending_messages or []) + new_messages_for_pending
-#                     dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-
-#                     logger.info(f"Добавлено {len(new_messages_for_pending)} новых сообщений в диалог {response_id}.")
-
-#             await db.flush()
-#             await db.commit()
-            
-#         except Exception as e:
-#             logger.error(f"Error in process_ongoing_responses: {e}", exc_info=True)
-#             await db.rollback()
-#             raise
-#         finally:
-#             logger.debug(
-#                 f"[Recruiter {recruiter_name_for_logging}] "
-#                 f"process_ongoing_responses finished in {time.monotonic() - function_start_time:.2f}s"
-#             )
 
 def _log_missing_vacancy(title: str, city: str):
     """
@@ -979,7 +529,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             logger.debug(f"Dialogue {dialogue_id} is locked by another worker or not found. Skipping.")
             return
         # -----------------------------------------
-
+        log_extra = {
+            "dialogue_id": dialogue.id,
+            "hh_response_id": dialogue.hh_response_id,
+            "recruiter_id": recruiter_id,
+            "vacancy_id": dialogue.vacancy_id,
+            "candidate_id": dialogue.candidate_id,
+            "worker": "handler"
+        }
         # Загружаем recruiter
         recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
@@ -995,7 +552,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         await db.refresh(dialogue.candidate)
         await db.refresh(dialogue.vacancy)
 
-        logger.debug(f"Processing dialogue {dialogue.hh_response_id}...")
+        logger.debug(
+            f"Processing dialogue {dialogue.hh_response_id}...",
+            extra={**log_extra, "action": "start_processing"}
+        )
 
         pending_messages = dialogue.pending_messages or []
         if not pending_messages:
@@ -1044,7 +604,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # 2. Логируем "пустышки" для всех предыдущих неудачных попыток (ретраев), если они были
                     total_attempts = len(citizenship_attempts)
                     if total_attempts > 1:
-                        logger.warning(f"[{dialogue.hh_response_id}] Анализ гражданства: выполнено успешно после {total_attempts-1} ретраев.")
+                        logger.warning(
+                            f"[{dialogue.hh_response_id}] Анализ гражданства: выполнено успешно после {total_attempts-1} ретраев.",
+                            extra={**log_extra, "action": "citizenship_retry_success", "attempts": total_attempts}
+                        )
                         for i in range(total_attempts - 1):
                             retry_log = LlmUsageLog(
                                 dialogue_id=dialogue.id,
@@ -1060,7 +623,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     try:
                         parsed_response = llm_citizenship_response.get('parsed_response')
                         if parsed_response and parsed_response.get("is") == "yes":
-                            logger.info(f"[{dialogue.hh_response_id}] Распарсили гражданство: {parsed_response.get('citizenship')}")
+                            logger.info(
+                                f"[{dialogue.hh_response_id}] Распарсили гражданство: {parsed_response.get('citizenship')}",
+                                extra={**log_extra, "action": "citizenship_parsed", "citizenship": parsed_response.get('citizenship')}
+                            )
                             citizenship = parsed_response.get("citizenship")
                             system_command_content = None
 
@@ -1086,15 +652,24 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                                 
                                 
                         else:
-                            logger.info(f"[{dialogue.hh_response_id}] Информация о гражданстве не найдена в текущем сообщении.")
+                            logger.info(
+                                f"[{dialogue.hh_response_id}] Информация о гражданстве не найдена в текущем сообщении.",
+                                extra={**log_extra, "action": "citizenship_not_found"}
+                            )
 
                     except Exception as parse_err:
-                        logger.error(f"[{dialogue.hh_response_id}] Ошибка разбора JSON гражданства: {parse_err}")
+                        logger.error(
+                            f"[{dialogue.hh_response_id}] Ошибка разбора JSON гражданства: {parse_err}",
+                            extra={**log_extra, "action": "citizenship_json_error"}
+                        )
 
             except Exception as citizenship_err:
                 # --- ЛОГИРОВАНИЕ ПОЛНОГО ПРОВАЛА ---
                 # Если tenacity исчерпала попытки, записываем в БД все неудачные заходы
-                logger.error(f"[{dialogue.hh_response_id}] Анализ гражданства ПРОВАЛЕН после {len(citizenship_attempts)} попыток: {citizenship_err}")
+                logger.error(
+                    f"[{dialogue.hh_response_id}] Анализ гражданства ПРОВАЛЕН после {len(citizenship_attempts)} попыток: {citizenship_err}",
+                    extra={**log_extra, "action": "citizenship_analysis_failed_total"}
+                )
                 for i in range(len(citizenship_attempts)):
                     failure_log = LlmUsageLog(
                         dialogue_id=dialogue.id,
@@ -1177,7 +752,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             failed_attempts = total_attempts - 1 # Все кроме последней (успешной)
             
             if failed_attempts > 0:
-                logger.warning(f"[{dialogue.hh_response_id}] Было {failed_attempts} скрытых ретраев tenacity.")
+                logger.warning(
+                    f"[{dialogue.hh_response_id}] Было {failed_attempts} скрытых ретраев tenacity.",
+                    extra={**log_extra, "action": "llm_retries_detected", "retry_count": failed_attempts}
+                )
                 for i in range(failed_attempts):
                     # Записываем "пустышки" для ретраев
                     retry_log = LlmUsageLog(
@@ -1198,7 +776,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # В attempt_tracker лежат метки ВСЕХ попыток (например, 3 штуки).
             # Все они считаются провальными.
             
-            logger.error(f"[{dialogue.hh_response_id}] LLM Request FAILED completely after {len(attempt_tracker)} attempts: {llm_error}")
+            logger.error(
+                f"[{dialogue.hh_response_id}] LLM Request FAILED completely after {len(attempt_tracker)} attempts: {llm_error}",
+                extra={**log_extra, "action": "llm_request_failed_total"}
+            )
             
             try:
                 for i in range(len(attempt_tracker)):
@@ -1219,7 +800,11 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             raise llm_error # Пробрасываем ошибку дальше
 
-        logger.debug(f"[{dialogue.hh_response_id}] LLM call: {time.monotonic() - llm_call_start:.2f} sec.")
+        llm_duration = time.monotonic() - llm_call_start
+        logger.debug(
+            f"[{dialogue.hh_response_id}] LLM call: {llm_duration:.2f} sec.",
+            extra={**log_extra, "llm_duration": llm_duration, "action": "llm_request_complete"}
+        )
 
         if llm_data is None:
             alert_message = "⚠️ LLM service unavailable!"
@@ -1300,11 +885,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                      pass 
                 elif _validate_age_in_text(current_user_text, raw_age):
                     dialogue.candidate.age = raw_age
-                    logger.debug(f"[{dialogue.hh_response_id}] Возраст {raw_age} прошел валидацию.")
+                    logger.debug(
+                        f"[{dialogue.hh_response_id}] Возраст {raw_age} прошел валидацию.",
+                        extra={**log_extra, "action": "age_validated", "age": raw_age}
+                    )
                 else:
                     logger.warning(
                         f"[{dialogue.hh_response_id}] LLM галлюцинирует возраст: {raw_age}. "
-                        f"В сообщении пользователя этого нет. Запись в БД заблокирована."
+                        f"В сообщении пользователя этого нет. Запись в БД заблокирована.",
+                        extra={**log_extra, "action": "age_hallucination_detected", "hallucinated_age": raw_age}
                     )
             if extracted_data.get("citizenship"):
                 dialogue.candidate.citizenship = extracted_data["citizenship"]
@@ -1322,13 +911,19 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
     #and dialogue.dialogue_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']  # <-- ДОБАВИТЬ
     #and new_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']
         and is_candidate_profile_complete(dialogue.candidate)):
-            logger.info(f"[{dialogue.hh_response_id}] Анкета собрана полностью. Запускаю проверку критериев.")
+            logger.info(
+                f"[{dialogue.hh_response_id}] Анкета собрана полностью. Запускаю проверку критериев.",
+                extra={**log_extra, "action": "profile_complete_start_check"}
+            )
 
             is_eligible = check_candidate_eligibility(dialogue.candidate)
 
             if not is_eligible:
                 # --- СЦЕНАРИЙ 1: ОТКАЗ ---
-                logger.info(f"[{dialogue.hh_response_id}] Кандидат НЕ прошел проверку кодом (Age/Citizenship).")
+                logger.info(
+                    f"[{dialogue.hh_response_id}] Кандидат НЕ прошел проверку кодом (Age/Citizenship).",
+                    extra={**log_extra, "action": "qualification_failed_by_code"}
+                )
 
                 # Принудительно меняем состояние и текст (игнорируем то, что написала LLM)
                 new_state = 'qualification_failed'
@@ -1339,7 +934,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             else:
                 # --- СЦЕНАРИЙ 2: ПОДХОДИТ ---
-                logger.info(f"[{dialogue.hh_response_id}] Кандидат успешно прошел проверку кодом.")
+                logger.info(
+                    f"[{dialogue.hh_response_id}] Кандидат успешно прошел проверку кодом.",
+                    extra={**log_extra, "action": "qualification_passed_by_code"}
+                )
 
                 # Проверяем город
                 city_lower = (dialogue.vacancy.city or "").lower()
@@ -1362,13 +960,19 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                     # Проверяем, входит ли хоть одна фраза из списка в название вакансии
                     if any(phrase in current_title_lower for phrase in excluded_vacancies):
-                        logger.info(f"[{dialogue.hh_response_id}] Вакансия '{vacancy_title}' (СПб) переведена на рекрутера (исключение).")
+                        logger.info(
+                            f"[{dialogue.hh_response_id}] Вакансия '{vacancy_title}' (СПб) переведена на рекрутера (исключение).",
+                            extra={**log_extra, "action": "spb_vacancy_excluded"}
+                        )
                         new_state = 'forwarded_to_researcher'
                         bot_response_text = "Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."
 
                     else:
                         # --- 2.2 СПБ (Запись на собеседование) ---
-                        logger.info(f"[{dialogue.hh_response_id}] Город СПб. Кандидат подходит. Добавляю команду для LLM на запись.")
+                        logger.info(
+                            f"[{dialogue.hh_response_id}] Город СПб. Кандидат подходит. Добавляю команду для LLM на запись.",
+                            extra={**log_extra, "action": "spb_scheduling_start"}
+                        )
 
 
                         # 2. ВАЖНО: Нам нужно сохранить текущие ответы пользователя в историю прямо сейчас.
@@ -1445,9 +1049,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     dialogue_id=dialogue.id, 
                     status='pending'
                 ))
-                logger.info(f"[{dialogue.hh_response_id}] Переход в state 'call_later'. Добавлена запись в InactiveNotificationQueue.")
+                logger.info(
+                    f"[{dialogue.hh_response_id}] Переход в state 'call_later'. Добавлена запись в InactiveNotificationQueue.",
+                    extra={**log_extra, "action": "state_call_later_added"}
+                )
             else:
-                logger.debug(f"[{dialogue.hh_response_id}] State 'call_later', но диалог уже есть в таблице молчунов. Пропускаем.")
+                logger.debug(
+                    f"[{dialogue.hh_response_id}] State 'call_later', но диалог уже есть в таблице молчунов. Пропускаем.",
+                    extra={**log_extra, "action": "state_call_later_skip_duplicate"}
+                )
         # --------------------------------------------------
 
         if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status != 'qualified':
@@ -1469,7 +1079,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             api_move_start = time.monotonic()
             await hh_api.move_response_to_folder(recruiter, db, dialogue.hh_response_id, 'interview')
-            logger.debug(f"[{dialogue.hh_response_id}] API move: {time.monotonic() - api_move_start:.2f} sec.")
+            logger.debug(
+                f"[{dialogue.hh_response_id}] API move: {time.monotonic() - api_move_start:.2f} sec.",
+                extra={**log_extra, "action": "api_move_completed", "duration": time.monotonic() - api_move_start}
+            )
 
             # --- ДОБАВИТЬ ЭТОТ БЛОК КОДА ---
             if new_state == 'interview_scheduled_spb':
@@ -1532,7 +1145,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     total_attempts = len(clarification_attempts)
                     failed_attempts = total_attempts - 1
                     if failed_attempts > 0:
-                        logger.warning(f"[{dialogue.hh_response_id}] Уточнение declined_vacancy: {failed_attempts} скрытых ретраев.")
+                        logger.warning(
+                            f"[{dialogue.hh_response_id}] Уточнение declined_vacancy: {failed_attempts} скрытых ретраев.",
+                            extra={**log_extra, "action": "decline_check_retries"}
+                        )
                         for i in range(failed_attempts):
                             retry_log = LlmUsageLog(
                                 dialogue_id=dialogue.id,
@@ -1577,7 +1193,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 except Exception as e:
                     # === ПОЛНЫЙ ПРОВАЛ ===
-                    logger.warning(f"[{dialogue.hh_response_id}] Ошибка при уточнении 'declined_vacancy': {e}. Считаем отказом по умолчанию.")
+                    logger.warning(
+                        f"[{dialogue.hh_response_id}] Ошибка при уточнении 'declined_vacancy': {e}. Считаем отказом по умолчанию.",
+                        extra={**log_extra, "action": "decline_check_failed"}
+                    )
                     total_fails = len(clarification_attempts)
                     for i in range(total_fails):
                         fail_log = LlmUsageLog(
@@ -1599,7 +1218,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         parsed = clarification_result['parsed_response']
                         is_real_decline = (parsed.get('answer') == 'yes')
                     except Exception as e:
-                        logger.warning(f"[{dialogue.hh_response_id}] Ошибка парсинга JSON при уточнении 'declined_vacancy': {e}")
+                        logger.warning(
+                            f"[{dialogue.hh_response_id}] Ошибка парсинга JSON при уточнении 'declined_vacancy': {e}",
+                            extra={**log_extra, "action": "decline_check_json_error"}
+                        )
 
                 if not is_real_decline:
                     # Кандидат НЕ отказался → прерываем текущую обработку
@@ -1612,10 +1234,16 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     dialogue.pending_messages = (dialogue.pending_messages or []) + [system_command]
                     dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
                     await db.commit()
-                    logger.info(f"[{dialogue.hh_response_id}] Отказ от вакансии НЕ подтверждён. Отложен системный запрос для повторной обработки.")
+                    logger.info(
+                        f"[{dialogue.hh_response_id}] Отказ от вакансии НЕ подтверждён. Отложен системный запрос для повторной обработки.",
+                        extra={**log_extra, "action": "decline_not_confirmed"}
+                    )
                     return  # ← ВАЖНО: выходим из функции, НЕ переводя в статус 'rejected'
                 else:
-                    logger.info(f"[{dialogue.hh_response_id}] Отказ от вакансии подтверждён LLM.")
+                    logger.info(
+                        f"[{dialogue.hh_response_id}] Отказ от вакансии подтверждён LLM.",
+                        extra={**log_extra, "action": "decline_confirmed"}
+                    )
                 # --- КОНЕЦ ДОПОЛНИТЕЛЬНОЙ ПРОВЕРКИ ---
 
 
@@ -1632,7 +1260,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         processed_at=datetime.datetime.now(datetime.timezone.utc)
                     )
                 )
-                logger.info(f"[{dialogue.hh_response_id}] Статус 'declined_interview': все запланированные напоминания отменены.")
+                logger.info(
+                    f"[{dialogue.hh_response_id}] Статус 'declined_interview': все запланированные напоминания отменены.",
+                    extra={**log_extra, "action": "reminders_cancelled_due_to_decline"}
+                )
             # -------------------------------------------------------
 
             
@@ -1645,7 +1276,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # `dialogue.rejected_alerts` будет либо объектом RejectedNotificationQueue, либо None,
             # благодаря `uselist=False` в relationship.
             if dialogue.inactive_alerts:
-                logger.info(f"[{dialogue.hh_response_id}] Кандидат уже в таблице молчунов. Пропускаю запись в отказники.")
+                logger.info(
+                    f"[{dialogue.hh_response_id}] Кандидат уже в таблице молчунов. Пропускаю запись в отказники.",
+                    extra={**log_extra, "action": "skip_rejected_queue_exists_in_inactive"}
+                )
             else:
                 if dialogue.rejected_alerts:
                     # Запись уже существует. Если статус не 'pending', обновляем его.
@@ -1680,7 +1314,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             api_move_start = time.monotonic()
             await hh_api.move_response_to_folder(recruiter, db, dialogue.hh_response_id, 'assessment')
-            logger.debug(f"[{dialogue.hh_response_id}] API move: {time.monotonic() - api_move_start:.2f} sec.")
+            logger.debug(
+                f"[{dialogue.hh_response_id}] API move: {time.monotonic() - api_move_start:.2f} sec.",
+                extra={**log_extra, "action": "api_move_completed", "duration": time.monotonic() - api_move_start}
+            )
 
         # Если LLM не вернула текст, не отправляем сообщение
         # Если LLM не вернула текст
@@ -1692,7 +1329,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # прошла, но не перевела кандидата в forwarded/failed (например, ждем чего-то еще).
             # В этом случае молчание допустимо.
             if new_state == 'qualification_complete':
-                logger.info(f"[{dialogue.hh_response_id}] LLM вернула пустой ответ для 'qualification_complete'. Это соответствует правилам.")
+                logger.info(
+                    f"[{dialogue.hh_response_id}] LLM вернула пустой ответ для 'qualification_complete'. Это соответствует правилам.",
+                    extra={**log_extra, "action": "empty_response_allowed"}
+                )
                 
                 # Сохраняем историю и стейт, но не отправляем сообщение
                 new_history = (dialogue.history or []) + user_entries_to_history
@@ -1708,7 +1348,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Если стейт подразумевает диалог (awaiting_age, awaiting_phone, scheduling и т.д.),
             # а бот молчит — это ошибка генерации.
             else:
-                logger.error(f"[{dialogue.hh_response_id}] ОШИБКА: LLM вернула пустоту для разговорного стейта '{new_state}'. Вызываю RETRY.")
+                logger.error(
+                    f"[{dialogue.hh_response_id}] ОШИБКА: LLM вернула пустоту для разговорного стейта '{new_state}'. Вызываю RETRY.",
+                    extra={**log_extra, "action": "empty_response_error_retry", "state": new_state}
+                )
                 # Мы специально кидаем ошибку, чтобы сработал rollback и бот попробовал снова в следующем цикле
                 raise ValueError(f"Empty response text forbidden for conversational state: {new_state}")
 
@@ -1740,7 +1383,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             await db.flush()
             await db.commit()
 
-            logger.info(f"Dialogue {dialogue.hh_response_id} processed successfully")
+            logger.info(
+                f"Dialogue {dialogue.hh_response_id} processed successfully",
+                extra={**log_extra, "action": "dialogue_processed_success", "new_state": new_state}
+            )
         elif message_sent == 403:
             logger.warning(f"Failed to send message for dialogue {dialogue.hh_response_id}. Clearing pending messages to avoid loop.")
             dialogue.pending_messages = None
@@ -1752,7 +1398,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             return
 
     except Exception as e:
-        logger.error(f"Critical error processing dialogue {dialogue_id}: {e}", exc_info=True)
+        ctx = log_extra if 'log_extra' in locals() else {"dialogue_id": dialogue_id}
+        logger.error(
+            f"Critical error processing dialogue {dialogue_id}: {e}", 
+            exc_info=True,
+            extra={**ctx, "action": "process_dialogue_critical_error"}
+        )
         if db and db.is_active:
             await db.rollback()
         raise  # Важно: пробрасываем исключение дальше
@@ -1840,429 +1491,7 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
         logger.debug(f"[Recruiter {recruiter_id}] process_pending_dialogues: {time.monotonic() - function_start_time:.2f}s")
 
 
-# async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, semaphore: asyncio.Semaphore):
-#     """
-#     Обрабатывает напоминание для одного диалога в изолированной сессии.
-#     """
-#     async with semaphore:
-#         async with SessionLocal() as db:
-#             try:
-#                 # Загружаем диалог со всеми связями
-#                 dialogue = await db.get(
-#                     Dialogue,
-#                     dialogue_id,
-#                     options=[
-#                         selectinload(Dialogue.candidate),
-#                         selectinload(Dialogue.vacancy),
-#                         selectinload(Dialogue.inactive_alerts)
-#                     ]
-#                 )
-#                 recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
-#                 if not dialogue or not recruiter:
-#                     return
-
-#                 # Проверка: если диалог уже не in_progress (мог измениться параллельно), выходим
-#                 EXCLUDED_REMINDER_STATUSES = ['declined_interview', 'declined_vacancy' 'call_later', 'refusal']
-#                 if (dialogue.status not in ['in_progress'] or
-#                     dialogue.dialogue_state in EXCLUDED_REMINDER_STATUSES or
-#                     dialogue.reminder_level >= 6): # Теперь до 6 уровня включительно
-#                     return
-
-#                 now = datetime.datetime.now(datetime.timezone.utc)
-#                 dialogue_hh_id = dialogue.hh_response_id
-
-#                 # --- API ЗАПРОС (самое долгое место) ---
-#                 current_folder_on_hh = await hh_api.get_negotiation_current_folder(
-#                     recruiter, db, dialogue_hh_id
-#                 )
-
-#                 # Логика обработки папки
-#                 if current_folder_on_hh is None:
-#                     # Отклик удален или не найден
-#                     return
-#                 elif current_folder_on_hh == 404:
-#                     # Вакансия закрыта
-#                     logger.info(f"Вакансия для диалога {dialogue_hh_id} закрыта. Обновляю статус.")
-#                     dialogue.status = 'timed_out'
-#                     dialogue.reminder_level = 6
-#                     await db.commit()
-#                     return
-
-#                 elif current_folder_on_hh != 'consider':
-#                     # Кандидат перемещен вручную рекрутером
-#                     logger.info(f"Диалог {dialogue_hh_id} перемещен в '{current_folder_on_hh}'. Отключаю напоминания.")
-#                     dialogue.status = 'recruiter_handled'
-#                     dialogue.reminder_level = 3
-
-#                     if dialogue.inactive_alerts and dialogue.inactive_alerts.status == 'pending':
-#                         dialogue.inactive_alerts.status = 'cancelled'
-#                         dialogue.inactive_alerts.processed_at = now
-
-#                     await db.commit()
-#                     return
-
-#                 # Логика времени
-#                 dialogue_last_updated = dialogue.last_updated or dialogue.created_at
-#                 time_since_update = now - dialogue_last_updated
-
-#                 reminder_messages = []
-#                 next_level = None
-#                 should_timeout = False
-
-#                 # Определение действия
-#                 if dialogue.reminder_level == 0 and time_since_update > datetime.timedelta(minutes=30):
-#                     reminder_messages = [
-#                         "Напишу вам ещё раз, вдруг моё прошлое сообщение затерялось где-то между делами:-). ",
-#                         "Вакансия интересна или что-то смутило? Если что-то смущает, попробую разъяснить спорные моменты и подобрать для вас варианты ."
-#                     ]
-#                     next_level = 1
-
-#                 elif dialogue.reminder_level == 1 and time_since_update > datetime.timedelta(minutes=60):
-#                     reminder_messages = [
-#                         "Пишу вам ещё раз, вдруг не увидели предыдущее сообщение. Если вам сейчас неудобно или вы думаете -  напишите, пожалуйста, чтобы я понимала, как лучше вам помочь."
-#                     ]
-#                     next_level = 2
-
-#                 elif dialogue.reminder_level == 2 and time_since_update > datetime.timedelta(minutes=30):
-#                     should_timeout = True
-
-#                 # --- НОВЫЕ УРОВНИ ---
-#                 # elif dialogue.reminder_level == 3 and time_since_update > datetime.timedelta(days=7):
-#                 #     reminder_messages = ["Добрый день. Если вы еще находитесь в поиске работы, то будем рады пригласить вас пройти собеседование. Готовы продолжить диалог?"]
-#                 #     next_level = 4
-
-#                 # elif dialogue.reminder_level == 4 and time_since_update > datetime.timedelta(days=21):
-#                 #     reminder_messages = ["Добрый день. Вы трудоустроились? Если еще рассматриваете варианты, будем рады предложить вам пройти собеседование. А так же ответить на все вопросы, которые у вас есть. "]
-#                 #     next_level = 5
-
-#                 # elif dialogue.reminder_level == 5 and time_since_update > datetime.timedelta(days=51):
-#                 #     reminder_messages = ["Еще раз добрый день. Как ваши дела? Хотели бы сообщить вам, что вакансия вновь актуальна и если вы в поиске или задумываетесь о смене работы, мы с удовольствием пригласили бы вас на собеседование"]
-#                 #     next_level = 6
-
-#                 # Выполнение действия
-#                 if should_timeout:
-#                     # ТВОЕ ТРЕБОВАНИЕ: Если запись уже есть, ничего не делаем с таблицей молчунов
-#                     if not dialogue.inactive_alerts:
-#                         db.add(InactiveNotificationQueue(dialogue_id=dialogue.id, status='pending'))
-#                         logger.info(f"Диалог {dialogue_hh_id} впервые добавлен в InactiveNotificationQueue.")
-#                     else:
-#                         logger.debug(f"Диалог {dialogue_hh_id} уже зафиксирован в таблице молчунов. Повторная запись не требуется.")
-
-#                     # Но статус самого диалога и уровень напоминания обновляем в любом случае,
-#                     # чтобы пошел отсчет 7 дней для уровня 4.
-#                     dialogue.status = 'timed_out'
-#                     dialogue.reminder_level = 3
-#                     dialogue.last_updated = now
-#                     await db.commit()
-
-#                 elif reminder_messages:
-#                     logger.info(f"Отправка напоминания уровня {next_level} для диалога {dialogue_hh_id}.")
-
-#                     # 1. Определяем типы напоминаний
-#                     is_long_reminder = next_level in [4, 5, 6]
-#                     # ТВОЕ ТРЕБОВАНИЕ: Списываем деньги только один раз (при переходе на 4 уровень)
-#                     should_charge = (next_level == 4) 
-                    
-#                     settings = None
-
-#                     # 2. Проверяем баланс только если это ПЕРВОЕ долгое напоминание
-#                     if should_charge:
-#                         # Добавляем .with_for_update()
-#                         settings_res = await db.execute(
-#                             select(AppSettings).filter_by(id=1).with_for_update()
-#                         )
-#                         settings = settings_res.scalar_one_or_none()
-                        
-#                         if not settings or settings.balance < settings.cost_per_long_reminder:
-#                             logger.warning(f"Баланс пуст. Первое долгое напоминание для {dialogue_hh_id} отменено.")
-#                             return 
-
-#                     all_sent = True
-#                     for msg in reminder_messages:
-#                         status_code = await hh_api.send_message(recruiter, db, dialogue_hh_id, msg)
-
-#                         if status_code == 200:
-#                             # Записываем сообщение в историю
-#                             new_history_entry = {
-#                                 'role': 'assistant', 
-#                                 'content': msg,
-#                                 'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
-#                             }
-#                             current_history = list(dialogue.history) if dialogue.history else []
-#                             current_history.append(new_history_entry)
-
-#                             # Добавляем системную команду (для всех уровней 4, 5, 6)
-#                             if is_long_reminder:
-#                                 system_instruction = {
-#                                     'role': 'user',
-#                                     'content': (
-#                                         "[SYSTEM COMMAND] если кандидат ответит после этого сообщения, то ты должен "
-#                                         "продолжить диалог по плану разговора, опираясь на текущее состояние (state), "
-#                                         "и не забывай перед переходом к анкете спросить про вопросы и ответить на них!"
-#                                     )
-#                                 }
-#                                 current_history.append(system_instruction)
-                            
-#                             dialogue.history = current_history[-150:]
-
-#                             # 3. СПИСЫВАЕМ ДЕНЬГИ (только если это уровень 4)
-#                             # 3. СПИСЫВАЕМ ДЕНЬГИ + СТАТИСТИКА
-#                             if should_charge and settings:
-#                                 cost = settings.cost_per_long_reminder
-#                                 settings.balance -= cost
-#                                 settings.total_spent_on_reminders += cost # Увеличиваем счетчик напоминалок
-#                                 logger.info(f"ЕДИНОВРЕМЕННОЕ СПИСАНИЕ: {cost} руб. Всего на дожимы потрачено: {settings.total_spent_on_reminders}")
-#                         elif status_code == 403:
-#                              # Вакансия закрыта или доступ запрещен
-#                              dialogue.reminder_level = 6
-#                              dialogue.status = 'vacancy_closed'
-#                              await db.commit()
-#                              all_sent = False
-#                              break # Прерываем цикл
-#                         else:
-#                             all_sent = False # Ошибка отправки
-
-#                     # Если не было критической ошибки (403), обновляем уровень и время
-#                     if all_sent or status_code == 200:
-#                         dialogue.reminder_level = next_level
-#                         dialogue.last_updated = now
-#                         await db.commit()
-
-#             except Exception as e:
-#                 logger.error(f"Ошибка в задаче напоминания для диалога {dialogue_id}: {e}")
-#                 # Не рейзим ошибку, чтобы не поломать gather
-
-
-# async def process_reminders(recruiter_id: int, db: AsyncSession):
-#     """
-#     Этап 4: Параллельная отправка напоминаний.
-#     Аргумент db здесь используется только для получения списка ID,
-#     далее каждый таск создает свою сессию.
-#     """
-#     function_start_time = time.monotonic()
-
-#     # Семафор для ограничения одновременных проверок напоминаний (чтобы не убить базу)
-#     # Можно использовать тот же MAX_CONCURRENT_DIALOGUES или создать свой
-#     REMINDER_SEMAPHORE = asyncio.Semaphore(20)
-
-#     try:
-#         # 1. Проверка времени (быстро)
-#         if SPB_TIMEZONE is None:
-#             return
-
-#         now_utc = datetime.datetime.now(datetime.timezone.utc)
-#         current_time_spb = now_utc.astimezone(SPB_TIMEZONE)
-
-#         if not (REMINDER_START_HOUR_LOCAL <= current_time_spb.hour < REMINDER_END_HOUR_LOCAL):
-#             # Вне рабочего времени просто выходим, не нагружая базу
-#             return
-
-#         # 2. Быстрая выборка ТОЛЬКО ID кандидатов, которым (возможно) нужны напоминания
-#         # Мы не грузим здесь объекты целиком, только ID
-#         EXCLUDED_REMINDER_STATUSES = ['declined_vacancy', 'declined_interview', 'call_later', 'refusal']
-
-#         result = await db.execute(
-#             select(Dialogue.id)
-#             .filter(
-#                 Dialogue.recruiter_id == recruiter_id,
-#                 # ИЗМЕНЕНИЕ: Разрешаем обработку и для тех, кто уже в статусе timed_out,
-#                 # но еще не достиг финального уровня напоминаний
-#                 Dialogue.status.in_(['in_progress']), 
-
-#                 Dialogue.dialogue_state.notin_(EXCLUDED_REMINDER_STATUSES),
-#                 Dialogue.reminder_level < 6 # 6 — это будет последнее напоминание (21 день)
-#             )
-#         )
-#         candidate_ids_to_check = result.scalars().all()
-
-#         if not candidate_ids_to_check:
-#             return
-
-#         logger.debug(f"Запуск параллельной проверки напоминаний для {len(candidate_ids_to_check)} диалогов...")
-
-#         # 3. Создаем задачи для параллельного выполнения
-#         tasks = [
-#             _process_single_reminder_task(d_id, recruiter_id, REMINDER_SEMAPHORE)
-#             for d_id in candidate_ids_to_check
-#         ]
-
-#         # 4. Запускаем и ждем выполнения (return_exceptions=True чтобы ошибка в одном не крашила всё)
-#         await asyncio.gather(*tasks, return_exceptions=True)
-
-#     except Exception as e:
-#         logger.error(f"Ошибка в process_reminders (диспетчер): {e}", exc_info=True)
-#     finally:
-#         logger.debug(
-#             f"[Recruiter ID {recruiter_id}] "
-#             f"process_reminders finished in {time.monotonic() - function_start_time:.2f}s"
-#         )
-
-# async def check_and_send_interview_reminders():
-#     """
-#     Фоновая задача, которая проверяет очередь InterviewReminder
-#     и рассылает запланированные уведомления кандидатам на HH.ru.
-#     """
-#     logger.info("Фоновый обработчик напоминаний о собеседованиях запущен.")
-
-#     # Шаблоны сообщений (это черновик, нужны будут точные тексты)
-#     MESSAGE_TEMPLATES = {
-#         '2_hours_before': (
-#             "Здравствуйте! Напоминаю, что у вас запланировано собеседование по вакансии "
-#             "'{vacancy_title}' сегодня в {interview_time_spb} по московскому времени. "
-#             "Пожалуйста, будьте готовы."
-#         ),
-#         '1_day_before_20h_spb': (
-#             "Добрый вечер! Напоминаю, что завтра, {interview_date_spb} в {interview_time_spb} "
-#             "по московскому времени, у вас назначено собеседование по вакансии '{vacancy_title}'. "
-#             "Если у вас есть вопросы, напишите нам."
-#         ),
-#         'day_of_9h_spb': (
-#             "Доброе утро! Сегодня, {interview_date_spb} в {interview_time_spb} "
-#             "по московскому времени, состоится ваше собеседование по вакансии '{vacancy_title}'. "
-#             "Будем ждать вас!"
-#         )
-#     }
-
-#     # Определяем часовой пояс Санкт-Петербурга
-#     try:
-#         SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
-#     except ZoneInfoNotFoundError: # <--- Нужно импортировать ZoneInfoNotFoundError в hh_worker/main.py тоже
-#         logger.critical("Часовой пояс 'Europe/Moscow' не найден. Напоминания не будут отправляться.")
-#         SPB_TIMEZONE = None
-#         return
-
-#     while True:
-#         if shutdown_requested:
-#             logger.info("Задача отправки напоминаний о собеседованиях остановлена из-за запроса на завершение работы.")
-#             break
-
-#         if SPB_TIMEZONE is None:
-#             await asyncio.sleep(60) # Ждем, если часовой пояс не определен
-#             continue
-
-#         async with SessionLocal() as db_session:
-#             try:
-#                 now_utc = datetime.datetime.now(datetime.timezone.utc)
-
-#                 # Выбираем напоминания, которые пора отправить
-#                 # Используем selectinload для всех необходимых связей
-#                 result = await db_session.execute(
-#                     select(InterviewReminder)
-#                     .options(
-#                         selectinload(InterviewReminder.dialogue)
-#                         .selectinload(Dialogue.vacancy),
-#                         selectinload(InterviewReminder.dialogue)
-#                         .selectinload(Dialogue.candidate),
-#                         selectinload(InterviewReminder.recruiter) # Загружаем рекрутера напрямую
-#                     )
-#                     .filter(
-#                         InterviewReminder.status == 'pending',
-#                         InterviewReminder.scheduled_send_time_utc <= now_utc
-#                     )
-#                     .limit(20) # Обрабатываем по 20 за раз
-#                 )
-#                 reminders_to_send = result.scalars().all()
-
-#                 if not reminders_to_send:
-#                     # logger.debug("[Interview Reminders] Нет ожидающих напоминаний. Пауза.")
-#                     await asyncio.sleep(30) # Пауза, если нет задач
-#                     continue
-
-#                 logger.info(f"[Interview Reminders] Найдено {len(reminders_to_send)} напоминаний для отправки.")
-
-#                 for reminder in reminders_to_send:
-#                     try:
-#                         dialogue = reminder.dialogue
-#                         recruiter = reminder.recruiter # Объект рекрутера уже загружен
-#                         vacancy = dialogue.vacancy
-#                         candidate = dialogue.candidate
-
-#                         if not dialogue or not recruiter or not vacancy or not candidate:
-#                             logger.error(
-#                                 f"Не удалось загрузить связанные объекты для напоминания {reminder.id}. "
-#                                 f"Dialogue: {bool(dialogue)}, Recruiter: {bool(recruiter)}, "
-#                                 f"Vacancy: {bool(vacancy)}, Candidate: {bool(candidate)}"
-#                             )
-#                             reminder.status = 'error'
-#                             reminder.processed_at = now_utc
-#                             await db_session.commit()
-#                             continue
-
-#                         if not recruiter.access_token:
-#                             logger.error(f"У рекрутера {recruiter.name} (ID: {recruiter.id}) нет access_token. Не могу отправить напоминание {reminder.id}.")
-#                             reminder.status = 'error'
-#                             reminder.processed_at = now_utc
-#                             await db_session.commit()
-#                             continue
-
-#                         # Форматируем дату и время собеседования для сообщения
-#                         interview_datetime_spb = reminder.interview_datetime_utc.astimezone(SPB_TIMEZONE)
-#                         interview_date_spb = interview_datetime_spb.strftime("%d.%m.%Y")
-#                         interview_time_spb = interview_datetime_spb.strftime("%H:%M")
-
-#                         # Получаем шаблон сообщения
-#                         template = MESSAGE_TEMPLATES.get(reminder.notification_type)
-#                         if not template:
-#                             logger.error(f"Не найден шаблон сообщения для типа уведомления '{reminder.notification_type}'. Напоминание {reminder.id} не будет отправлено.")
-#                             reminder.status = 'error'
-#                             reminder.processed_at = now_utc
-#                             await db_session.commit()
-#                             continue
-
-#                         message_text = template.format(
-#                             vacancy_title=vacancy.title,
-#                             candidate_full_name=candidate.full_name, # Можно использовать, если нужно
-#                             interview_date_spb=interview_date_spb,
-#                             interview_time_spb=interview_time_spb
-#                         )
-
-#                         logger.info(f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}...")
-
-#                         # Отправка сообщения кандидату через HH API
-#                         # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
-#                         send_result = await hh_api.send_message(
-#                             recruiter=recruiter,
-#                             db=db_session,
-#                             negotiation_id=dialogue.hh_response_id,
-#                             message_text=message_text
-#                         )
-
-#                         if send_result == 200:
-#                             # УСПЕХ
-#                             reminder.status = 'sent'
-#                             logger.info(f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}.")
-
-#                         elif send_result == 403:
-#                             # ВАКАНСИЯ ЗАКРЫТА
-#                             reminder.status = 'cancelled' # Отменяем, так как отправлять бессмысленно
-#                             logger.warning(
-#                                 f"Напоминание {reminder.id} ОТМЕНЕНО: Вакансия закрыта/в архиве. "
-#                                 f"Кандидат: {candidate.full_name}, Диалог: {dialogue.hh_response_id}"
-#                             )
-
-#                         else:
-#                             # ПРОЧИЕ ОШИБКИ (False или другие коды)
-#                             reminder.status = 'error'
-#                             logger.error(f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error).")
-#                         # -----------------------
-
-#                         reminder.processed_at = now_utc
-#                         await db_session.commit() # Коммитим каждое напоминание отдельно для надежности
-
-#                     except Exception as e:
-#                         logger.error(f"Ошибка при обработке напоминания {reminder.id}: {e}", exc_info=True)
-#                         if reminder.id: # Убедимся, что reminder объект существует
-#                             reminder.status = 'error'
-#                             reminder.processed_at = now_utc
-#                             await db_session.commit() # Попытаемся сохранить статус ошибки
-#                         else:
-#                             await db_session.rollback() # Откатываем, если ошибка до создания reminder
-#             except Exception as e:
-#                 logger.critical(f"Критическая ошибка в фоновом обработчике напоминаний о собеседованиях: {e}", exc_info=True)
-#                 await db_session.rollback() # Откат при ошибке верхнего уровня
-
-#         await asyncio.sleep(30) # Пауза между циклами проверки
 
 
 async def handle_single_recruiter(rec_id: int, prompt_library: dict):
@@ -2283,82 +1512,6 @@ async def handle_single_recruiter(rec_id: int, prompt_library: dict):
     except Exception as e:
         logger.error(f"Worker error for recruiter {rec_id}: {e}", exc_info=True)
 
-# async def handle_single_recruiter(rec_id: int, prompt_library: dict):
-#     """Гибридный подход: группируем связанные операции"""
-#     recruiter_processing_start_time = time.monotonic()
-#     # 1. Инициализируем имя заранее, чтобы блок finally не падал при раннем return
-#     recruiter_name = f"ID {rec_id}"
-#     try:
-#         # Быстрая проверка существования рекрутера
-#         async with SessionLocal() as check_db:
-#             result = await check_db.execute(
-#                 select(TrackedRecruiter.name, TrackedRecruiter.access_token).filter_by(id=rec_id)
-#             )
-#             recruiter_data = result.first()
-
-#             if not recruiter_data or not recruiter_data[1]:
-#                 logger.warning(f"Skipping recruiter {rec_id}: no token")
-#                 return
-
-#         recruiter_name = recruiter_data[0]
-#         logger.debug(f"--- Starting work with recruiter: {recruiter_name} (ID: {rec_id}) ---")
-
-#         # Получаем вакансии (функция сама управляет сессией)
-#         active_vacancies = await get_all_active_vacancies_for_recruiter(rec_id)
-
-#         if not active_vacancies:
-#             logger.warning(f"No active vacancies for recruiter {recruiter_name}")
-#             return
-
-#         vacancy_ids = [v['id'] for v in active_vacancies]
-
-#         # ЭТАП 1+2: Сканирование новых откликов (логически связаны, короткие операции)
-#         # Эти этапы быстрые (несколько секунд) и логически одна "фаза сканирования"
-
-#         try:
-#             scan_start = time.monotonic()
-
-#                 # Параллельное выполнение этапов 1 и 2
-#             await asyncio.gather(
-#                 process_new_responses(rec_id, vacancy_ids),
-#                 process_ongoing_responses(rec_id, vacancy_ids)
-#             )
-
-#                 # Коммитим только если оба этапа успешны
-
-#             logger.debug(f"[{recruiter_name}] Scan phase: {time.monotonic() - scan_start:.2f}s")
-
-#         except Exception as e:
-#             logger.error(f"[{recruiter_name}] Scan phase failed: {e}", exc_info=True)
-
-#                 # Не прерываем работу - идем дальше к обработке диалогов
-
-#         # ЭТАП 3: Обработка диалогов (ОТДЕЛЬНАЯ сессия - долгие операции)
-#         # Каждый диалог получает свою сессию через run_dialogue_task_with_semaphore
-#         try:
-#             dialogues_start = time.monotonic()
-#             await process_pending_dialogues(rec_id, prompt_library, None)  # Сессия не нужна
-#             logger.debug(f"[{recruiter_name}] Dialogues phase: {time.monotonic() - dialogues_start:.2f}s")
-#         except Exception as e:
-#             logger.error(f"[{recruiter_name}] Dialogues phase failed: {e}", exc_info=True)
-#             # Не прерываем - идем к напоминаниям
-
-#         # ЭТАП 4: Напоминания (ОТДЕЛЬНАЯ сессия - независимая операция)
-#         # async with SessionLocal() as reminders_db:
-#         #     try:
-#         #         reminders_start = time.monotonic()
-#         #         await process_reminders(rec_id, reminders_db)
-#         #         await reminders_db.commit()
-#         #         logger.debug(f"[{recruiter_name}] Reminders phase: {time.monotonic() - reminders_start:.2f}s")
-#         #     except Exception as e:
-#         #         logger.error(f"[{recruiter_name}] Reminders phase failed: {e}", exc_info=True)
-#         #         await reminders_db.rollback()
-
-#     except Exception as e:
-#         logger.error(f"Critical error in handle_single_recruiter {rec_id}: {e}", exc_info=True)
-
-#     finally:
-#         logger.debug(f"--- Recruiter {recruiter_name} completed: {time.monotonic() - recruiter_processing_start_time:.2f}s ---")
 
 async def run_worker_cycle(target_recruiter_ids=None):
     """Главный цикл, который запускает независимые асинхронные задачи."""
@@ -2446,6 +1599,7 @@ if __name__ == "__main__":
     setup_logging(log_filename="hh_worker.log")
     load_dotenv()
     init_sentry()
+    start_metrics_server(8000)
 
     # Настраиваем чтение аргументов
     parser = argparse.ArgumentParser(description="HH Worker instance")
