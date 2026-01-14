@@ -7,18 +7,16 @@ services:
     container_name: hh_pgbouncer
     restart: always
     environment:
-      # Настройки подключения к РЕАЛЬНОЙ базе (на хосте)
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
-      - DB_HOST=host.docker.internal  # Стучимся на хост-машину
+      - DB_HOST=host.docker.internal
       - DB_PORT=${DB_PORT}
       - DB_NAME=${DB_NAME}
-      
-      # Настройки самого PgBouncer
       - POOL_MODE=transaction
       - MAX_CLIENT_CONN=1000
       - DEFAULT_POOL_SIZE=20
       - LISTEN_PORT=6432
+      # Исправлено на scram-sha-256, как выяснили в логах
       - AUTH_TYPE=scram-sha-256
     ports:
       - "6432:6432"
@@ -26,16 +24,16 @@ services:
       - "host.docker.internal:host-gateway"
 
   # ---------------------------------------------------------------
-  # SCANNER (1 шт, сканирует HH)
+  # SCANNER (Общий)
   # ---------------------------------------------------------------
   hh_scanner:
     build: .
-    container_name: hh_scanner
+    # container_name УБРАЛИ, чтобы можно было скейлить (docker compose up -d --scale hh_scanner=2)
     restart: always
     command: python run_hh_scanner.py
     volumes:
-      - ./logs:/app/logs            # Прокидываем логи наружу
-      - ./credentials.json:/app/credentials.json # Google Creds
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
       - ./missing_vacancies.txt:/app/missing_vacancies.txt
     depends_on:
       - pgbouncer
@@ -44,18 +42,16 @@ services:
     env_file:
       - .env
     environment:
-      # Переопределяем хост БД на pgbouncer
       - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER (Обработчик, можно скейлить)
+  # WORKER (Общий обработчик)
   # ---------------------------------------------------------------
   hh_worker:
     build: .
     restart: always
-    # container_name не задаем, чтобы можно было запускать --scale
     command: python run_hh_worker.py
     volumes:
       - ./logs:/app/logs
@@ -72,10 +68,33 @@ services:
       - REDIS_HOST=host.docker.internal
     deploy:
       mode: replicated
-      replicas: 5  # <--- КОЛИЧЕСТВО ВОРКЕРОВ (Запускаем сразу 5 штук)
+      replicas: 1  # <-- Начинаем с 1. Нужно больше? docker compose up -d --scale hh_worker=5
 
   # ---------------------------------------------------------------
-  # REMINDERS (Напоминатор, 1 шт)
+  # ПРИМЕР: VIP WORKER (Для конкретных рекрутеров)
+  # Раскомментируй, если нужно выделить мощности под конкретных ID
+  # ---------------------------------------------------------------
+  # hh_worker_vip:
+  #   build: .
+  #   restart: always
+  #   # Запускаем только для ID 1 и 5
+  #   command: python run_hh_worker.py --recruiter_ids 1 5
+  #   volumes:
+  #     - ./logs:/app/logs
+  #     - ./credentials.json:/app/credentials.json
+  #   depends_on:
+  #     - pgbouncer
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - DB_HOST=pgbouncer
+  #     - DB_PORT=6432
+  #     - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # REMINDERS (Напоминатор)
   # ---------------------------------------------------------------
   hh_reminders:
     build: .
@@ -96,7 +115,7 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # TELEGRAM BOT (Интерфейс управления)
+  # TELEGRAM BOT
   # ---------------------------------------------------------------
   tg_bot:
     build: .

@@ -14,18 +14,11 @@ def get_redis_client():
     if _redis_client is None:
         host = os.getenv("REDIS_HOST", "localhost")
         port = int(os.getenv("REDIS_PORT", 6379))
-        
-        # --- ИСПРАВЛЕНИЕ: ЖЕЛЕЗОБЕТОННАЯ ПРОВЕРКА ПАРОЛЯ ---
         password = os.getenv("REDIS_PASSWORD")
-        
-        # 1. Если переменная есть, убираем пробелы по краям
         if password is not None:
             password = password.strip()
-            
-        # 2. Если после этого осталась пустая строка — ставим None
         if not password:
             password = None
-        # ---------------------------------------------------
         
         db_index = int(os.getenv("REDIS_DB", 0)) 
         
@@ -39,9 +32,6 @@ def get_redis_client():
     return _redis_client
 
 class DistributedSemaphore:
-    """
-    Распределенный семафор на базе Redis.
-    """
     def __init__(self, name: str, limit: int, timeout: int = 60):
         self.client = get_redis_client()
         self.name = f"semaphore:{name}"
@@ -57,6 +47,10 @@ class DistributedSemaphore:
 
     async def acquire(self):
         """Пытается захватить слот. Если слотов нет — ждет."""
+        start_wait_time = time.time()
+        log_interval = 5.0 # Логировать ожидание каждые 5 секунд
+        last_log_time = start_wait_time
+
         while True:
             lua_script = """
             local current = redis.call('get', KEYS[1])
@@ -71,7 +65,7 @@ class DistributedSemaphore:
                 redis.call('expire', KEYS[1], ARGV[2])
                 return 1
             else
-                return 0
+                return current
             end
             """
             try:
@@ -79,10 +73,20 @@ class DistributedSemaphore:
                 
                 if result == 1:
                     return True
+                
+                # --- ДОБАВЛЕНО ЛОГИРОВАНИЕ ОЖИДАНИЯ ---
+                current_time = time.time()
+                if current_time - last_log_time > log_interval:
+                    logger.warning(
+                        f"⏳ Semaphore '{self.name}' is BUSY (Current: {result}/{self.limit}). "
+                        f"Waiting for {int(current_time - start_wait_time)}s..."
+                    )
+                    last_log_time = current_time
+                # --------------------------------------
+
             except Exception as e:
-                # Логируем ошибку, но не спамим в консоль каждую миллисекунду
-                # logger.error(f"Redis error acquiring semaphore: {e}")
-                await asyncio.sleep(5) # Если Redis упал, ждем 5 секунд
+                logger.error(f"Redis error acquiring semaphore: {e}")
+                await asyncio.sleep(5)
                 continue
             
             await asyncio.sleep(0.1 + (0.05 * (id(self) % 10)))

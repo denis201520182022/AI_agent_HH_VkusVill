@@ -1,3 +1,7 @@
+
+source venv/bin/activate
+
+
 systemctl stop hh_main.service
 systemctl status hh_reminders.service
 
@@ -33,6 +37,7 @@ python run_hh_worker.py --recruiter_ids 1 5
 
 
 
+source venv/bin/activate
 
 
 
@@ -50,3 +55,4 @@ docker compose logs -f
 
 
 docker compose logs -f hh_scanner
+docker compose restart hh_scanner
