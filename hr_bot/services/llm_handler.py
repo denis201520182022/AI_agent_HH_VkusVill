@@ -12,10 +12,7 @@ import datetime
 import os # <--- Добавь
 from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
 
-# --- ИЗМЕНЕНИЕ: Импорты утилит и метрик ---
-from hr_bot.utils.redis_lock import DistributedSemaphore, close_redis 
-from hr_bot.utils.metrics import LLM_REQUEST_DURATION, LLM_TOKENS_TOTAL, LLM_COST_TOTAL
-# ------------------------------------------
+
 
 load_dotenv()
 logger = logging.getLogger(__name__)
