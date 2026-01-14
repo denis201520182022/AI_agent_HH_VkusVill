@@ -891,7 +891,8 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         'post_qualification_chat': ['#SCHEDULING_ALGORITHM#'],
         'scheduling_spb_day': ['#SCHEDULING_ALGORITHM#'],
         'scheduling_spb_time': ['#SCHEDULING_ALGORITHM#'],
-        'interview_scheduled_spb': ['#SCHEDULING_ALGORITHM#']
+        'interview_scheduled_spb': ['#SCHEDULING_ALGORITHM#'],
+        'forwarded_to_researcher': ['#POSTCVALTWO#'],
     }
     required_blocks.extend(state_specific_blocks.get(dialogue_state, []))
 
@@ -914,7 +915,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         prompt_pieces.append(calendar_block)
     # +++ КОНЕЦ ИЗМЕНЕНИЯ +++
 
-    POST_QUALIFICATION_STATES = ['forwarded_to_researcher', 'interview_scheduled_spb', 'post_qualification_chat']
+    POST_QUALIFICATION_STATES = ['interview_scheduled_spb', 'post_qualification_chat']
     
     if dialogue_state in POST_QUALIFICATION_STATES:
         post_qual_block = prompt_library.get('#POSTCVAL#', '')
