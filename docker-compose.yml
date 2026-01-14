@@ -197,11 +197,11 @@ services:
   # PROMTAIL (Сборщик логов)
   # ---------------------------------------------------------------
   promtail:
-    image: grafana/promtail:2.9.2
+    image: grafana/promtail:latest  # <--- ОБНОВЛЯЕМ
     container_name: monitoring_promtail
+    user: root
     restart: always
     volumes:
-      # Пробрасываем сокет Docker, чтобы Promtail видел другие контейнеры
       - /var/run/docker.sock:/var/run/docker.sock
       - ./monitoring/promtail/docker-config.yaml:/etc/promtail/config.yaml
     command: -config.file=/etc/promtail/config.yaml
