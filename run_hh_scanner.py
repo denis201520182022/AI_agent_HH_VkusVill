@@ -153,7 +153,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         vac_count = len(all_vacancies_from_api)
         VACANCIES_ACTIVE_GAUGE.labels(recruiter_id=str(recruiter_id)).set(vac_count) # <--- МЕТРИКА
         
-        logger.info(
+        logger.debug(
             f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...",
             extra={"recruiter_id": recruiter_id, "active_vacancies_count": vac_count, "action": "sync_vacancies"}
         )

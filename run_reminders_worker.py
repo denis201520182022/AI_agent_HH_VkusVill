@@ -570,7 +570,7 @@ async def run_reminders_cycle(target_recruiter_ids=None):
             await process_reminders(r_id, db_session)
             await db_session.commit()
     
-    logger.info(f"Цикл 'дожимов' завершен за {time.monotonic() - start_time:.2f} сек. (Рекрутеров: {len(recruiter_ids)})")
+    logger.debug(f"Цикл 'дожимов' завершен за {time.monotonic() - start_time:.2f} сек. (Рекрутеров: {len(recruiter_ids)})")
 
 # --- ИСПРАВЛЕНИЕ: Убрали лишний отступ у main (вынесли из предыдущей функции) ---
 async def main(target_recruiter_ids=None):

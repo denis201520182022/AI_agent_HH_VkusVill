@@ -10,5 +10,11 @@ scrape_configs:
           - hh_worker
           - hh_scanner
           - hh_reminders
+          # --- ДОБАВЛЕНЫ НОВЫЕ СЕРВИСЫ ---
+          - worker_r1
+          - scanner_r1
+          - worker_r2
+          - scanner_r2
+          # -------------------------------
         type: 'A'
         port: 8000

@@ -1517,7 +1517,7 @@ async def run_worker_cycle(target_recruiter_ids=None):
     """Главный цикл, который запускает независимые асинхронные задачи."""
     cycle_start_time = time.monotonic()
     try:
-        logger.info("Начало нового цикла воркера.")
+        logger.debug("Начало нового цикла воркера.")
         prompt_library = knowledge_base.get_prompt_library()
 
         all_recruiters_ids = []
@@ -1551,7 +1551,7 @@ async def run_worker_cycle(target_recruiter_ids=None):
         logger.critical("Критическая ошибка в главном цикле воркера!", exc_info=True)
     finally:
         cycle_end_time = time.monotonic()
-        logger.info(f"Цикл воркера завершен. Общее время: {cycle_end_time - cycle_start_time:.2f} сек.")
+        logger.debug(f"Цикл воркера завершен. Общее время: {cycle_end_time - cycle_start_time:.2f} сек.")
         logger.debug("Цикл воркера завершен.")
 
 async def main(target_recruiter_ids=None):

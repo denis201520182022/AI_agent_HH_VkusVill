@@ -23,15 +23,13 @@ services:
     extra_hosts:
       - "host.docker.internal:host-gateway"
   # ==========================================
-  # РЕКРУТЕР 1 (ID: 1)
+  # РЕКРУТЕР 1 (ID: 6 - Долгополова Марина)
   # ==========================================
   scanner_r1:
     build: .
     container_name: hh_scanner_r1
     restart: always
-    # ЗАПУСКАЕМ ТОЛЬКО ДЛЯ ID 1
-    command: python run_hh_scanner.py --recruiter_ids 1
-    # Копируем настройки из обычного сканера:
+    command: python run_hh_scanner.py --recruiter_ids 6  # <--- ИСПРАВЛЕНО ID
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -49,9 +47,49 @@ services:
 
   worker_r1:
     build: .
-    restart: always # container_name не нужен, если захочешь скейлить этот воркер
-    # ЗАПУСКАЕМ ТОЛЬКО ДЛЯ ID 1
-    command: python run_hh_worker.py --recruiter_ids 1
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 6   # <--- ИСПРАВЛЕНО ID
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ==========================================
+  # РЕКРУТЕР 2 (ID: 21 - Измайлова Анастасия)
+  # ==========================================
+  scanner_r2:
+    build: .
+    container_name: hh_scanner_r2
+    restart: always
+    command: python run_hh_scanner.py --recruiter_ids 21  # <--- НОВЫЙ СЕРВИС
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  worker_r2:
+    build: .
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 21   # <--- НОВЫЙ СЕРВИС
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
