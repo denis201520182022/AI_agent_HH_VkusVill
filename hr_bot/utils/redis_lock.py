@@ -1,3 +1,5 @@
+#hr_bot\utils\redis_lock.py
+
 import asyncio
 import logging
 import time
@@ -117,3 +119,42 @@ async def close_redis():
     if _redis_client:
         await _redis_client.aclose()
         logger.info("Redis client closed")
+
+
+# === ДОБАВЬ В КОНЕЦ ФАЙЛА redis_lock.py ===
+
+async def acquire_lock(key: str, timeout: int = 120) -> bool:
+    """
+    Захватывает блокировку через Redis.
+    
+    Args:
+        key: Уникальный ключ блокировки (например, "dialogue_lock:123")
+        timeout: Время жизни блокировки в секундах
+    
+    Returns:
+        True если блокировка успешно захвачена, False если уже занята
+    """
+    client = get_redis_client()
+    try:
+        # SET key value NX EX timeout
+        # NX - устанавливает только если ключа НЕ существует
+        # EX - автоматически удалит через timeout секунд
+        result = await client.set(key, "locked", nx=True, ex=timeout)
+        return result is not None
+    except Exception as e:
+        logger.error(f"Redis error acquiring lock '{key}': {e}")
+        return False
+
+
+async def release_lock(key: str):
+    """
+    Освобождает блокировку.
+    
+    Args:
+        key: Ключ блокировки для освобождения
+    """
+    client = get_redis_client()
+    try:
+        await client.delete(key)
+    except Exception as e:
+        logger.error(f"Redis error releasing lock '{key}': {e}")

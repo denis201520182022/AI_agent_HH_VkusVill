@@ -31,6 +31,7 @@ from hr_bot.utils.system_notifier import send_system_alert
 from hr_bot.utils.resh_in_code import check_candidate_eligibility, is_candidate_profile_complete
 import signal
 import sys
+from hr_bot.utils.redis_lock import acquire_lock, release_lock
 from hr_bot.services.llm_handler import cleanup
 from hr_bot.utils.system_notifier import send_system_alert
 from sqlalchemy import func, select, delete, update  
@@ -492,7 +493,14 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_library: dict, db: AsyncSession):
     """Исправленная версия с правильной работой с ORM"""
     dialogue_processing_start_time = time.monotonic()
-
+    # === БЛОКИРОВКА ЧЕРЕЗ REDIS ===
+    lock_key = f"dialogue_lock:{dialogue_id}"
+    lock_acquired = await acquire_lock(lock_key, timeout=120)  # 2 минуты на обработку
+    
+    if not lock_acquired:
+        logger.debug(f"Dialogue {dialogue_id} is already being processed by another worker. Skipping.")
+        return
+    # ==============================
     dialogue = None
     recruiter = None
     # --- ЗАГРУЗКА ЗДЕСЬ (значение по умолчанию) ---
@@ -1409,8 +1417,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         raise  # Важно: пробрасываем исключение дальше
 
     finally:
+        # === ОСВОБОЖДЕНИЕ БЛОКИРОВКИ ===
+        try:
+            await release_lock(lock_key)
+        except Exception as release_error:
+            logger.error(f"Failed to release lock for dialogue {dialogue_id}: {release_error}")
+        # ================================
         logger.debug(f"[{log_dialogue_hh_response_id}] Processing finished in: {time.monotonic() - dialogue_processing_start_time:.2f} sec.")
-
 
 async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db: None):
     """
