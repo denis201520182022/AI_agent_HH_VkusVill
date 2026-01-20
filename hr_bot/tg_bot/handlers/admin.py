@@ -40,7 +40,9 @@ class RecruiterManagement(StatesGroup):
     add_chat_id = State()        # <-- НОВОЕ
     add_topic_qualified = State() # <-- НОВОЕ
     add_topic_rejected = State()  # <-- НОВОЕ
+    add_topic_declined_interview = State()
     add_topic_timeout = State()   # <-- НОВОЕ
+    
     
     del_id = State()
 
@@ -52,6 +54,7 @@ class RecruiterManagement(StatesGroup):
     update_chat_id = State()        # <-- НОВОЕ
     update_topic_qualified = State() # <-- НОВОЕ
     update_topic_rejected = State()  # <-- НОВОЕ
+    update_topic_declined_interview = State() # <--- НОВОЕ
     update_topic_timeout = State()   # <-- НОВОЕ
 
 class SettingsManagement(StatesGroup):
@@ -379,8 +382,21 @@ async def process_add_topic_rejected(message: Message, state: FSMContext):
         return
     await state.update_data(topic_rejected_id=int(message.text))
     
+    # ПЕРЕХОД НА НОВЫЙ ШАГ
+    await state.set_state(RecruiterManagement.add_topic_declined_interview)
+    await message.answer("Шаг 9/10: Введите ID темы (Topic ID) для 'Отказ от собеседования'.", reply_markup=cancel_fsm_keyboard)
+
+# НОВЫЙ ОБРАБОТЧИК
+@router.message(RecruiterManagement.add_topic_declined_interview)
+async def process_add_topic_declined_interview(message: Message, state: FSMContext):
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ ID темы должен быть числом.", reply_markup=cancel_fsm_keyboard)
+        return
+    await state.update_data(topic_declined_interview_id=int(message.text))
+    
+    # ПЕРЕХОД К ФИНАЛУ
     await state.set_state(RecruiterManagement.add_topic_timeout)
-    await message.answer("Шаг 9/9: Введите ID темы (Topic ID) для 'Молчуны'.", reply_markup=cancel_fsm_keyboard)
+    await message.answer("Шаг 10/10: Введите ID темы (Topic ID) для 'Молчуны'.", reply_markup=cancel_fsm_keyboard)
 
 @router.message(RecruiterManagement.add_topic_timeout)
 async def process_add_topic_timeout(message: Message, state: FSMContext, db_session: Session):
@@ -400,7 +416,8 @@ async def process_add_topic_timeout(message: Message, state: FSMContext, db_sess
         telegram_chat_id=data['telegram_chat_id'],
         topic_qualified_id=data['topic_qualified_id'],
         topic_rejected_id=data['topic_rejected_id'],
-        topic_timeout_id=int(message.text)
+        topic_timeout_id=int(message.text),
+        topic_declined_interview_id=data['topic_declined_interview_id']
     )
     db_session.add(new_recruiter)
     db_session.commit()
@@ -508,8 +525,21 @@ async def process_update_topic_rejected(message: Message, state: FSMContext):
         return
     await state.update_data(topic_rejected_id=int(message.text))
     
+    # ПЕРЕХОД НА НОВЫЙ ШАГ
+    await state.set_state(RecruiterManagement.update_topic_declined_interview)
+    await message.answer("Шаг 7/8: Введите новый ID темы 'Отказ от собеседования'.", reply_markup=cancel_fsm_keyboard)
+
+# НОВЫЙ ОБРАБОТЧИК
+@router.message(RecruiterManagement.update_topic_declined_interview)
+async def process_update_topic_declined_interview(message: Message, state: FSMContext):
+    if not message.text or not message.text.isdigit():
+        await message.answer("❌ ID темы должен быть числом.", reply_markup=cancel_fsm_keyboard)
+        return
+    await state.update_data(topic_declined_interview_id=int(message.text))
+    
+    # ПЕРЕХОД К ФИНАЛУ
     await state.set_state(RecruiterManagement.update_topic_timeout)
-    await message.answer("Шаг 7/7: Введите новый ID темы 'Молчуны'.", reply_markup=cancel_fsm_keyboard)
+    await message.answer("Шаг 8/8: Введите новый ID темы 'Молчуны'.", reply_markup=cancel_fsm_keyboard)
 
 @router.message(RecruiterManagement.update_topic_timeout)
 async def process_update_topic_timeout(message: Message, state: FSMContext, db_session: Session):
@@ -534,6 +564,7 @@ async def process_update_topic_timeout(message: Message, state: FSMContext, db_s
     recruiter_to_update.topic_qualified_id = data['topic_qualified_id']
     recruiter_to_update.topic_rejected_id = data['topic_rejected_id']
     recruiter_to_update.topic_timeout_id = int(message.text)
+    recruiter_to_update.topic_declined_interview_id = data['topic_declined_interview_id']
 
     db_session.commit()
     await state.clear()

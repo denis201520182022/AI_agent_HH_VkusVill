@@ -114,6 +114,7 @@ class TrackedRecruiter(Base):
     topic_qualified_id = Column(Integer, nullable=True)  # ID темы "Подходящие"
     topic_rejected_id = Column(Integer, nullable=True)   # ID темы "Отказники"
     topic_timeout_id = Column(Integer, nullable=True)    # ID темы "Молчуны"
+    topic_declined_interview_id = Column(Integer, nullable=True) # ID темы "Отказ от собеседования"
     # -------------------------------------
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -155,7 +156,7 @@ class Dialogue(Base):
     candidate = relationship("Candidate", back_populates="dialogues")
     vacancy = relationship("Vacancy", back_populates="dialogues")
     recruiter = relationship("TrackedRecruiter", back_populates="dialogues")
-
+    declined_interview_alerts = relationship("DeclinedInterviewNotificationQueue", back_populates="dialogue", uselist=False)
     # --- ДОБАВИТЬ ЭТИ ДВЕ СТРОКИ СВЯЗЕЙ ---
     inactive_alerts = relationship("InactiveNotificationQueue", back_populates="dialogue", uselist=False) # uselist=False, т.к. unique=True на dialogue_id
     rejected_alerts = relationship("RejectedNotificationQueue", back_populates="dialogue", uselist=False) # uselist=False, т.к. unique=True на dialogue_id
@@ -240,6 +241,18 @@ class RejectedNotificationQueue(Base):
     
     dialogue = relationship("Dialogue", back_populates="rejected_alerts")
 # --- КОНЕЦ НОВОЙ МОДЕЛИ ---
+
+class DeclinedInterviewNotificationQueue(Base):
+    __tablename__ = 'declined_interview_notification_queue'
+    id = Column(Integer, primary_key=True, index=True)
+    # dialogue_id уникален
+    dialogue_id = Column(Integer, ForeignKey('dialogues.id'), unique=True, nullable=False)
+    status = Column(String(50), nullable=False, default='pending') # pending, sent, error
+    created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
+    processed_at = Column(DateTime(timezone=True))
+    
+    dialogue = relationship("Dialogue", back_populates="declined_interview_alerts")
+# -------------------------------------
 
 # --- НОВАЯ МОДЕЛЬ ДЛЯ УВЕДОМЛЕНИЙ О СОБЕСЕДОВАНИЯХ ---
 class InterviewReminder(Base):

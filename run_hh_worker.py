@@ -20,7 +20,7 @@ import re
 from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.logger_config import setup_logging
-from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
+from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog, DeclinedInterviewNotificationQueue
 from hr_bot.services import hh_api_real as hh_api
 from hr_bot.services import knowledge_base
 from hr_bot.services import llm_handler
@@ -132,29 +132,42 @@ shutdown_requested = False
 
 
 
+def signal_handler(sig, frame):
+    """Обработчик сигналов для graceful shutdown"""
+    global shutdown_requested
+    logger.info("Получен сигнал остановки. Завершаем работу...")
+    shutdown_requested = True
 
-async def _record_citizenship_usage(db: AsyncSession, dialogue: Dialogue, llm_data: dict):
-    """Специальная функция для учета токенов побочного запроса (гражданство)"""
-    usage_stats = llm_data.get("usage_stats")
-    if not usage_stats:
-        return
-
+async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usage_stats: dict = None):
+    """
+    Универсальная функция для подсчета токенов, стоимости и записи логов в БД.
+    Обновляет общую статистику диалога и сохраняет запись в LlmUsageLog.
+    
+    :param context: Строка контекста (например: 'Citizenship_Analysis', 'awaiting_age (RETRY #1)')
+    :param usage_stats: Словарь из ответа LLM. Если None (например, при ошибке), записываются нули.
+    """
     try:
-        p_tokens = usage_stats.get('prompt_tokens', 0)
-        c_tokens = usage_stats.get('completion_tokens', 0)
-        cached_tokens = usage_stats.get('cached_tokens', 0)
-        total_tokens = usage_stats.get('total_tokens', 0)
+        # 1. Извлечение данных (с защитой от None)
+        stats = usage_stats or {}
+        p_tokens = stats.get('prompt_tokens', 0)
+        c_tokens = stats.get('completion_tokens', 0)
+        cached_tokens = stats.get('cached_tokens', 0)
+        total_tokens = stats.get('total_tokens', 0)
 
-        # Расчет стоимости
-        cost_input_regular = (max(0, p_tokens - cached_tokens) / 1_000_000) * PRICE_PER_MILLION_INPUT_TOKENS
+        # 2. Расчет стоимости
+        # Обычные входные токены (минус кеш)
+        non_cached_input = max(0, p_tokens - cached_tokens)
+        
+        cost_input_regular = (non_cached_input / 1_000_000) * PRICE_PER_MILLION_INPUT_TOKENS
         cost_input_cached = (cached_tokens / 1_000_000) * (PRICE_PER_MILLION_INPUT_TOKENS / 2)
         cost_output = (c_tokens / 1_000_000) * PRICE_PER_MILLION_OUTPUT_TOKENS
+        
         total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
 
-        # Запись в лог
+        # 3. Создание записи лога
         usage_log = LlmUsageLog(
             dialogue_id=dialogue.id,
-            dialogue_state_at_call="Citizenship_Analysis",
+            dialogue_state_at_call=context,
             prompt_tokens=p_tokens,
             completion_tokens=c_tokens,
             cached_tokens=cached_tokens,
@@ -163,22 +176,20 @@ async def _record_citizenship_usage(db: AsyncSession, dialogue: Dialogue, llm_da
         )
         db.add(usage_log)
 
-        # Обновление счетчиков диалога
-        dialogue.total_prompt_tokens += p_tokens
-        dialogue.total_completion_tokens += c_tokens
-        dialogue.total_cached_tokens += cached_tokens
-        dialogue.total_cost += total_call_cost
-        
-        await db.flush()
+        # 4. Обновление счетчиков диалога (только если были токены)
+        if total_tokens > 0:
+            dialogue.total_prompt_tokens += p_tokens
+            dialogue.total_completion_tokens += c_tokens
+            dialogue.total_cached_tokens += cached_tokens
+            dialogue.total_cost += total_call_cost
+
+        # 5. Сохранение
+        await db.commit()
+        # Refresh нужен, чтобы объект dialogue остался привязан к сессии для дальнейшей работы
+        await db.refresh(dialogue)
+
     except Exception as e:
-        logger.error(f"Ошибка логирования токенов гражданства: {e}")
-
-def signal_handler(sig, frame):
-    """Обработчик сигналов для graceful shutdown"""
-    global shutdown_requested
-    logger.info("Получен сигнал остановки. Завершаем работу...")
-    shutdown_requested = True
-
+        logger.error(f"Ошибка при логировании токенов ({context}): {e}")
 
 def _log_missing_vacancy(title: str, city: str):
     """
@@ -524,7 +535,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 selectinload(Dialogue.vacancy),
                 selectinload(Dialogue.candidate),
                 selectinload(Dialogue.rejected_alerts),
-                selectinload(Dialogue.inactive_alerts)
+                selectinload(Dialogue.inactive_alerts),
+                selectinload(Dialogue.declined_interview_alerts)
             )
             .with_for_update(skip_locked=True)
         )
@@ -607,9 +619,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 if llm_citizenship_response:
                     # 1. Логируем успешный расход (токены и деньги)
-                    await _record_citizenship_usage(db, dialogue, llm_citizenship_response)
+                    await _log_llm_usage(
+                        db, dialogue, 
+                        "Citizenship_Analysis", 
+                        llm_citizenship_response.get("usage_stats")
+                    )
                     
-                    # 2. Логируем "пустышки" для всех предыдущих неудачных попыток (ретраев), если они были
+                    # 2. Логируем скрытые ретраи (если были)
                     total_attempts = len(citizenship_attempts)
                     if total_attempts > 1:
                         logger.warning(
@@ -617,12 +633,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             extra={**log_extra, "action": "citizenship_retry_success", "attempts": total_attempts}
                         )
                         for i in range(total_attempts - 1):
-                            retry_log = LlmUsageLog(
-                                dialogue_id=dialogue.id,
-                                dialogue_state_at_call=f"Citizenship_Analysis (RETRY #{i+1})",
-                                prompt_tokens=0, completion_tokens=0, cached_tokens=0, total_tokens=0, cost=0.0
-                            )
-                            db.add(retry_log)
+                            await _log_llm_usage(db, dialogue, f"Citizenship_Analysis (RETRY #{i+1})")
+                            
                     
                     await db.commit()
                     await db.refresh(dialogue)
@@ -679,13 +691,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     extra={**log_extra, "action": "citizenship_analysis_failed_total"}
                 )
                 for i in range(len(citizenship_attempts)):
-                    failure_log = LlmUsageLog(
-                        dialogue_id=dialogue.id,
-                        dialogue_state_at_call=f"Citizenship_Analysis (FAILED #{i+1}: {type(citizenship_err).__name__})",
-                        prompt_tokens=0, completion_tokens=0, cached_tokens=0, total_tokens=0, cost=0.0
+                    await _log_llm_usage(
+                        db, dialogue, 
+                        f"Citizenship_Analysis (FAILED #{i+1}: {type(citizenship_err).__name__})"
                     )
-                    db.add(failure_log)
-                await db.commit()
+                    
+                
                 # Пробрасываем ошибку дальше, чтобы воркер мог её обработать (или просто логируем и идем дальше)
                 raise citizenship_err
 
@@ -765,18 +776,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     extra={**log_extra, "action": "llm_retries_detected", "retry_count": failed_attempts}
                 )
                 for i in range(failed_attempts):
-                    # Записываем "пустышки" для ретраев
-                    retry_log = LlmUsageLog(
-                        dialogue_id=dialogue.id,
-                        dialogue_state_at_call=f"{dialogue.dialogue_state} (RETRY #{i+1})",
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        cached_tokens=0,
-                        total_tokens=0,
-                        cost=0.0
-                    )
-                    db.add(retry_log)
-                await db.commit() # Сохраняем логи ретраев сразу
+                    await _log_llm_usage(db, dialogue, f"{dialogue.dialogue_state} (RETRY #{i+1})")
 
         except Exception as llm_error:
             # --- СЦЕНАРИЙ ПОЛНОГО ПРОВАЛА ---
@@ -791,18 +791,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             
             try:
                 for i in range(len(attempt_tracker)):
-                    # Пишем лог для КАЖДОЙ попытки
-                    failure_log = LlmUsageLog(
-                        dialogue_id=dialogue.id,
-                        dialogue_state_at_call=f"{dialogue.dialogue_state} (FAILED #{i+1}: {type(llm_error).__name__})",
-                        prompt_tokens=0,
-                        completion_tokens=0,
-                        cached_tokens=0,
-                        total_tokens=0,
-                        cost=0.0
+                    await _log_llm_usage(
+                        db, dialogue, 
+                        f"{dialogue.dialogue_state} (FAILED #{i+1}: {type(llm_error).__name__})"
                     )
-                    db.add(failure_log)
-                await db.commit()
             except Exception as log_ex:
                 logger.error(f"Failed to log LLM errors to DB: {log_ex}")
 
@@ -826,50 +818,11 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # === ЛОГИРОВАНИЕ ТОКЕНОВ ===
         if usage_stats:
             try:
-                p_tokens = usage_stats.get('prompt_tokens', 0)
-                c_tokens = usage_stats.get('completion_tokens', 0)
-                cached_tokens = usage_stats.get('cached_tokens', 0)
-                total_tokens = usage_stats.get('total_tokens', 0)
-
-                # 1. Обычные входные токены (которые НЕ попали в кеш)
-                non_cached_input = max(0, p_tokens - cached_tokens)
-                cost_input_regular = (non_cached_input / 1_000_000) * PRICE_PER_MILLION_INPUT_TOKENS
-
-                # 2. Кешированные входные токены (стоят в 2 раза дешевле)
-                cost_input_cached = (cached_tokens / 1_000_000) * (PRICE_PER_MILLION_INPUT_TOKENS / 2)
-
-                # 3. Выходные токены (ответ бота)
-                cost_output = (c_tokens / 1_000_000) * PRICE_PER_MILLION_OUTPUT_TOKENS
-
-                # Итоговая цена за этот запрос
-                total_call_cost = cost_input_regular + cost_input_cached + cost_output
-
-                # 1. Запись в лог
-                usage_log = LlmUsageLog(
-                    dialogue_id=dialogue.id,
-                    dialogue_state_at_call=dialogue.dialogue_state,
-                    prompt_tokens=p_tokens,
-                    completion_tokens=c_tokens,
-                    cached_tokens=cached_tokens,
-                    total_tokens=total_tokens,
-                    cost=total_call_cost
+                await _log_llm_usage(
+                    db, dialogue, 
+                    dialogue.dialogue_state, 
+                    llm_data.get("usage_stats")
                 )
-                db.add(usage_log)
-
-                # 2. Обновление счетчиков диалога
-                dialogue.total_prompt_tokens += p_tokens
-                dialogue.total_completion_tokens += c_tokens
-                dialogue.total_cached_tokens += cached_tokens
-                # Преобразуем float в Decimal перед сложением
-                dialogue.total_cost += Decimal(str(total_call_cost))
-                
-                await db.commit() 
-                
-                # После коммита объекты могут "отцепиться" (expire), поэтому рефрешим dialogue
-                # чтобы дальше с ним работать в этой сессии
-                await db.refresh(dialogue) 
-                # (Если usage_log дальше не нужен, его можно не рефрешить)
-
             except Exception as e:
                 logger.error(f"Error logging tokens for dialogue {dialogue.id}: {e}")
         # ===========================
@@ -913,7 +866,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Вызываем ошибку, чтобы откатить транзакцию (db.rollback) и не сохранять мусор в БД
             raise ValueError(f"Invalid state returned by LLM: {new_state}")
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
-        
+
         # Обновляем статус
         if dialogue.status == 'new':
             dialogue.status = 'in_progress'
@@ -1194,46 +1147,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             extra={**log_extra, "action": "decline_check_retries"}
                         )
                         for i in range(failed_attempts):
-                            retry_log = LlmUsageLog(
-                                dialogue_id=dialogue.id,
-                                dialogue_state_at_call=f"DeclineClarification (RETRY #{i+1})",
-                                prompt_tokens=0,
-                                completion_tokens=0,
-                                cached_tokens=0,
-                                total_tokens=0,
-                                cost=Decimal('0.0')
-                            )
-                            db.add(retry_log)
-                        await db.commit()
+                            await _log_llm_usage(db, dialogue, f"DeclineClarification (RETRY #{i+1})")
 
                     # === ЛОГИРОВАНИЕ ТОКЕНОВ ===
                     if clarification_result and 'usage_stats' in clarification_result:
-                        usage = clarification_result['usage_stats']
-                        p_tokens = usage.get('prompt_tokens', 0)
-                        c_tokens = usage.get('completion_tokens', 0)
-                        cached_tokens = usage.get('cached_tokens', 0)
-                        non_cached = max(0, p_tokens - cached_tokens)
-                        cost = (
-                            (non_cached / 1_000_000) * PRICE_PER_MILLION_INPUT_TOKENS +
-                            (cached_tokens / 1_000_000) * (PRICE_PER_MILLION_INPUT_TOKENS / 2) +
-                            (c_tokens / 1_000_000) * PRICE_PER_MILLION_OUTPUT_TOKENS
+                        await _log_llm_usage(
+                            db, dialogue, 
+                            "DeclineClarification", 
+                            clarification_result.get('usage_stats')
                         )
-                        usage_log = LlmUsageLog(
-                            dialogue_id=dialogue.id,
-                            dialogue_state_at_call="DeclineClarification",
-                            prompt_tokens=p_tokens,
-                            completion_tokens=c_tokens,
-                            cached_tokens=cached_tokens,
-                            total_tokens=p_tokens + c_tokens,
-                            cost=Decimal(str(cost))
-                        )
-                        db.add(usage_log)
-                        dialogue.total_prompt_tokens += p_tokens
-                        dialogue.total_completion_tokens += c_tokens
-                        dialogue.total_cached_tokens += cached_tokens
-                        dialogue.total_cost += Decimal(str(cost))
-                        await db.commit()
-                        await db.refresh(dialogue)
 
                 except Exception as e:
                     # === ПОЛНЫЙ ПРОВАЛ ===
@@ -1242,17 +1164,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         extra={**log_extra, "action": "decline_check_failed"}
                     )
                     total_fails = len(clarification_attempts)
+                    
                     for i in range(total_fails):
-                        fail_log = LlmUsageLog(
-                            dialogue_id=dialogue.id,
-                            dialogue_state_at_call=f"DeclineClarification (FAILED #{i+1}: {type(e).__name__})",
-                            prompt_tokens=0,
-                            completion_tokens=0,
-                            cached_tokens=0,
-                            total_tokens=0,
-                            cost=Decimal('0.0')
+                        await _log_llm_usage(
+                            db, dialogue, 
+                            f"DeclineClarification (FAILED #{i+1}: {type(e).__name__})"
                         )
-                        db.add(fail_log)
                     await db.commit()
                     clarification_result = None
 
@@ -1325,32 +1242,44 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     extra={**log_extra, "action": "skip_rejected_queue_exists_in_inactive"}
                 )
             else:
-                if dialogue.rejected_alerts:
-                    # Запись уже существует. Если статус не 'pending', обновляем его.
-                    if dialogue.rejected_alerts.status != 'pending':
-                        logger.debug(
-                            f"Уведомление об отклоненном кандидате для диалога {dialogue.hh_response_id} "
-                            f"уже существует со статусом '{dialogue.rejected_alerts.status}'. Обновляю статус на 'pending'."
-                        )
-                        dialogue.rejected_alerts.status = 'pending'
-                        dialogue.rejected_alerts.processed_at = None # Сбросим время обработки при переходе в pending
-                        db.add(dialogue.rejected_alerts) # Добавляем для сохранения изменений
+                # СЦЕНАРИЙ 1: Отказ от собеседования -> ОТДЕЛЬНАЯ ОЧЕРЕДЬ
+                if new_state == 'declined_interview':
+                    if dialogue.declined_interview_alerts:
+                         # Запись уже существует
+                        if dialogue.declined_interview_alerts.status != 'pending':
+                            dialogue.declined_interview_alerts.status = 'pending'
+                            dialogue.declined_interview_alerts.processed_at = None
+                            db.add(dialogue.declined_interview_alerts)
                     else:
-                        logger.debug(
-                            f"Уведомление об отклоненном кандидате для диалога {dialogue.hh_response_id} "
-                            f"уже существует в RejectedNotificationQueue со статусом 'pending'.")
-                else:
-                    # Записи не существует, создаем новую
-                    new_rejected_alert = RejectedNotificationQueue(
-                        dialogue_id=dialogue.id,
-                        status='pending'
-                    )
-                    db.add(new_rejected_alert)
-                    logger.info(
-                        f"Добавлено уведомление об отклоненном кандидате (диалог {dialogue.hh_response_id}) "
-                        f"в RejectedNotificationQueue."
-                    )
-            # --- КОНЕЦ ИСПРАВЛЕННОГО БЛОКА КОДА ---
+                        # Создаем новую запись
+                        new_declined_alert = DeclinedInterviewNotificationQueue(
+                            dialogue_id=dialogue.id,
+                            status='pending'
+                        )
+                        db.add(new_declined_alert)
+                        logger.info(
+                            f"Добавлено уведомление 'Отказ от собеседования' (диалог {dialogue.hh_response_id}) "
+                            f"в DeclinedInterviewNotificationQueue."
+                        )
+                
+                # СЦЕНАРИЙ 2: Обычный отказ или провал квалификации -> REJECTED QUEUE
+                else: 
+                    if dialogue.rejected_alerts:
+                        if dialogue.rejected_alerts.status != 'pending':
+                            dialogue.rejected_alerts.status = 'pending'
+                            dialogue.rejected_alerts.processed_at = None
+                            db.add(dialogue.rejected_alerts)
+                    else:
+                        new_rejected_alert = RejectedNotificationQueue(
+                            dialogue_id=dialogue.id,
+                            status='pending'
+                        )
+                        db.add(new_rejected_alert)
+                        logger.info(
+                            f"Добавлено уведомление об отклоненном кандидате (диалог {dialogue.hh_response_id}) "
+                            f"в RejectedNotificationQueue."
+                        )
+            # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
 
 

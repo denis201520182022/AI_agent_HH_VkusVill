@@ -17,7 +17,7 @@ from aiogram.types import BufferedInputFile
 from hr_bot.utils.sentry_config import init_sentry
 
 from hr_bot.utils.logger_config import setup_logging
-from hr_bot.db.models import SessionLocal, SyncSessionLocal, Candidate, NotificationQueue, Dialogue, Vacancy, InactiveNotificationQueue, RejectedNotificationQueue
+from hr_bot.db.models import SessionLocal, SyncSessionLocal, Candidate, NotificationQueue, Dialogue, Vacancy, InactiveNotificationQueue, RejectedNotificationQueue, DeclinedInterviewNotificationQueue
 
 from hr_bot.tg_bot.middlewares import DbSessionMiddleware
 from hr_bot.tg_bot.handlers import main_router
@@ -56,7 +56,7 @@ class TaskHealthMonitor:
         while not self.shutdown:
             try:
                 now = datetime.datetime.now()
-                for name in ['qualified', 'inactive', 'rejected', 'cleanup']:
+                for name in ['qualified', 'inactive', 'rejected', 'declined_interview', 'cleanup']:
                     last = self.last_heartbeat.get(name)
                     # Если задача завершена или зависла (нет пульса)
                     if not last or (now - last).total_seconds() > MAX_STUCK_TIME or (name in self.tasks and self.tasks[name].done()):
@@ -69,6 +69,8 @@ class TaskHealthMonitor:
                             self.tasks[name] = asyncio.create_task(check_and_send_inactive_alerts(self.bot, self))
                         elif name == 'rejected':
                             self.tasks[name] = asyncio.create_task(check_and_send_rejected_alerts(self.bot, self))
+                        elif name == 'declined_interview':
+                            self.tasks[name] = asyncio.create_task(check_and_send_declined_interview_alerts(self.bot, self))
                         elif name == 'cleanup':
                             self.tasks[name] = asyncio.create_task(run_history_cleanup_task(self))
                         
@@ -637,6 +639,171 @@ async def check_and_send_rejected_alerts(bot: Bot, health_monitor: TaskHealthMon
                 await db_session.rollback()
                 await asyncio.sleep(30) # Более длительная пауза при критической ошибке
 
+async def check_and_send_declined_interview_alerts(bot: Bot, health_monitor: TaskHealthMonitor):
+    """
+    Фоновая задача, которая проверяет очередь DeclinedInterviewNotificationQueue
+    и рассылает уведомления об отказе от собеседования в групповой чат.
+    """
+    logger.info(f"Фоновый обработчик отказов от собеседования запущен.")
+    iteration_count = 0
+    while True:
+        health_monitor.heartbeat('declined_interview')
+        iteration_count += 1
+        # Логируем начало цикла не каждый раз, чтобы не спамить, или каждый (как у вас принято)
+        if iteration_count % 10 == 0:
+            logger.info(f"[Declined Interview] Итерация #{iteration_count}: работаем.")
+        
+        async with SessionLocal() as db_session:
+            try:
+                # Ищем записи в очереди со статусом 'pending'
+                result = await asyncio.wait_for(
+                    db_session.execute(
+                        select(DeclinedInterviewNotificationQueue)
+                        .filter_by(status='pending')
+                        .limit(10)
+                    ),
+                    timeout=30.0
+                )
+                tasks = result.scalars().all()
+
+                if not tasks:
+                    await asyncio.sleep(15) 
+                    continue
+
+                logger.info(f"[Declined Interview Sender] Найдено {len(tasks)} новых отказов от собеседования.")
+
+                for task in tasks:
+                    health_monitor.heartbeat('declined_interview')
+                    
+                    dialogue_result = await db_session.execute(
+                        select(Dialogue)
+                        .options(
+                            selectinload(Dialogue.candidate),
+                            selectinload(Dialogue.vacancy),
+                            selectinload(Dialogue.recruiter)
+                        )
+                        .filter_by(id=task.dialogue_id)
+                    )
+                    dialogue = dialogue_result.scalar_one_or_none()
+
+                    if not dialogue or not dialogue.candidate or not dialogue.vacancy or not dialogue.recruiter:
+                        task.status = 'error'
+                        logger.error(f"Не полные данные для задачи DeclinedInterviewNotificationQueue {task.id}.")
+                        await db_session.commit()
+                        continue
+                    
+                    recruiter = dialogue.recruiter
+
+                    # --- ПРОВЕРКА НАСТРОЕК РЕКРУТЕРА ---
+                    # Проверяем наличие chat_id и ID нужного топика
+                    if not recruiter.telegram_chat_id or not recruiter.topic_declined_interview_id:
+                        task.status = 'skipped_no_chat'
+                        logger.warning(
+                            f"Рекрутер {recruiter.name} не настроил топик 'declined_interview'. "
+                            f"Пропускаем задачу {task.id}."
+                        )
+                        await db_session.commit()
+                        continue
+                    
+                    target_chat_id = recruiter.telegram_chat_id
+                    target_thread_id = recruiter.topic_declined_interview_id
+                    # -----------------------------------
+
+                    candidate = dialogue.candidate
+                    vacancy = dialogue.vacancy
+
+                    resume_link = f"https://hh.ru/resume/{candidate.hh_resume_id}"
+
+                    safe_vacancy_title = escape_markdown(vacancy.title)
+                    safe_city = escape_markdown(vacancy.city or 'Не указан')
+                    safe_masked_name = escape_markdown(mask_fio(candidate.full_name))
+                    safe_phone_number = escape_markdown(candidate.phone_number or "—")
+                    
+                    message_text = (
+                        f"🙅‍♂️ *Кандидат отказался от собеседования*\n\n"
+                        f"Вакансия: ✨*{safe_vacancy_title}*✨\n"
+                        f"Город: 📍*{safe_city}*📍\n"
+                        f"Имя: {safe_masked_name}\n"
+                        f"Номер телефона: {safe_phone_number}\n"
+                        f"Ссылка на резюме: [Открыть на HH.ru]({resume_link})\n\n"
+                        f"URL: {resume_link}"
+                    )
+
+                    # Формирование транскрипции (стандартный блок)
+                    chat_transcript_file = None
+                    if dialogue.history:
+                        formatted_history_lines = []
+                        formatted_history_lines.append(f"=== ИСТОРИЯ ДИАЛОГА ===")
+                        formatted_history_lines.append(f"ID отклика: {dialogue.hh_response_id}")
+                        
+                        if dialogue.response_created_at:
+                            response_time_msk = dialogue.response_created_at.astimezone(SPB_TIMEZONE)
+                            formatted_time_str = response_time_msk.strftime('%d.%m.%Y в %H:%M:%S')
+                            formatted_history_lines.append(f"Время отклика (МСК): {formatted_time_str}")
+                        
+                        formatted_history_lines.append(f"Кандидат: {safe_masked_name}")
+                        formatted_history_lines.append(f"Вакансия: {safe_vacancy_title}, {safe_city}")
+                        formatted_history_lines.append("--------------------------------------------------")
+                        formatted_history_lines.append("")
+
+                        for entry in dialogue.history:
+                            role = entry.get('role')
+                            content = entry.get('content')
+                            if not content: continue
+                            if is_system_command(content): continue
+
+                            timestamp_raw = entry.get('timestamp_msk', '')
+                            timestamp_clean = timestamp_raw.split('.')[0][:-7] if timestamp_raw else ''
+                            timestamp_prefix = f"[{timestamp_clean}]" if timestamp_clean else ''
+
+                            formatted_history_lines.append("")
+                            if role == 'user':
+                                formatted_history_lines.append(f"{timestamp_prefix} 👤 Кандидат: {content}")
+                            elif role == 'assistant':
+                                formatted_history_lines.append(f"{timestamp_prefix} 🤖 Бот: {content}")
+
+                        formatted_history_string = "\n".join(formatted_history_lines)
+                        file_name = f"declined_interview_{dialogue.hh_response_id}.txt"
+                        chat_transcript_file = BufferedInputFile(formatted_history_string.encode('utf-8'), filename=file_name)
+                    
+                    # Отправка
+                    try:
+                        async with asyncio.timeout(120.0):
+                            if chat_transcript_file:
+                                await bot.send_document(
+                                    chat_id=target_chat_id,
+                                    document=chat_transcript_file,
+                                    caption=message_text,
+                                    parse_mode=ParseMode.MARKDOWN,
+                                    message_thread_id=target_thread_id
+                                )
+                            else:
+                                await bot.send_message(
+                                    chat_id=target_chat_id,
+                                    text=message_text,
+                                    message_thread_id=target_thread_id
+                                )
+                            
+                            task.status = 'sent'
+                            task.processed_at = datetime.datetime.now(datetime.timezone.utc)
+                            logger.info(f"Уведомление об отказе от интервью (диалог {dialogue.id}) отправлено.")
+
+                    except Exception as e:
+                        task.status = 'error'
+                        task.processed_at = datetime.datetime.now(datetime.timezone.utc)
+                        logger.error(f"Ошибка отправки (declined_interview): {e}", exc_info=True)
+
+                    finally:
+                        await db_session.commit()
+
+                await asyncio.sleep(5)
+
+            except Exception as e:
+                logger.critical(f"Критическая ошибка в обработчике отказов от интервью: {e}", exc_info=True)
+                await db_session.rollback()
+                await asyncio.sleep(30)
+
+
 async def run_history_cleanup_task(health_monitor: TaskHealthMonitor):
     logger.info(f"Задача очистки истории запущена.")
     last_run_date = None
@@ -697,6 +864,7 @@ async def main():
     health_monitor.tasks['qualified'] = asyncio.create_task(check_and_send_notifications(bot, health_monitor))
     health_monitor.tasks['inactive'] = asyncio.create_task(check_and_send_inactive_alerts(bot, health_monitor))
     health_monitor.tasks['rejected'] = asyncio.create_task(check_and_send_rejected_alerts(bot, health_monitor))
+    health_monitor.tasks['declined_interview'] = asyncio.create_task(check_and_send_declined_interview_alerts(bot, health_monitor))
     health_monitor.tasks['cleanup'] = asyncio.create_task(run_history_cleanup_task(health_monitor))
     
     # Запуск самого монитора
