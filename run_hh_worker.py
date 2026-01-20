@@ -1162,16 +1162,16 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         pending_messages_json=saved_pending_json  # <--- Передаем сохраненный JSON
                     )
 
-                    # 3. БЛОКИРУЕМ ДИАЛОГ
-                    dialogue.status = 'admin_review' 
-                    dialogue.dialogue_state = 'verification_error' 
+                    # # 3. БЛОКИРУЕМ ДИАЛОГ
+                    # dialogue.status = 'admin_review' 
+                    # dialogue.dialogue_state = 'verification_error' 
                     
-                    # 4. ОСТАНАВЛИВАЕМ ЦИКЛ (Очищаем очередь)
-                    dialogue.pending_messages = None
-                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                    # # 4. ОСТАНАВЛИВАЕМ ЦИКЛ (Очищаем очередь)
+                    # dialogue.pending_messages = None
+                    # dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
 
-                    await db.commit()
-                    return 
+                    # await db.commit()
+                    # return 
 
                 logger.info(f"[{dialogue.hh_response_id}] ✅ Верификация пройдена успешно.")
 
