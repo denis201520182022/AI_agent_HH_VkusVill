@@ -1,3 +1,4 @@
+# hr_bot\utils\resh_in_code.py
 def is_candidate_profile_complete(candidate) -> bool:
     """
     Проверяет, заполнены ли все обязательные поля анкеты в БД.

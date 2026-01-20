@@ -17,6 +17,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
 import re
+# ... другие импорты
+from hr_bot.utils.data_verification_notifier import send_verification_alert # <--- НОВЫЙ ИМПОРТ
 from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.logger_config import setup_logging
@@ -873,24 +875,54 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         # Обновляем extracted_data (candidate уже в сессии)
         if extracted_data and dialogue.status != 'qualified':
-            # --- ВАЛИДАЦИЯ ВОЗРАСТА ---
+            # Сохраняем текущий стейт (до того, как LLM предложила новый), 
+            # чтобы понимать, в каком контексте мы находились.
+            current_state_at_update = dialogue.dialogue_state
+
+            # --- 1. ОБРАБОТКА ВОЗРАСТА ---
             raw_age = extracted_data.get("age")
             if raw_age:
-                # Берем весь текст текущих входящих сообщений для проверки
-                current_user_text = " ".join(all_masked_content).lower()
-                if dialogue.candidate.age == raw_age:
-                     pass 
-                elif _validate_age_in_text(current_user_text, raw_age):
-                    dialogue.candidate.age = raw_age
+                # Разрешенные стейты для записи возраста
+                allowed_age_states = ['awaiting_age', 'clarifying_anything']
+                
+                if current_state_at_update in allowed_age_states:
+                    # Берем весь текст текущих входящих сообщений для проверки
+                    current_user_text = " ".join(all_masked_content).lower()
+                    
+                    if dialogue.candidate.age == raw_age:
+                        pass # Значение не изменилось
+                    elif _validate_age_in_text(current_user_text, raw_age):
+                        dialogue.candidate.age = raw_age
+                        logger.debug(
+                            f"[{dialogue.hh_response_id}] Возраст {raw_age} записан (State: {current_state_at_update}).",
+                            extra={**log_extra, "action": "age_saved"}
+                        )
+                    else:
+                        logger.warning(
+                            f"[{dialogue.hh_response_id}] LLM придумала возраст {raw_age}, но в тексте его нет. Пропуск.",
+                            extra={**log_extra, "action": "age_hallucination_detected"}
+                        )
+                else:
                     logger.debug(
-                        f"[{dialogue.hh_response_id}] Возраст {raw_age} прошел валидацию.",
-                        extra={**log_extra, "action": "age_validated", "age": raw_age}
+                        f"[{dialogue.hh_response_id}] Игнорируем возраст {raw_age} от LLM, так как стейт '{current_state_at_update}' не подразумевает ввод возраста.",
+                        extra={**log_extra, "action": "age_update_blocked_by_state"}
+                    )
+
+            # --- 2. ОБРАБОТКА ГРАЖДАНСТВА ---
+            if extracted_data.get("citizenship"):
+                # Разрешенные стейты для записи гражданства
+                allowed_citizenship_states = ['awaiting_citizenship', 'clarifying_citizenship', 'clarifying_anything']
+                
+                if current_state_at_update in allowed_citizenship_states:
+                    dialogue.candidate.citizenship = extracted_data["citizenship"]
+                    logger.debug(
+                        f"[{dialogue.hh_response_id}] Гражданство обновлено (State: {current_state_at_update}).",
+                        extra={**log_extra, "action": "citizenship_saved"}
                     )
                 else:
-                    logger.warning(
-                        f"[{dialogue.hh_response_id}] LLM галлюцинирует возраст: {raw_age}. "
-                        f"В сообщении пользователя этого нет. Запись в БД заблокирована.",
-                        extra={**log_extra, "action": "age_hallucination_detected", "hallucinated_age": raw_age}
+                    logger.debug(
+                        f"[{dialogue.hh_response_id}] Игнорируем гражданство от LLM, так как стейт '{current_state_at_update}' это запрещает.",
+                        extra={**log_extra, "action": "citizenship_update_blocked_by_state"}
                     )
             if extracted_data.get("citizenship"):
                 dialogue.candidate.citizenship = extracted_data["citizenship"]
@@ -908,6 +940,138 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
     #and dialogue.dialogue_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']  # <-- ДОБАВИТЬ
     #and new_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']
         and is_candidate_profile_complete(dialogue.candidate)):
+            
+            # =====================================================================
+            # [START] ФИНАЛЬНАЯ ВЕРИФИКАЦИЯ ДАННЫХ ПЕРЕД РЕШЕНИЕМ
+            # =====================================================================
+            logger.info(
+                f"[{dialogue.hh_response_id}] Запуск финальной верификации данных через LLM...",
+                extra={**log_extra, "action": "verification_start"}
+            )
+
+            # 1. Формируем полную историю текстом
+            full_history_text = "\n".join([f"{msg.get('role')}: {msg.get('content')}" for msg in (dialogue.history or [])])
+            full_history_text += "\n" + "\n".join([pm.get('content', '') if isinstance(pm, dict) else str(pm) for pm in pending_messages])
+
+            # 2. Промпт для проверки
+            verification_prompt = (
+                """[SYSTEM COMMAND] Твоя задача — выполнить роль АУДИТОРА данных.
+                Проанализируй ВЕСЬ диалог выше.
+                Извлеки финальный возраст и гражданство кандидата.
+
+                ПРАВИЛА НОРМАЛИЗАЦИИ ГРАЖДАНСТВА:
+                1. Если кандидат гражданин РФ (России), Беларуси, Киргизии, Армении или Казахстана -> верни строго "ЕАЭС".
+                2. Если другое гражданство, но кандидат сказал, что у него есть ВНЖ РФ -> верни строго "внж рф".
+                3. Если другое гражданство, но кандидат сказал, что у него есть РВП РФ -> верни строго "рвп рф".
+                4. Во всех остальных случаях верни название страны как есть (например "Узбекистан").
+
+                Верни ответ ТОЛЬКО в формате JSON:
+                {
+                    "age": <целое число или null>,
+                    "citizenship": "<строка или null>"
+                }
+                """
+            )
+
+            verify_attempts = []
+            verify_response = None
+            
+            try:
+                # Вызываем LLM (используем существующий механизм)
+                verify_response = await llm_handler.get_bot_response(
+                    system_prompt=verification_prompt,
+                    dialogue_history=[], # Историю мы уже вклеили в user_message или можно передать отдельно, но для аудита лучше подать контекстом
+                    user_message=f"ИСТОРИЯ ДИАЛОГА:\n{full_history_text}\n\nПроанализируй и верни JSON.",
+                    current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
+                    attempt_tracker=verify_attempts,
+                    skip_instructions=True
+                )
+
+                # Логируем использование токенов
+                if verify_response:
+                    await _log_llm_usage(
+                        db, dialogue, 
+                        "Final_Data_Verification", 
+                        verify_response.get("usage_stats")
+                    )
+                    
+                    # Логируем ретраи, если были
+                    if len(verify_attempts) > 1:
+                        for i in range(len(verify_attempts) - 1):
+                            await _log_llm_usage(db, dialogue, f"Final_Data_Verification (RETRY #{i+1})")
+
+                # Парсим ответ
+                verified_data = verify_response.get('parsed_response', {}) if verify_response else {}
+                verify_age = verified_data.get('age')
+                verify_citizenship = verified_data.get('citizenship')
+
+                # Сравниваем с БД
+                db_age = dialogue.candidate.age
+                db_citizenship = dialogue.candidate.citizenship
+                
+                # Логика сравнения (можно сделать мягче, например lower().strip())
+                is_age_ok = (db_age == verify_age)
+                
+                # Для гражданства делаем нормализацию перед сравнением, если в БД записано не "ЕАЭС", а "РФ"
+                # Но вы просили: "проверять совпадает ли". 
+                # Если в БД "РФ", а Верификатор вернул "ЕАЭС" - это несовпадение строк, но по смыслу может быть ок.
+                # НО! Раз мы хотим перестраховаться, давайте считать любое несовпадение строк инцидентом,
+                # чтобы вы увидели глазами, как работает ваша система записи.
+                
+                # Приводим к нижнему регистру для сравнения
+                def norm(s): return str(s).lower().strip() if s else "none"
+                is_citizen_ok = (norm(db_citizenship) == norm(verify_citizenship))
+
+                if not is_age_ok or not is_citizen_ok:
+                    logger.warning(
+                        f"[{dialogue.hh_response_id}] ⛔ ИНЦИДЕНТ ВЕРИФИКАЦИИ! БД: age={db_age}, cit={db_citizenship}. "
+                        f"LLM: age={verify_age}, cit={verify_citizenship}. ДИАЛОГ ОСТАНОВЛЕН.",
+                        extra={**log_extra, "action": "verification_failed_mismatch"}
+                    )
+                    
+                    # 1. Сохраняем Pending Messages в строку JSON перед удалением
+                    # ensure_ascii=False чтобы русские буквы не превратились в кракозябры
+                    saved_pending_json = json.dumps(
+                        dialogue.pending_messages, 
+                        ensure_ascii=False, 
+                        indent=2, 
+                        default=str
+                    )
+
+                    # 2. Отправляем алерт в ТГ
+                    await send_verification_alert(
+                        dialogue_id=dialogue.id,
+                        hh_response_id=dialogue.hh_response_id,
+                        db_age=db_age,
+                        db_citizenship=db_citizenship,
+                        llm_age=verify_age,
+                        llm_citizenship=verify_citizenship,
+                        history_text=full_history_text,
+                        pending_messages_json=saved_pending_json  # <--- Передаем сохраненный JSON
+                    )
+
+                    # 3. БЛОКИРУЕМ ДИАЛОГ
+                    dialogue.status = 'admin_review' 
+                    dialogue.dialogue_state = 'verification_error' 
+                    
+                    # 4. ОСТАНАВЛИВАЕМ ЦИКЛ (Очищаем очередь)
+                    dialogue.pending_messages = None
+                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+
+                    await db.commit()
+                    return 
+
+                logger.info(f"[{dialogue.hh_response_id}] ✅ Верификация пройдена успешно.")
+
+            except Exception as e:
+                logger.error(f"[{dialogue.hh_response_id}] Ошибка процесса верификации: {e}", exc_info=True)
+                # Если верификация упала технически - лучше не рисковать и тоже остановить процесс
+                return
+
+            # =====================================================================
+            # [END] КОНЕЦ БЛОКА ВЕРИФИКАЦИИ. ДАЛЬШЕ ИДЕТ СТАРЫЙ КОД...
+            # =====================================================================
+
             logger.info(
                 f"[{dialogue.hh_response_id}] Анкета собрана полностью. Запускаю проверку критериев.",
                 extra={**log_extra, "action": "profile_complete_start_check"}

@@ -18,3 +18,7 @@ stat.md
 .env.zabota
 .env.vkusvill
 run_hh_worker_не используется.py
+test_dates.py
+test.py
+hh_stress_test.py
+venv_date_test/
