@@ -96,19 +96,18 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
         return msk_dt.strftime('%Y-%m-%d %H:%M:%S MSK')
     except (ValueError, TypeError):
         return "время не определено"
-async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSession) -> list: # <--- Добавили аргумент db
+    
+async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSession) -> list:
     """
-    Асинхронно получает список вакансий. Использует переданную сессию.
+    Асинхронно получает список вакансий и синхронизирует их владельца.
+    Если вакансия перешла к текущему рекрутеру, переносит на него и активные диалоги.
     """
     function_start_time = time.monotonic()
-
-    # УБРАЛИ async with SessionLocal() as db: — используем переданную db
 
     try:
         now = datetime.datetime.now(datetime.timezone.utc)
         cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
 
-        # Получаем актуальный объект recruiter в ЭТОЙ (переданной) сессии
         current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
         if not current_recruiter:
@@ -117,6 +116,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
             
         logger.debug(f"Получение и синхронизация списка активных вакансий для рекрутера {current_recruiter.name}...")
         
+        # 1. Проверка кэша (если недавно обновляли, просто берем из БД)
         if current_recruiter.vacancies_last_synced_at:
             time_since_sync = now - current_recruiter.vacancies_last_synced_at
             if time_since_sync < cache_expiry_time:
@@ -126,11 +126,9 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 return [{"id": v.hh_vacancy_id, "name": v.title, "area": {"name": v.city} if v.city else {}} for v in cached_vacancies]
 
         logger.debug(f"Кэш устарел. Запрос к API...")
-        api_request_start = time.monotonic()
-
-        # Передаем ту же db в _make_request
-        me_data = await hh_api._make_request(current_recruiter, db, "GET", "me")
         
+        # 2. Запрос к API HH
+        me_data = await hh_api._make_request(current_recruiter, db, "GET", "me")
         if not me_data or not me_data.get('employer') or not me_data['employer'].get('id'):
             logger.error(f"Не удалось получить employer_id.")
             return []
@@ -151,19 +149,21 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
             page += 1
 
         vac_count = len(all_vacancies_from_api)
-        VACANCIES_ACTIVE_GAUGE.labels(recruiter_id=str(recruiter_id)).set(vac_count) # <--- МЕТРИКА
+        VACANCIES_ACTIVE_GAUGE.labels(recruiter_id=str(recruiter_id)).set(vac_count)
         
         logger.debug(
             f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...",
-            extra={"recruiter_id": recruiter_id, "active_vacancies_count": vac_count, "action": "sync_vacancies"}
+            extra={"recruiter_id": recruiter_id, "active_vacancies_count": vac_count}
         )
         active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
 
+        # 3. Синхронизация вакансий и диалогов
         for vacancy_data in all_vacancies_from_api:
             hh_vacancy_id = str(vacancy_data.get("id"))
             result = await db.execute(select(Vacancy).filter_by(hh_vacancy_id=hh_vacancy_id))
             vacancy_in_db = result.scalar_one_or_none()
 
+            # Если вакансии нет - создаем
             if not vacancy_in_db:
                 new_vacancy = Vacancy(
                     hh_vacancy_id=hh_vacancy_id,
@@ -173,15 +173,35 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 )
                 db.add(new_vacancy)
             else:
-                if (vacancy_in_db.title != vacancy_data.get("name") or
-                    vacancy_in_db.city != vacancy_data.get("area", {}).get("name") or
-                    vacancy_in_db.recruiter_id != current_recruiter.id):
-                    
-                    vacancy_in_db.title = vacancy_data.get("name", "Без названия")
-                    vacancy_in_db.city = vacancy_data.get("area", {}).get("name")
-                    vacancy_in_db.recruiter_id = current_recruiter.id
+                # Вакансия есть. Обновляем поля (название, город)
+                vacancy_in_db.title = vacancy_data.get("name", "Без названия")
+                vacancy_in_db.city = vacancy_data.get("area", {}).get("name")
 
-        # Отвязываем старые
+                # === [ГЛАВНАЯ ЛОГИКА ПЕРЕНОСА] ===
+                # Если у вакансии в БД другой рекрутер (или None), а HH говорит, что она теперь наша
+                if vacancy_in_db.recruiter_id != current_recruiter.id:
+                    logger.info(
+                        f"Вакансия {hh_vacancy_id} перешла к рекрутеру {recruiter_id}. "
+                        f"Переносим активные диалоги..."
+                    )
+                    
+                    # 1. Меняем владельца вакансии
+                    vacancy_in_db.recruiter_id = current_recruiter.id
+                    
+                    # 2. МАССОВЫЙ UPDATE ДИАЛОГОВ
+                    # Одним запросом меняем recruiter_id во всех диалогах этой вакансии,
+                    # которые находятся в активных статусах.
+                    stmt = (
+                        update(Dialogue)
+                        .where(Dialogue.vacancy_id == vacancy_in_db.id)
+                        .where(Dialogue.status.in_(['new', 'in_progress', 'qualified']))
+                        .values(recruiter_id=current_recruiter.id)
+                    )
+                    await db.execute(stmt)
+                    # =================================
+
+        # 4. Отвязываем вакансии, которые больше не активны у этого рекрутера
+        # (Например, рекрутер закрыл вакансию или передал другому, и её нет в current active list)
         stale_result = await db.execute(select(Vacancy).filter(
             Vacancy.recruiter_id == current_recruiter.id,
             Vacancy.hh_vacancy_id.notin_(active_hh_ids)
@@ -191,8 +211,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
 
         current_recruiter.vacancies_last_synced_at = now
         
-        # ВАЖНО: Мы НЕ делаем db.commit() здесь, потому что транзакцией управляет вызывающая функция!
-        # Но делаем flush, чтобы изменения применились в памяти
+        # Flush применяет изменения в транзакции (в т.ч. наш update), но не комитит окончательно
         await db.flush() 
         
         logger.debug(f"Синхронизация завершена.")
@@ -200,7 +219,6 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
 
     except Exception as e:
         logger.error(f"Ошибка при синхронизации вакансий: {e}", exc_info=True)
-        # Не делаем rollback всей сессии тут, просто пробрасываем ошибку
         raise 
     finally:
         logger.debug(f"Время выполнения: {time.monotonic() - function_start_time:.2f} sec.")

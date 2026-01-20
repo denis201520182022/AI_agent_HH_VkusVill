@@ -874,10 +874,46 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 logger.error(f"Error logging tokens for dialogue {dialogue.id}: {e}")
         # ===========================
 
+        # --- СПИСОК РАЗРЕШЕННЫХ СТАТУСОВ ДИАЛОГА ---
+        ALLOWED_STATES = {
+            'initial_processing',
+            'awaiting_questions',
+            'awaiting_phone',
+            'awaiting_city',
+            'awaiting_readiness',
+            'awaiting_citizenship',
+            'clarifying_citizenship',
+            'awaiting_age',
+            'clarifying_anything',
+            'clarifying_declined_vacancy',
+            'qualification_complete',
+            'call_later',
+            'init_scheduling_spb',
+            'post_qualification_chat',
+            'scheduling_spb_day',
+            'scheduling_spb_time',
+            'interview_scheduled_spb',
+            'forwarded_to_researcher',
+            'qualification_failed',
+            'declined_vacancy',
+            'declined_interview'
+        }
+
         bot_response_text = llm_response.get("response_text")
         new_state = llm_response.get("new_state", "error_state")
         extracted_data = llm_response.get("extracted_data")
 
+        # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
+        if new_state not in ALLOWED_STATES:
+            logger.error(
+                f"[{dialogue.hh_response_id}] CRITICAL: LLM hallucinated invalid state: '{new_state}'. "
+                f"Valid states are: {ALLOWED_STATES}",
+                extra={**log_extra, "action": "invalid_state_detected", "invalid_state": new_state}
+            )
+            # Вызываем ошибку, чтобы откатить транзакцию (db.rollback) и не сохранять мусор в БД
+            raise ValueError(f"Invalid state returned by LLM: {new_state}")
+        # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
+        
         # Обновляем статус
         if dialogue.status == 'new':
             dialogue.status = 'in_progress'
