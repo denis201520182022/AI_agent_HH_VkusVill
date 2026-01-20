@@ -1140,7 +1140,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         dialogue.candidate.citizenship = verify_citizenship
                     
                     await db.flush() # Сохраняем изменения в текущей транзакции
-                    
+
                     # 1. Сохраняем Pending Messages в строку JSON перед удалением
                     # ensure_ascii=False чтобы русские буквы не превратились в кракозябры
                     saved_pending_json = json.dumps(
@@ -1214,7 +1214,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 # Проверяем город
                 city_lower = (dialogue.vacancy.city or "").lower()
-                is_spb = any(x in city_lower for x in ['санкт-петербург', 'конаково'])
+                is_spb = any(x in city_lower for x in ['санкт-петербург', 'Ставрополь'])
 
                 if not is_spb:
                     # --- 2.1 НЕ СПБ (Регионы) ---
