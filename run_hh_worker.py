@@ -1130,10 +1130,16 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 if not is_age_ok or not is_citizen_ok:
                     logger.warning(
-                        f"[{dialogue.hh_response_id}] ⛔ ИНЦИДЕНТ ВЕРИФИКАЦИИ! БД: age={db_age}, cit={db_citizenship}. "
-                        f"LLM: age={verify_age}, cit={verify_citizenship}. ДИАЛОГ ОСТАНОВЛЕН.",
-                        extra={**log_extra, "action": "verification_failed_mismatch"}
+                        f"[{dialogue.hh_response_id}] ВЕРИФИКАЦИЯ: Данные исправлены. Было: {db_age}/{db_citizenship}, Стало: {verify_age}/{verify_citizenship}",
+                        extra={**log_extra, "action": "verification_auto_correct"}
                     )
+                    # ЗАПИСЫВАЕМ ВЕРНЫЕ ДАННЫЕ В БД
+                    if verify_age:
+                        dialogue.candidate.age = verify_age
+                    if verify_citizenship:
+                        dialogue.candidate.citizenship = verify_citizenship
+                    
+                    await db.flush() # Сохраняем изменения в текущей транзакции
                     
                     # 1. Сохраняем Pending Messages в строку JSON перед удалением
                     # ensure_ascii=False чтобы русские буквы не превратились в кракозябры
