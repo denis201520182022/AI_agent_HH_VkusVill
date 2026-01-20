@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
 import re
+from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
 # ... другие импорты
 from hr_bot.utils.data_verification_notifier import send_verification_alert # <--- НОВЫЙ ИМПОРТ
 from hr_bot.utils.redis_lock import close_redis 
@@ -192,6 +193,48 @@ async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usa
 
     except Exception as e:
         logger.error(f"Ошибка при логировании токенов ({context}): {e}")
+
+async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_date: str, history_messages: list, calendar_context: str, log_extra: dict) -> str:
+    """
+    Техническая проверка даты (Аудит). Возвращает исправленную дату в формате YYYY-MM-DD.
+    """
+    # Собираем последние 10 сообщений для анализа
+    recent_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_messages[-10:]])
+    
+    verify_prompt = (
+        f"Ты — технический контролер системы бронирования. Твоя задача — проверить, не ошиблась ли первая модель в выборе даты.\n\n"
+        f"[ДИНАМИЧЕСКИЙ КАЛЕНДАРЬ]\n{calendar_context}\n\n"
+        f"[ЗАДАЧА]\n"
+        f"Проанализируй диалог. Какую дату на самом деле выбрал кандидат?\n"
+        f"Первая модель предложила: {suggested_date}\n\n"
+        f"Правила:\n"
+        f"1. Если предложенная дата {suggested_date} точно соответствует словам кандидата и календарю — верни её.\n"
+        f"2. Если первая модель ошиблась (например, кандидат просил субботу 24-е, а модель дала 21-е) — верни ПРАВИЛЬНУЮ дату из календаря.\n"
+        f"3. Если в сообщениях кандидата вообще нет указания на дату — верни 'none'.\n\n"
+        f"Ответ строго в формате JSON: {{\"correct_date\": \"YYYY-MM-DD или none\"}}"
+    )
+
+    verify_attempts = []
+    try:
+        # Вызываем LLM через твой обработчик
+        response = await llm_handler.get_bot_response(
+            system_prompt=verify_prompt,
+            dialogue_history=[],
+            user_message=f"ИСТОРИЯ ДИАЛОГА:\n{recent_text}",
+            current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
+            attempt_tracker=verify_attempts,
+            skip_instructions=True
+        )
+
+        if response and 'usage_stats' in response:
+            await _log_llm_usage(db, dialogue, "Date_Audit_Call", response['usage_stats'])
+
+        parsed = response.get('parsed_response', {})
+        return parsed.get("correct_date", suggested_date)
+    except Exception as e:
+        logger.error(f"Критическая ошибка аудита даты: {e}", extra=log_extra)
+        return suggested_date # В случае падения пропускаем как есть (fallback)
+    
 
 def _log_missing_vacancy(title: str, city: str):
     """
@@ -868,6 +911,69 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Вызываем ошибку, чтобы откатить транзакцию (db.rollback) и не сохранять мусор в БД
             raise ValueError(f"Invalid state returned by LLM: {new_state}")
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
+
+        # --- [START] БЛОК ВЕРИФИКАЦИИ ДАТЫ И ПОВТОРНОЙ ГЕНЕРАЦИИ ---
+        extracted_data = llm_response.get("extracted_data")
+        
+        # 1. Проверяем, прислала ли модель дату
+        if extracted_data and extracted_data.get("interview_date"):
+            suggested_date = extracted_data["interview_date"]
+            suggested_time = extracted_data.get("interview_time", "время не указано")
+
+            # 2. Проверяем, НЕТ ЛИ уже записанной даты в БД (interview_datetime_utc)
+            # Если дата уже есть, мы игнорируем попытки LLM назначить новую (защита от перезаписи)
+        
+            # 3. Запускаем Аудит (Deep Check)
+            logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {suggested_date}")
+            
+            cal_context = _generate_calendar_context()
+            # История: старая + то что юзер прислал сейчас
+            full_hist = (dialogue.history or []) + user_entries_to_history
+            
+            verified_date = await _verify_date_audit(db, dialogue, suggested_date, full_hist, cal_context, log_extra)
+
+            # 4. СРАВНИВАЕМ
+            if verified_date != suggested_date and verified_date != "none":
+                logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {suggested_date}, Аудитор: {verified_date}")
+
+                # Отправляем алерт в ТГ
+                user_text_now = " ".join(all_masked_content)
+                full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
+                
+                from hr_bot.utils.data_verification_notifier import send_date_conflict_alert # Импортируй заранее
+                await send_date_conflict_alert(
+                    dialogue_id=dialogue.id,
+                    hh_response_id=dialogue.hh_response_id,
+                    user_said=user_text_now,
+                    llm_suggested=suggested_date,
+                    verified_date=verified_date,
+                    history_text=full_hist_text
+                )
+
+                # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
+                correction_cmd = {
+                    'message_id': f'sys_date_corr_{time.time()}',
+                    'role': 'user',
+                    'content': (
+                        f"[SYSTEM INSTRUCTION] В прошлом шаге ты ошибся и предложил дату {suggested_date}. "
+                        f"На самом деле пользователь выбрал {verified_date} (согласно календарю). "
+                        f"Сгенерируй ответ заново, подтвердив правильную дату ({verified_date}) и время ({suggested_time}). "
+                        f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
+                    )
+                }
+
+                # Кладем в очередь и прерываем текущий цикл (не отправляем сообщение в HH!)
+                dialogue.pending_messages = [correction_cmd]
+                dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                
+                # Сохраняем историю (чтобы не потерять сообщение юзера, которое мы только что обработали)
+                dialogue.history = (dialogue.history or []) + user_entries_to_history
+                
+                await db.commit()
+                logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
+                return # ВЫХОДИМ ИЗ ФУНКЦИИ. Сообщение в HH не уйдет.
+
+        # --- [END] БЛОК ВЕРИФИКАЦИИ ДАТЫ ---
 
         # Обновляем статус
         if dialogue.status == 'new':

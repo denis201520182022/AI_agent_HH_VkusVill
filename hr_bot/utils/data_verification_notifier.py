@@ -73,3 +73,25 @@ async def send_verification_alert(
 
     except Exception as e:
         logger.error(f"Ошибка при отправке алерта верификации: {e}", exc_info=True)
+
+
+    async def send_date_conflict_alert(dialogue_id: int, hh_response_id: str, user_said: str, llm_suggested: str, verified_date: str, history_text: str ):
+        """Специальный алерт для ошибок в датах"""
+        admin_id = "1975808643"
+        token = os.getenv("TELEGRAM_BOT_TOKEN")
+        
+        alert_text = (
+            f"📅 **INCIDENT: Ошибка в дате записи**\n\n"
+            f"Диалог: `{hh_response_id}`\n"
+            f"Кандидат сказал: *\"{user_said}\"* \n"
+            f"Первая LLM выдала: `{llm_suggested}`\n"
+            f"Проверка (Deep Check) нашла: `{verified_date}`\n\n"
+            f"⚠️ **В базу записана верная дата.**"
+        )
+        
+        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)) as bot:
+            await bot.send_message(chat_id=admin_id, text=alert_text)
+            if history_text:
+                from aiogram.types import BufferedInputFile
+                file = BufferedInputFile(history_text.encode('utf-8'), filename=f"date_error_{hh_response_id}.txt")
+                await bot.send_document(chat_id=admin_id, document=file, caption="📜 История для проверки")
