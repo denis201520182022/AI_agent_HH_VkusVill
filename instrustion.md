@@ -58,6 +58,7 @@ docker compose build --no-cache
 # 3. Запускаем
 docker compose up -d
 
+docker compose up -d --build
 
 
 http://212.193.26.118:3000

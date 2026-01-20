@@ -924,12 +924,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         f"[{dialogue.hh_response_id}] Игнорируем гражданство от LLM, так как стейт '{current_state_at_update}' это запрещает.",
                         extra={**log_extra, "action": "citizenship_update_blocked_by_state"}
                     )
-            if extracted_data.get("citizenship"):
-                dialogue.candidate.citizenship = extracted_data["citizenship"]
-            if extracted_data.get("city"):
-                dialogue.candidate.city = extracted_data["city"]
-            if extracted_data.get("readiness_to_start"):
-                dialogue.candidate.readiness_to_start = extracted_data["readiness_to_start"]
+            # if extracted_data.get("citizenship"):
+            #     dialogue.candidate.citizenship = extracted_data["citizenship"]
+            # if extracted_data.get("city"):
+            #     dialogue.candidate.city = extracted_data["city"]
+            # if extracted_data.get("readiness_to_start"):
+            #     dialogue.candidate.readiness_to_start = extracted_data["readiness_to_start"]
             await db.flush()
         # ==========================================================================================
         # БЛОК ВАЛИДАЦИИ И ПРИНЯТИЯ РЕШЕНИЙ (КОД)
