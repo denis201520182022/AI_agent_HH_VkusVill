@@ -1208,7 +1208,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 # Проверяем город
                 city_lower = (dialogue.vacancy.city or "").lower()
-                is_spb = any(x in city_lower for x in ['санкт-петербург'])
+                is_spb = any(x in city_lower for x in ['санкт-петербург', 'конаково'])
 
                 if not is_spb:
                     # --- 2.1 НЕ СПБ (Регионы) ---
