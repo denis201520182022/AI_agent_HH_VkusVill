@@ -11,6 +11,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import datetime
 import os # <--- Добавь
 from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
+from hr_bot.utils.redis_lock import close_redis 
 
 
 
@@ -111,6 +112,7 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         print(f"💬 Input токены: {usage.prompt_tokens}")
         print(f"📤 Output токены: {usage.completion_tokens}")
         print(f"⚡ Кешированные токены: {cached_tokens}")
+        print(f"📄 Содержание ответа: {response_content}")
 
         if usage.prompt_tokens > 0:
             cache_percent = (cached_tokens / usage.prompt_tokens) * 100
@@ -167,7 +169,7 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
 
         async with DistributedSemaphore(name="llm_global", limit=GLOBAL_LLM_LIMIT):
             response = await client.chat.completions.create(
-                model="gpt-4o", # Используем мощную модель
+                model="gpt-5", # Используем мощную модель
                 messages=messages,
                 max_completion_tokens=2500,
                 response_format={"type": "json_object"},
@@ -187,7 +189,7 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
         print(f"💬 Input токены: {usage.prompt_tokens}")
         print(f"📤 Output токены: {usage.completion_tokens}")
         print(f"⚡ Кешированные токены: {cached_tokens}")
-
+        print(f"📄 Содержание ответа: {response_content}")
         logger.info(f"Успешный ответ от SMART LLM. Tokens: {usage.total_tokens}")
 
         return {
