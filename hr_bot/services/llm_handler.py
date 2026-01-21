@@ -89,6 +89,7 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
                 messages=messages,
                 max_completion_tokens=2500,
                 response_format={"type": "json_object"},
+                frequency_penalty=0.7
             )
         # ----------------------------------------------------
 
@@ -170,7 +171,8 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
                 messages=messages,
                 max_completion_tokens=2500,
                 response_format={"type": "json_object"},
-                temperature=0 # Устанавливаем 0 для максимальной точности в датах
+                temperature=0
+                 # Устанавливаем 0 для максимальной точности в датах
             )
 
         response_content = response.choices[0].message.content
@@ -185,7 +187,7 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
         print(f"💬 Input токены: {usage.prompt_tokens}")
         print(f"📤 Output токены: {usage.completion_tokens}")
         print(f"⚡ Кешированные токены: {cached_tokens}")
-        
+
         logger.info(f"Успешный ответ от SMART LLM. Tokens: {usage.total_tokens}")
 
         return {
