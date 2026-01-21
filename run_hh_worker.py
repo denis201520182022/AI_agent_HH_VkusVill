@@ -217,7 +217,7 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
     verify_attempts = []
     try:
         # Вызываем LLM через твой обработчик
-        response = await llm_handler.get_bot_response(
+        response = await llm_handler.get_smart_bot_response(
             system_prompt=verify_prompt,
             dialogue_history=[],
             user_message=f"ИСТОРИЯ ДИАЛОГА:\n{recent_text}",

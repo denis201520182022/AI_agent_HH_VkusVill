@@ -142,6 +142,66 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         # и решить, нужно ли повторять попытку.
         raise
 
+# Найти в конце файла или после функции get_bot_response
+
+@retry(
+    stop=stop_after_attempt(3),
+    wait=wait_exponential(multiplier=1, min=4, max=10),
+)
+async def get_smart_bot_response(system_prompt: str, dialogue_history: list, user_message: str, current_datetime_utc: datetime.datetime, attempt_tracker: list = None, skip_instructions: bool = False) -> dict:
+    """
+    Асинхронно отправляет запрос к УМНОЙ модели (gpt-4o) для сложных задач (аудит дат, верификация).
+    """
+    if attempt_tracker is not None:
+        attempt_tracker.append(datetime.datetime.now())
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+    ]
+    messages.extend(dialogue_history)
+    messages.append({"role": "user", "content": user_message})
+
+    try:
+        logger.info(f"Отправка запроса к SMART LLM (gpt-4o)...")
+
+        async with DistributedSemaphore(name="llm_global", limit=GLOBAL_LLM_LIMIT):
+            response = await client.chat.completions.create(
+                model="gpt-4o", # Используем мощную модель
+                messages=messages,
+                max_completion_tokens=2500,
+                response_format={"type": "json_object"},
+                temperature=0 # Устанавливаем 0 для максимальной точности в датах
+            )
+
+        response_content = response.choices[0].message.content
+        usage = response.usage
+        cached_tokens = 0
+        
+        if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
+            cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0)
+
+        print("\n=== ТОКЕНЫ И КЕШ ===")
+        print(f"📊 Всего токенов: {usage.total_tokens}")
+        print(f"💬 Input токены: {usage.prompt_tokens}")
+        print(f"📤 Output токены: {usage.completion_tokens}")
+        print(f"⚡ Кешированные токены: {cached_tokens}")
+        
+        logger.info(f"Успешный ответ от SMART LLM. Tokens: {usage.total_tokens}")
+
+        return {
+            "parsed_response": json.loads(response_content),
+            "usage_stats": {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "total_tokens": usage.total_tokens,
+                "cached_tokens": cached_tokens
+            }
+        }
+
+    except Exception as e:
+        logger.warning(f"Ошибка в SMART LLM: {type(e).__name__}: {e}. Ретрай...")
+        raise
+
 
 async def cleanup():
     """
