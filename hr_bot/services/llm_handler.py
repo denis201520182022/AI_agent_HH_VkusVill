@@ -107,20 +107,23 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
             cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0)
 
-        
+        # Расчет процента кэша
+        prompt_tokens = usage.prompt_tokens
+        cache_percentage = 0.0
+        if prompt_tokens > 0:
+            cache_percentage = (cached_tokens / prompt_tokens) * 100
+
+
         ctx_logger.info(
-            f"LLM Response received. Total tokens 📊: {usage.total_tokens}",
-            extra={
-                "action": "llm_response_success",
-                "llm_stats": {
-                    "total": usage.total_tokens,
-                    "prompt": usage.prompt_tokens,
-                    "completion": usage.completion_tokens,
-                    "cached": cached_tokens,
-                },
-                "llm_response_raw": response_content[:500]  # Логируем начало ответа для отладки
-            }
+            f"✅ LLM Response received. "
+            f"[Action: llm_response_success] "
+            f"[Tokens: Total={usage.total_tokens}, Prompt={usage.prompt_tokens}, "
+            f"Compl={usage.completion_tokens}, Cached={cached_tokens} ({cache_percentage:.1f}%)]"
+            f"Raw LLM Response: {response_content}..."
         )
+        
+        
+
         #print(response_content)
         parsed_response = json.loads(response_content)
 
@@ -166,7 +169,7 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
     messages.append({"role": "user", "content": user_message})
 
     try:
-        ctx_logger.info(f"🧬🧬Отправка запроса к GPT-5 (SMART mode)...")
+        ctx_logger.info(f"🧠🧠Отправка запроса к GPT-5 (SMART mode)...")
 
         async with DistributedSemaphore(name="llm_global", limit=GLOBAL_LLM_LIMIT):
             response = await client.chat.completions.create(
@@ -186,18 +189,16 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
         
         if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
             cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0)
-
+        prompt_tokens = usage.prompt_tokens
+        cache_percentage = 0.0
+        if prompt_tokens > 0:
+            cache_percentage = (cached_tokens / prompt_tokens) * 100
         ctx_logger.info(
-            f"SMART LLM Response received. Tokens ⚡: {usage.total_tokens}",
-            extra={
-                "action": "smart_llm_success",
-                "llm_stats": {
-                    "total": usage.total_tokens,
-                    "prompt": usage.prompt_tokens,
-                    "completion": usage.completion_tokens,
-                    "cached": cached_tokens,
-                }
-            }
+            f"✅ SMART LLM Response received. "
+            f"[Action: smart_llm_success] "
+            f"[Tokens: Total={usage.total_tokens}, Prompt={usage.prompt_tokens}, "
+            f"Compl={usage.completion_tokens}, Cached={cached_tokens} ({cache_percentage:.1f}%)]"
+            f"Raw LLM Response: {response_content}..."
         )
 
         return {
