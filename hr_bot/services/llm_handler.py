@@ -172,12 +172,12 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
             response = await client.chat.completions.create(
                 model="gpt-5", # Или "gpt-5-thinking" для сверхсложных задач
                 messages=messages,
-                max_completion_tokens=3000, # Увеличили запас для reasoning tokens
+                max_completion_tokens=1500, # Увеличили запас для reasoning tokens
                 response_format={"type": "json_object"},
                 # НОВЫЕ ПАРАМЕТРЫ GPT-5:
-                reasoning_effort="high",  # Максимальная точность для аудита дат
+                reasoning_effort="low",  # Максимальная точность для аудита дат
                 verbosity="low",         # Чтобы ответ был чистым JSON без лишнего текста
-                # temperature=1,         # В GPT-5 часто фиксирована, можно не указывать
+                
             )
 
         response_content = response.choices[0].message.content
