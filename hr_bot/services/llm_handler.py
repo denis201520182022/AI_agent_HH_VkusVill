@@ -158,23 +158,26 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
     if attempt_tracker is not None:
         attempt_tracker.append(datetime.datetime.now())
     
+    # Рекомендуется использовать роль 'developer' для системных инструкций в GPT-5
     messages = [
-        {"role": "system", "content": system_prompt},
+        {"role": "developer", "content": system_prompt},
     ]
     messages.extend(dialogue_history)
     messages.append({"role": "user", "content": user_message})
 
     try:
-        logger.info(f"Отправка запроса к SMART LLM (gpt-4o)...")
+        logger.info(f"Отправка запроса к GPT-5 (SMART mode)...")
 
         async with DistributedSemaphore(name="llm_global", limit=GLOBAL_LLM_LIMIT):
             response = await client.chat.completions.create(
-                model="gpt-5", # Используем мощную модель
+                model="gpt-5", # Или "gpt-5-thinking" для сверхсложных задач
                 messages=messages,
-                max_completion_tokens=2500,
+                max_completion_tokens=3000, # Увеличили запас для reasoning tokens
                 response_format={"type": "json_object"},
-                temperature=0
-                 # Устанавливаем 0 для максимальной точности в датах
+                # НОВЫЕ ПАРАМЕТРЫ GPT-5:
+                reasoning_effort="high",  # Максимальная точность для аудита дат
+                verbosity="low",         # Чтобы ответ был чистым JSON без лишнего текста
+                # temperature=1,         # В GPT-5 часто фиксирована, можно не указывать
             )
 
         response_content = response.choices[0].message.content
