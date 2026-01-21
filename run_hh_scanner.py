@@ -103,6 +103,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
     Если вакансия перешла к текущему рекрутеру, переносит на него и активные диалоги.
     """
     function_start_time = time.monotonic()
+    current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
     rec_logger = logging.LoggerAdapter(logger, {
         "recruiter_id": recruiter_id, 
         "recruiter_name": current_recruiter.name,
@@ -112,7 +113,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         now = datetime.datetime.now(datetime.timezone.utc)
         cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
 
-        current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
+        
 
         if not current_recruiter:
             rec_logger.error(f"Рекрутер с ID {recruiter_id} не найден.")
