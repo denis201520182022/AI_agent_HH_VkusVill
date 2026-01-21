@@ -443,7 +443,7 @@ async def get_responses_from_folder(
 # ИЗМЕНЕНИЕ: Тип db изменен на AsyncSession
 async def get_messages(recruiter: TrackedRecruiter, db: AsyncSession, messages_url: str) -> list:
     """Асинхронно получает ПОЛНУЮ историю сообщений постранично."""
-    logger.info(f"REAL_API: Запрос ВСЕХ сообщений по {messages_url}...")
+    logger.debug(f"REAL_API: Запрос ВСЕХ сообщений по {messages_url}...")
     all_messages, page = [], 0
 
     while True:
@@ -474,7 +474,7 @@ async def get_messages(recruiter: TrackedRecruiter, db: AsyncSession, messages_u
 # НАЙДИТЕ ЭТУ ФУНКЦИЮ И ЗАМЕНИТЕ ЕЁ ЦЕЛИКОМ:
 async def send_message(recruiter: TrackedRecruiter, db: AsyncSession, negotiation_id: str, message_text: str) -> int | bool:
     """Асинхронно отправляет сообщение в чат отклика с обработкой закрытых вакансий."""
-    logger.info(f"REAL_API: Отправка сообщения в диалог {negotiation_id} от {recruiter.name}...")
+    logger.info(f"REAL_API: Отправка сообщения в диалог {negotiation_id} от {recruiter.name}... ✉️✉️✉️")
     try:
         # db здесь передается в _make_request, которое уже обновлено для AsyncSession
         await _make_request(

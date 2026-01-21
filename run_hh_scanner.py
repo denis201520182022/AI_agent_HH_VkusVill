@@ -103,7 +103,11 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
     Если вакансия перешла к текущему рекрутеру, переносит на него и активные диалоги.
     """
     function_start_time = time.monotonic()
-
+    rec_logger = logging.LoggerAdapter(logger, {
+        "recruiter_id": recruiter_id, 
+        "recruiter_name": current_recruiter.name,
+        "worker": "scanner"
+    })
     try:
         now = datetime.datetime.now(datetime.timezone.utc)
         cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
@@ -111,26 +115,26 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
         if not current_recruiter:
-            logger.error(f"Рекрутер с ID {recruiter_id} не найден.")
+            rec_logger.error(f"Рекрутер с ID {recruiter_id} не найден.")
             return []
             
-        logger.debug(f"Получение и синхронизация списка активных вакансий для рекрутера {current_recruiter.name}...")
+        rec_logger.debug(f"Получение и синхронизация списка активных вакансий для рекрутера {current_recruiter.name}...")
         
         # 1. Проверка кэша (если недавно обновляли, просто берем из БД)
         if current_recruiter.vacancies_last_synced_at:
             time_since_sync = now - current_recruiter.vacancies_last_synced_at
             if time_since_sync < cache_expiry_time:
-                logger.debug(f"Используем кэш. Последняя синхронизация: {time_since_sync.total_seconds() / 60:.1f} мин. назад.")
+                rec_logger.debug(f"Используем кэш. Последняя синхронизация: {time_since_sync.total_seconds() / 60:.1f} мин. назад.")
                 result = await db.execute(select(Vacancy).filter(Vacancy.recruiter_id == current_recruiter.id))
                 cached_vacancies = result.scalars().all()
                 return [{"id": v.hh_vacancy_id, "name": v.title, "area": {"name": v.city} if v.city else {}} for v in cached_vacancies]
 
-        logger.debug(f"Кэш устарел. Запрос к API...")
+        rec_logger.debug(f"Кэш устарел. Запрос к API...")
         
         # 2. Запрос к API HH
         me_data = await hh_api._make_request(current_recruiter, db, "GET", "me")
         if not me_data or not me_data.get('employer') or not me_data['employer'].get('id'):
-            logger.error(f"Не удалось получить employer_id.")
+            rec_logger.error(f"Не удалось получить employer_id.")
             return []
         employer_id = me_data['employer']['id']
 
@@ -151,9 +155,8 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         vac_count = len(all_vacancies_from_api)
         VACANCIES_ACTIVE_GAUGE.labels(recruiter_id=str(recruiter_id)).set(vac_count)
         
-        logger.debug(
-            f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...",
-            extra={"recruiter_id": recruiter_id, "active_vacancies_count": vac_count}
+        rec_logger.debug(
+            f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...[recruiter_id: {recruiter_id}, active_vacancies_count: {vac_count}]"
         )
         active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
 
@@ -180,7 +183,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 # === [ГЛАВНАЯ ЛОГИКА ПЕРЕНОСА] ===
                 # Если у вакансии в БД другой рекрутер (или None), а HH говорит, что она теперь наша
                 if vacancy_in_db.recruiter_id != current_recruiter.id:
-                    logger.info(
+                    rec_logger.info(
                         f"Вакансия {hh_vacancy_id} перешла к рекрутеру {recruiter_id}. "
                         f"Переносим активные диалоги..."
                     )
@@ -214,14 +217,14 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         # Flush применяет изменения в транзакции (в т.ч. наш update), но не комитит окончательно
         await db.flush() 
         
-        logger.debug(f"Синхронизация завершена.")
+        rec_logger.debug(f"Синхронизация завершена.")
         return all_vacancies_from_api
 
     except Exception as e:
-        logger.error(f"Ошибка при синхронизации вакансий: {e}", exc_info=True)
+        rec_logger.error(f"Ошибка при синхронизации вакансий: {e}", exc_info=True)
         raise 
     finally:
-        logger.debug(f"Время выполнения: {time.monotonic() - function_start_time:.2f} sec.")
+        rec_logger.debug(f"Время выполнения: {time.monotonic() - function_start_time:.2f} sec.")
 
 async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncSession):
     """Этап 1: Ищет новые отклики по СПИСКУ вакансий."""
@@ -229,21 +232,27 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
 
     recruiter = None
     recruiter_name_for_logging = f"ID {recruiter_id}"
-
-    
+    recruiter = await db.get(TrackedRecruiter, recruiter_id)
+    rec_logger = logging.LoggerAdapter(logger, {
+        "recruiter_id": recruiter_id,
+        "recruiter_name": recruiter.name if recruiter else "Unknown",
+        "worker": "scanner"
+    })
     try:
-        recruiter = await db.get(TrackedRecruiter, recruiter_id)
+        
         if not recruiter:
-            logger.warning(f"process_new_responses: Рекрутер с ID {recruiter_id} не найден.")
+            rec_logger.warning(f"process_new_responses: Рекрутер с ID {recruiter_id} не найден.")
             return
+        
+        
         recruiter_name_for_logging = recruiter.name
         cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
-        logger.debug(f"Используем дату старта для рекрутера {recruiter.name}: {cutoff_date}")
+        rec_logger.debug(f"Используем дату старта для рекрутера {recruiter.name}: {cutoff_date}")
         if not vacancy_ids:
-            logger.error("Этап 1: Нет активных вакансий для проверки 'Неразобранных'.")
+            rec_logger.error("Этап 1: Нет активных вакансий для проверки 'Неразобранных'.")
             return
 
-        logger.debug(f"Этап 1: Проверка 'Неразобранных' для {len(vacancy_ids)} вакансий...")
+        rec_logger.debug(f"Этап 1: Проверка 'Неразобранных' для {len(vacancy_ids)} вакансий...")
 
         new_responses_with_vacancy_ids = await hh_api.get_responses_from_folder(
             recruiter, db, 'response', vacancy_ids, since_datetime=cutoff_date
@@ -257,7 +266,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 # --- БЕЗОПАСНЫЙ ДОСТУП К ДАННЫМ РЕЗЮМЕ ---
                 resume_info = resp.get('resume')
                 if not resume_info:
-                    logger.warning(f"Отклик {response_id} без резюме. Пропуск.")
+                    rec_logger.warning(f"Отклик {response_id} без резюме. Пропуск.")
                     continue
 
                 candidate_first_name = resume_info.get('first_name', 'Неизвестно')
@@ -265,14 +274,19 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 candidate_full_name = f"{candidate_first_name} {candidate_last_name}".strip()
                 candidate_hh_resume_id = resume_info.get('id')
                 # -----------------------------------------
-                log_extra = {
+                # 2. СОЗДАЕМ ПОЛНЫЙ ЛОГГЕР ДЛЯ КОНКРЕТНОГО ОТКЛИКА
+                # Он содержит ID рекрутера, ID отклика, ID вакансии и имя кандидата
+                scan_logger = logging.LoggerAdapter(logger, {
                     "recruiter_id": recruiter_id,
-                    "vacancy_id": associated_vacancy_id_str, # HH ID вакансии
+                    "recruiter_name": recruiter_name_for_logging,
                     "hh_response_id": response_id,
+                    "vacancy_id": associated_vacancy_id_str, # HH ID вакансии
                     "candidate_resume_id": candidate_hh_resume_id,
                     "candidate_name": candidate_full_name,
-                    "worker": "scanner"
-                }
+                    "worker": "scanner",
+                    "action": "new_response_found"
+                })
+                # -----------------------------------------
                 if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
                     continue
 
@@ -289,19 +303,18 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 settings = settings_result.scalar_one_or_none()
 
                 if not settings:
-                    logger.error("Настройки AppSettings не найдены в БД!")
+                    scan_logger.error("Настройки AppSettings не найдены в БД!")
                     continue
 
                 # ПРОВЕРКА БАЛАНСА
                 if settings.balance < settings.cost_per_dialogue:
-                    logger.warning(f"Недостаточно средств на балансе ({settings.balance}). Отклик {response_id} пропущен.")
+                    scan_logger.warning(f"Недостаточно средств на балансе ({settings.balance}). Отклик {response_id} пропущен.")
                     continue
 
                 NEW_RESPONSES_TOTAL.labels(recruiter_id=str(recruiter_id), vacancy_id=str(associated_vacancy_id_str)).inc() # <--- МЕТРИКА
 
-                logger.info(
-                    f"Найден новый отклик {response_id} ({candidate_full_name}).",
-                    extra={**log_extra, "action": "new_response_found"}
+                scan_logger.info(
+                    f"Найден новый отклик {response_id} ({candidate_full_name})."
                 )
 
                 vacancy_in_db_result = await db.execute(
@@ -310,7 +323,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 vacancy_in_db = vacancy_in_db_result.scalar_one_or_none()
 
                 if not vacancy_in_db:
-                    logger.error(f"Вакансия {associated_vacancy_id_str} не найдена в БД. Пропуск.")
+                    scan_logger.error(f"Вакансия {associated_vacancy_id_str} не найдена в БД. Пропуск.")
                     continue
 
                 # Работа с кандидатом
@@ -341,7 +354,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     try:
                         response_created_at_dt = datetime.datetime.fromisoformat(response_created_at_str)
                     except (ValueError, TypeError):
-                        logger.warning(f"Не удалось распознать дату отклика: {response_created_at_str}")
+                        scan_logger.warning(f"Не удалось распознать дату отклика: {response_created_at_str}")
                 # <<< КОНЕЦ ИСПРАВЛЕНИЯ >>>
 
                 # Создаем диалог
@@ -378,7 +391,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                         for m in messages_data if m.get('text')
                     ]
                 except Exception as msg_err:
-                    logger.error(f"Ошибка получения сообщений для {response_id}: {msg_err}. Использую заглушку.")
+                    scan_logger.error(f"Ошибка получения сообщений для {response_id}: {msg_err}. Использую заглушку.")
                     messages = []
 
                 if not messages:
@@ -399,9 +412,8 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 # --- ВАЖНО: КОММИТИМ СРАЗУ ДЛЯ КАЖДОГО КАНДИДАТА ---
                 # Это гарантирует, что если мы перенесли его в consider, он сохранится в БД
                 await db.commit()
-                logger.info(
-                    f"✅ Диалог {response_id} успешно сохранен в БД.",
-                    extra={**log_extra, "action": "dialogue_created", "status": "success"}
+                scan_logger.info(
+                    f"✅ Диалог {response_id} успешно сохранен в БД."
                 )
 
                 # Проверка лимита для уведомления
@@ -418,19 +430,20 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     settings.low_limit_notified = False
 
             except Exception as e:
-                error_ctx = log_extra if 'log_extra' in locals() else {"recruiter_id": recruiter_id, "hh_response_id": resp.get('id')}
-                logger.error(
-                    f"Ошибка при обработке отклика {resp.get('id')}: {e}", 
+                err_logger = locals().get('scan_logger', rec_logger)
+                
+                err_logger.error(
+                    f"Ошибка при обработке отклика: {e}", 
                     exc_info=True,
-                    extra={**error_ctx, "action": "process_new_response_error"}
+                    extra={"action": "process_new_response_error"}
                 )
-                await db.rollback() # Откат только для текущего отклика
+                await db.rollback() 
                 continue
 
     except Exception as e:
-        logger.error(f"Критическая ошибка в process_new_responses: {e}", exc_info=True)
+        rec_logger.error(f"Критическая ошибка в process_new_responses: {e}", exc_info=True)
     finally:
-        logger.debug(f"process_new_responses завершено за {time.monotonic() - function_start_time:.2f}s")
+        rec_logger.debug(f"process_new_responses завершено за {time.monotonic() - function_start_time:.2f}s")
 
 
 
@@ -440,11 +453,19 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
 
     recruiter = None
     recruiter_name_for_logging = f"ID {recruiter_id}" # Значение по умолчанию на случай, если рекрутер не найден
+    # 1. Получаем рекрутера
+    recruiter = await db.get(TrackedRecruiter, recruiter_id)
     
+    # 2. Создаем логгер уровня Рекрутера
+    rec_logger = logging.LoggerAdapter(logger, {
+        "recruiter_id": recruiter_id,
+        "recruiter_name": recruiter.name if recruiter else "Unknown",
+        "worker": "scanner"
+    })
     try:
-        recruiter = await db.get(TrackedRecruiter, recruiter_id)
+        
         if not recruiter:
-            logger.warning(f"process_ongoing_responses: Рекрутер с ID {recruiter_id} не найден.")
+            rec_logger.warning(f"process_ongoing_responses: Рекрутер с ID {recruiter_id} не найден.")
             return
 
         # --- ЗАГРУЗКА ЗДЕСЬ ---
@@ -453,10 +474,10 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
         cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
 
         if not vacancy_ids:
-            logger.warning("Этап 2: Нет активных вакансий для проверки обновлений.")
+            rec_logger.warning("Этап 2: Нет активных вакансий для проверки обновлений.")
             return
 
-        logger.debug(
+        rec_logger.debug(
             f"Этап 2: Проверка обновлений в папках 'Подумать' и 'Собеседование' "
             f"для {len(vacancy_ids)} вакансий..."
         )
@@ -477,10 +498,9 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
         # Выполняем запросы параллельно
         consider_results, interview_results = await asyncio.gather(consider_task, interview_task)
         
-        logger.debug(
-            f"[Recruiter {recruiter_name_for_logging}] API calls took: "
-            f"{time.monotonic() - api_get_responses_gather_start:.2f} sec. "
-            f"Found {len(consider_results)} in consider, {len(interview_results)} in interview."
+        rec_logger.debug(
+            f"API calls finished. Found {len(consider_results)} in consider, {len(interview_results)} in interview.",
+            extra={"api_duration": time.monotonic() - api_get_responses_gather_start}
         )
 
         # Объединяем результаты в один список, помечая источник
@@ -502,19 +522,22 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
             if not dialogue:
                 logger.debug(f"Найдено обновление для отклика {response_id}, которого нет в нашей БД. Пропускаем.")
                 continue
-            log_extra = {
+            # 3. СОЗДАЕМ ЛОГГЕР УРОВНЯ ДИАЛОГА
+            # Теперь все логи ниже будут содержать ID диалога и вакансии
+            ctx_logger = logging.LoggerAdapter(logger, {
                 "recruiter_id": recruiter_id,
+                "recruiter_name": recruiter_name_for_logging,
                 "dialogue_id": dialogue.id,
                 "hh_response_id": response_id,
                 "vacancy_id": dialogue.vacancy_id,
                 "folder": folder_name,
                 "worker": "scanner"
-            }
+            })
             # --- КРИТИЧЕСКОЕ ИЗМЕНЕНИЕ: ПРОВЕРКА ПАПКИ ИНТЕРВЬЮ ---
             if folder_name == 'interview':
                 # Добавляем проверку: не трогать, если это 'forwarded_to_researcher' или уже 'post_qualification_chat'
                 if dialogue.dialogue_state not in ['post_qualification_chat', 'forwarded_to_researcher']:
-                    logger.debug(f"[{response_id}] Обнаружен в папке 'interview'. Принудительный стейт: post_qualification_chat.")
+                    ctx_logger.debug(f"[{response_id}] Обнаружен в папке 'interview'. Принудительный стейт: post_qualification_chat.")
                     dialogue.dialogue_state = 'post_qualification_chat'
                     
             # -----------------------------------------------------
@@ -522,7 +545,7 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
             api_get_messages_start = time.monotonic()
             all_messages_from_api = await hh_api.get_messages(recruiter, db, resp['messages_url'])
             
-            logger.debug(
+            ctx_logger.debug(
                 f"[Recruiter {recruiter.name}, Dialogue {response_id}] "
                 f"API get_messages took: {time.monotonic() - api_get_messages_start:.2f} sec."
             )
@@ -558,31 +581,35 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
                 msg_count = len(new_msgs)
                 MESSAGES_RECEIVED_TOTAL.labels(recruiter_id=str(recruiter_id)).inc(msg_count) # <--- МЕТРИКА
 
-                logger.info(
-                    f"Добавлено {msg_count} новых сообщений в диалог {response_id}.",
-                    extra={**log_extra, "new_messages_count": msg_count, "action": "messages_received"}
+                ctx_logger.info(
+                    f"Добавлено {msg_count} новых сообщений в диалог {response_id} 📩📩📩.",
+                    extra={"new_messages_count": msg_count, "action": "messages_received"}
                 )
 
         await db.flush()
         await db.commit()
         
     except Exception as e:
-        logger.error(
+        # Используем rec_logger для общих ошибок
+        rec_logger.error(
             f"Error in process_ongoing_responses: {e}", 
             exc_info=True,
-            extra={"recruiter_id": recruiter_id, "action": "ongoing_scan_error"}
+            extra={"action": "ongoing_scan_error"}
         )
         await db.rollback()
         raise
     finally:
-        logger.debug(
-            f"[Recruiter {recruiter_name_for_logging}] "
-            f"process_ongoing_responses finished in {time.monotonic() - function_start_time:.2f}s"
+        rec_logger.debug(
+            f"process_ongoing_responses finished",
+            extra={"total_duration": time.monotonic() - function_start_time}
         )
 
 
 async def handle_scanner_recruiter(rec_id: int):
     """Только сканирование для одного рекрутера с защитой от параллелизма"""
+    # Создаем логгер верхнего уровня для ошибок
+    rec_logger = logging.LoggerAdapter(logger, {"recruiter_id": rec_id, "worker": "scanner"})
+    
     async with SessionLocal() as db:
         try:
             # Пытаемся заблокировать строку рекрутера. 
@@ -608,12 +635,13 @@ async def handle_scanner_recruiter(rec_id: int):
             await db.commit()
             
         except Exception as e:
-            logger.error(
-                f"Ошибка при блокировке рекрутера {rec_id}: {e}",
-                extra={"recruiter_id": rec_id, "action": "lock_recruiter_error"}
+            # ИСПОЛЬЗУЕМ rec_logger
+            rec_logger.error(
+                f"Ошибка при блокировке/сканировании рекрутера: {e}",
+                exc_info=True,
+                extra={"action": "lock_recruiter_error"}
             )
             await db.rollback()
-
 # В начало файла добавь импорт argparse, если его нет (в твоем косте он есть вверху)
 
 async def main(target_recruiter_ids=None): # Добавь аргумент

@@ -78,6 +78,8 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
     """
     async with semaphore:
         async with SessionLocal() as db:
+            log_context = {"dialogue_id": dialogue_id, "recruiter_id": recruiter_id, "worker": "reminders"}
+            ctx_logger = logging.LoggerAdapter(logger, log_context)
             try:
                 # Загружаем диалог со всеми связями
                 stmt = (
@@ -98,21 +100,22 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     # Диалог занят или не найден
                     return
 
-                log_extra = {
-                    "dialogue_id": dialogue.id,
-                    "recruiter_id": recruiter_id,
-                    "hh_response_id": dialogue.hh_response_id,
-                    "vacancy_id": dialogue.vacancy_id,
-                    "worker": "reminders"
-                }
+                
 
                 recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
                 if not dialogue or not recruiter:
                     return
+                log_context.update({
+                    "hh_response_id": dialogue.hh_response_id,
+                    "vacancy_id": dialogue.vacancy_id,
+                    "recruiter_name": recruiter.name,
+                    "worker": "reminders"
+                })
+                ctx_logger = logging.LoggerAdapter(logger, log_context)
 
                 # Проверка: если диалог уже не in_progress (мог измениться параллельно), выходим
-                EXCLUDED_REMINDER_STATUSES = ['declined_interview', 'declined_vacancy' 'call_later', 'refusal']
+                EXCLUDED_REMINDER_STATUSES = ['declined_interview', 'declined_vacancy', 'call_later', 'refusal']
                 if (dialogue.status not in ['in_progress'] or
                     dialogue.dialogue_state in EXCLUDED_REMINDER_STATUSES or
                     dialogue.reminder_level >= 6): # Теперь до 6 уровня включительно
@@ -132,7 +135,7 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     return
                 elif current_folder_on_hh == 404:
                     # Вакансия закрыта
-                    logger.info(f"Вакансия для диалога {dialogue_hh_id} закрыта. Обновляю статус.")
+                    ctx_logger.info(f"Вакансия для диалога {dialogue_hh_id} закрыта. Обновляю статус.")
                     dialogue.status = 'timed_out'
                     dialogue.reminder_level = 6
                     await db.commit()
@@ -140,7 +143,7 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
 
                 elif current_folder_on_hh != 'consider':
                     # Кандидат перемещен вручную рекрутером
-                    logger.info(f"Диалог {dialogue_hh_id} перемещен в '{current_folder_on_hh}'. Отключаю напоминания.")
+                    ctx_logger.info(f"Диалог {dialogue_hh_id} перемещен в '{current_folder_on_hh}'. Отключаю напоминания.")
                     dialogue.status = 'recruiter_handled'
                     dialogue.reminder_level = 3
 
@@ -194,9 +197,9 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     # ТВОЕ ТРЕБОВАНИЕ: Если запись уже есть, ничего не делаем с таблицей молчунов
                     if not dialogue.inactive_alerts:
                         db.add(InactiveNotificationQueue(dialogue_id=dialogue.id, status='pending'))
-                        logger.info(f"Диалог {dialogue_hh_id} впервые добавлен в InactiveNotificationQueue.")
+                        ctx_logger.info(f"Диалог {dialogue_hh_id} впервые добавлен в InactiveNotificationQueue.")
                     else:
-                        logger.debug(f"Диалог {dialogue_hh_id} уже зафиксирован в таблице молчунов. Повторная запись не требуется.")
+                        ctx_logger.debug(f"Диалог {dialogue_hh_id} уже зафиксирован в таблице молчунов. Повторная запись не требуется.")
 
                     # Но статус самого диалога и уровень напоминания обновляем в любом случае,
                     # чтобы пошел отсчет 7 дней для уровня 4.
@@ -206,9 +209,8 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     await db.commit()
 
                 elif reminder_messages:
-                    logger.info(
-                        f"Отправка напоминания уровня {next_level} для диалога {dialogue_hh_id}.",
-                        extra={**log_extra, "reminder_level": next_level, "action": "send_nudge"}
+                    ctx_logger.info(
+                        f"Отправка напоминания уровня {next_level} для диалога {dialogue_hh_id}."
                     )
 
                     # 1. Определяем типы напоминаний
@@ -227,7 +229,7 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                         settings = settings_res.scalar_one_or_none()
                         
                         if not settings or settings.balance < settings.cost_per_long_reminder:
-                            logger.warning(f"Баланс пуст. Первое долгое напоминание для {dialogue_hh_id} отменено.")
+                            ctx_logger.warning(f"Баланс пуст. Первое долгое напоминание для {dialogue_hh_id} отменено.")
                             return 
 
                     all_sent = True
@@ -264,9 +266,9 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                                 cost = settings.cost_per_long_reminder
                                 settings.balance -= cost
                                 settings.total_spent_on_reminders += cost # Увеличиваем счетчик напоминалок
-                                logger.info(
-                                    f"ЕДИНОВРЕМЕННОЕ СПИСАНИЕ: {cost} руб. Всего на дожимы потрачено: {settings.total_spent_on_reminders}",
-                                    extra={**log_extra, "cost": float(cost), "action": "charge_balance"}
+                                ctx_logger.info(
+                                    f"ЕДИНОВРЕМЕННОЕ СПИСАНИЕ: {cost} руб. Всего на дожимы потрачено: {settings.total_spent_on_reminders}"
+                                    
                                 )
                         elif status_code == 403:
                              # Вакансия закрыта или доступ запрещен
@@ -286,7 +288,7 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                         await db.commit()
 
             except Exception as e:
-                logger.error(f"Ошибка в задаче напоминания для диалога {dialogue_id}: {e}")
+                ctx_logger.error(f"Ошибка в задаче напоминания для диалога {dialogue_id}: {e}")
                 # Не рейзим ошибку, чтобы не поломать gather
 
 
@@ -301,7 +303,7 @@ async def process_reminders(recruiter_id: int, db: AsyncSession):
     # Семафор для ограничения одновременных проверок напоминаний (чтобы не убить базу)
     # Можно использовать тот же MAX_CONCURRENT_DIALOGUES или создать свой
     REMINDER_SEMAPHORE = asyncio.Semaphore(20)
-
+    rec_logger = logging.LoggerAdapter(logger, {"recruiter_id": recruiter_id, "worker": "reminders"})
     try:
         # 1. Проверка времени (быстро)
         if SPB_TIMEZONE is None:
@@ -335,7 +337,7 @@ async def process_reminders(recruiter_id: int, db: AsyncSession):
         if not candidate_ids_to_check:
             return
 
-        logger.debug(f"Запуск параллельной проверки напоминаний для {len(candidate_ids_to_check)} диалогов...")
+        rec_logger.debug(f"Запуск параллельной проверки напоминаний для {len(candidate_ids_to_check)} диалогов...")
 
         # 3. Создаем задачи для параллельного выполнения
         tasks = [
@@ -347,9 +349,9 @@ async def process_reminders(recruiter_id: int, db: AsyncSession):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     except Exception as e:
-        logger.error(f"Ошибка в process_reminders (диспетчер): {e}", exc_info=True)
+        rec_logger.error(f"Ошибка в process_reminders (диспетчер): {e}", exc_info=True)
     finally:
-        logger.debug(
+        rec_logger.debug(
             f"[Recruiter ID {recruiter_id}] "
             f"process_reminders finished in {time.monotonic() - function_start_time:.2f}s"
         )
@@ -447,23 +449,24 @@ async def check_and_send_interview_reminders():
                             reminder.processed_at = now_utc
                             await db_session.commit()
                             continue
-
-                        if not recruiter.access_token:
-                            logger.error(f"У рекрутера {recruiter.name} (ID: {recruiter.id}) нет access_token. Не могу отправить напоминание {reminder.id}.")
-                            reminder.status = 'error'
-                            reminder.processed_at = now_utc
-                            await db_session.commit()
-                            continue
-
-                        log_extra = {
+                        ctx_logger = logging.LoggerAdapter(logger, {
                             "dialogue_id": dialogue.id,
                             "recruiter_id": recruiter.id,
+                            "recruiter_name": recruiter.name,
                             "hh_response_id": dialogue.hh_response_id,
                             "vacancy_id": vacancy.id,
                             "candidate_id": candidate.id,
                             "notification_type": reminder.notification_type,
                             "worker": "interview_reminders"
-                        }
+                        })
+                        if not recruiter.access_token:
+                            ctx_logger.error(f"У рекрутера {recruiter.name} (ID: {recruiter.id}) нет access_token. Не могу отправить напоминание {reminder.id}.")
+                            reminder.status = 'error'
+                            reminder.processed_at = now_utc
+                            await db_session.commit()
+                            continue
+
+                        
                         # Форматируем дату и время собеседования для сообщения
                         interview_datetime_spb = reminder.interview_datetime_utc.astimezone(SPB_TIMEZONE)
                         interview_date_spb = interview_datetime_spb.strftime("%d.%m.%Y")
@@ -472,7 +475,7 @@ async def check_and_send_interview_reminders():
                         # Получаем шаблон сообщения
                         template = MESSAGE_TEMPLATES.get(reminder.notification_type)
                         if not template:
-                            logger.error(f"Не найден шаблон сообщения для типа уведомления '{reminder.notification_type}'. Напоминание {reminder.id} не будет отправлено.")
+                            ctx_logger.error(f"Не найден шаблон сообщения для типа уведомления '{reminder.notification_type}'. Напоминание {reminder.id} не будет отправлено.")
                             reminder.status = 'error'
                             reminder.processed_at = now_utc
                             await db_session.commit()
@@ -485,10 +488,7 @@ async def check_and_send_interview_reminders():
                             interview_time_spb=interview_time_spb
                         )
 
-                        logger.info(
-                            f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}...",
-                            extra={**log_extra, "action": "sending_interview_reminder"}
-                        )
+                        ctx_logger.info(f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}.")
 
                         # Отправка сообщения кандидату через HH API
                         # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
@@ -504,15 +504,15 @@ async def check_and_send_interview_reminders():
                             reminder.status = 'sent'
 
                             MESSAGES_SENT_TOTAL.inc() # <--- МЕТРИКА
-                            logger.info(
-                                f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}.",
-                                extra={**log_extra, "action": "interview_reminder_sent", "status": "success"}
+                            ctx_logger.info(
+                                f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}."
+                                
                             )
 
                         elif send_result == 403:
                             # ВАКАНСИЯ ЗАКРЫТА
                             reminder.status = 'cancelled' # Отменяем, так как отправлять бессмысленно
-                            logger.warning(
+                            ctx_logger.warning(
                                 f"Напоминание {reminder.id} ОТМЕНЕНО: Вакансия закрыта/в архиве. "
                                 f"Кандидат: {candidate.full_name}, Диалог: {dialogue.hh_response_id}"
                             )
@@ -520,9 +520,9 @@ async def check_and_send_interview_reminders():
                         else:
                             # ПРОЧИЕ ОШИБКИ (False или другие коды)
                             reminder.status = 'error'
-                            logger.error(
-                                f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error).",
-                                extra={**log_extra, "action": "interview_reminder_failed", "status": "error"}
+                            ctx_logger.error(
+                                f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error)."
+                                
                             )
                         # -----------------------
 
@@ -530,7 +530,8 @@ async def check_and_send_interview_reminders():
                         await db_session.commit() # Коммитим каждое напоминание отдельно для надежности
 
                     except Exception as e:
-                        logger.error(f"Ошибка при обработке напоминания {reminder.id}: {e}", exc_info=True)
+                        err_logger = locals().get('ctx_logger', logger)
+                        err_logger.error(f"Ошибка при обработке напоминания {reminder.id}: {e}", exc_info=True)
                         if reminder.id: # Убедимся, что reminder объект существует
                             reminder.status = 'error'
                             reminder.processed_at = now_utc

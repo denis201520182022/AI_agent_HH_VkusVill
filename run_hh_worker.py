@@ -223,7 +223,8 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
             user_message=f"ИСТОРИЯ ДИАЛОГА:\n{recent_text}",
             current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
             attempt_tracker=verify_attempts,
-            skip_instructions=True
+            skip_instructions=True,
+            extra_context=log_extra
         )
 
         if response and 'usage_stats' in response:
@@ -266,11 +267,11 @@ def _log_missing_vacancy(title: str, city: str):
         logger.error(f"Ошибка при записи в missing_vacancies.txt: {e}")
 
 
-def _find_relevant_vacancy(prompt_library: dict, vacancy_title: str, vacancy_city: str) -> str:
+def _find_relevant_vacancy(prompt_library: dict, vacancy_title: str, vacancy_city: str, context_logger=None) -> str:
     """
     Поиск вакансии по принципу BEST MATCH с логикой исключения по критическим словам.
     """
-
+    local_log = context_logger or logger
     def normalize_text(text: str) -> str:
         if not text: 
             return ""
@@ -361,18 +362,11 @@ def _find_relevant_vacancy(prompt_library: dict, vacancy_title: str, vacancy_cit
 
     # --- РЕЗУЛЬТАТ С РАСШИРЕННЫМ ЛОГОМ ---
     if best_match_vacancy:
-        logger.info(
-            "✅ ВЫБРАНО ОПИСАНИЕ | HH: [%s, %s] | DB: [%s, %s] | score=%.2f",
-            vacancy_title, 
-            vacancy_city,
-            best_match_vacancy['titles'][0], 
-            matched_city_name,
-            best_match_score
-        )
+        local_log.info(f"✅ ВЫБРАНО ОПИСАНИЕ | HH: [{vacancy_title}]...")
         return best_match_vacancy.get("description", "")
 
     # Если ничего не нашли
-    logger.warning(
+    local_log.warning(
         "🤡 Описание не найдено | HH title='%s' | HH city='%s'",
         vacancy_title,
         vacancy_city,
@@ -646,14 +640,26 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_library: dict, db: AsyncSession):
     """Исправленная версия с правильной работой с ORM"""
     dialogue_processing_start_time = time.monotonic()
+
+    # 1. Создаем словарь с контекстом. Сначала только то, что пришло в аргументах.
+    log_context = {
+        "dialogue_id": dialogue_id,
+        "recruiter_id": recruiter_id,
+        "worker": "handler"
+    }
+    # 2. Создаем адаптер. Теперь вместо logger.info будем везде использовать ctx_logger.info
+    ctx_logger = logging.LoggerAdapter(logger, log_context)
+
     # === БЛОКИРОВКА ЧЕРЕЗ REDIS ===
     lock_key = f"dialogue_lock:{dialogue_id}"
     lock_acquired = await acquire_lock(lock_key, timeout=120)  # 2 минуты на обработку
     
     if not lock_acquired:
-        logger.debug(f"Dialogue {dialogue_id} is already being processed by another worker. Skipping.")
+        ctx_logger.debug(f"Dialogue {dialogue_id} is already being processed by another worker. Skipping.")
         return
     # ==============================
+
+    
     dialogue = None
     recruiter = None
     # --- ЗАГРУЗКА ЗДЕСЬ (значение по умолчанию) ---
@@ -663,7 +669,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
     try:
         # Проверка активности сессии
         if not db.is_active:
-            logger.error(f"Session is not active for dialogue {dialogue_id}")
+            ctx_logger.error(f"Session is not active for dialogue {dialogue_id}")
             return
 
         db_fetch_start = time.monotonic()
@@ -688,24 +694,34 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         # Если диалог занят другим процессом или удален
         if not dialogue:
-            logger.debug(f"Dialogue {dialogue_id} is locked by another worker or not found. Skipping.")
+            ctx_logger.debug(f"Dialogue {dialogue_id} is locked by another worker or not found. Skipping.")
             return
         # -----------------------------------------
-        log_extra = {
-            "dialogue_id": dialogue.id,
-            "hh_response_id": dialogue.hh_response_id,
-            "recruiter_id": recruiter_id,
-            "vacancy_id": dialogue.vacancy_id,
-            "candidate_id": dialogue.candidate_id,
-            "worker": "handler"
-        }
+        
         # Загружаем recruiter
         recruiter = await db.get(TrackedRecruiter, recruiter_id)
+        if not recruiter:
+            ctx_logger.error(f"Recruiter {recruiter_id} not found")
+            return
 
-        logger.debug(f"[Dialogue {dialogue_id}] DB fetch took: {time.monotonic() - db_fetch_start:.4f} sec.")
+        # 3. ОБНОВЛЯЕМ КОНТЕКСТ. Теперь логгер будет знать ВООБЩЕ ВСЁ.
+        log_context.update({
+            "hh_response_id": dialogue.hh_response_id,
+            "recruiter_name": recruiter.name,  # Добавили имя рекрутера
+            "vacancy_id": dialogue.vacancy_id,
+            "vacancy_title": dialogue.vacancy.title, # Добавили название вакансии
+            "candidate_id": dialogue.candidate_id
+        })
+        # Пересоздаем адаптер с полным набором данных
+        ctx_logger = logging.LoggerAdapter(logger, log_context)
+
+        # Теперь этот лог выйдет со всеми ID и именами:
+        ctx_logger.debug(f"Processing dialogue {dialogue.hh_response_id}...")
+
+        ctx_logger.debug(f"[Dialogue {dialogue_id}] DB fetch took: {time.monotonic() - db_fetch_start:.4f} sec.")
 
         if not dialogue or not recruiter:
-            logger.error(f"Dialogue {dialogue_id} or recruiter {recruiter_id} not found")
+            ctx_logger.error(f"Dialogue {dialogue_id} or recruiter {recruiter_id} not found")
             return
         # --- ЗАГРУЗКА ЗДЕСЬ ---
         log_dialogue_hh_response_id = dialogue.hh_response_id
@@ -714,14 +730,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         await db.refresh(dialogue.candidate)
         await db.refresh(dialogue.vacancy)
 
-        logger.debug(
+        ctx_logger.debug(
             f"Processing dialogue {dialogue.hh_response_id}...",
-            extra={**log_extra, "action": "start_processing"}
+            extra={"action": "start_processing"}
         )
 
         pending_messages = dialogue.pending_messages or []
         if not pending_messages:
-            logger.debug(f"Dialogue {dialogue.id}: no pending messages")
+            ctx_logger.debug(f"Dialogue {dialogue.id}: no pending messages")
             return
 
         # *************************************************************************************************************************************
@@ -756,7 +772,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     user_message=all_pending_content,
                     current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
                     attempt_tracker=citizenship_attempts, 
-                    skip_instructions=True
+                    skip_instructions=True,
+                    extra_context=log_context
                 )
 
                 if llm_citizenship_response:
@@ -770,9 +787,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # 2. Логируем скрытые ретраи (если были)
                     total_attempts = len(citizenship_attempts)
                     if total_attempts > 1:
-                        logger.warning(
+                        ctx_logger.warning(
                             f"[{dialogue.hh_response_id}] Анализ гражданства: выполнено успешно после {total_attempts-1} ретраев.",
-                            extra={**log_extra, "action": "citizenship_retry_success", "attempts": total_attempts}
+                            extra={"action": "citizenship_retry_success", "attempts": total_attempts}
                         )
                         for i in range(total_attempts - 1):
                             await _log_llm_usage(db, dialogue, f"Citizenship_Analysis (RETRY #{i+1})")
@@ -785,9 +802,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     try:
                         parsed_response = llm_citizenship_response.get('parsed_response')
                         if parsed_response and parsed_response.get("is") == "yes":
-                            logger.info(
+                            ctx_logger.info(
                                 f"[{dialogue.hh_response_id}] Распарсили гражданство: {parsed_response.get('citizenship')}",
-                                extra={**log_extra, "action": "citizenship_parsed", "citizenship": parsed_response.get('citizenship')}
+                                extra={"action": "citizenship_parsed", "citizenship": parsed_response.get('citizenship')}
                             )
                             citizenship = parsed_response.get("citizenship")
                             system_command_content = None
@@ -814,23 +831,23 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                                 
                                 
                         else:
-                            logger.info(
+                            ctx_logger.info(
                                 f"[{dialogue.hh_response_id}] Информация о гражданстве не найдена в текущем сообщении.",
-                                extra={**log_extra, "action": "citizenship_not_found"}
+                                extra={"action": "citizenship_not_found"}
                             )
 
                     except Exception as parse_err:
-                        logger.error(
+                        ctx_logger.error(
                             f"[{dialogue.hh_response_id}] Ошибка разбора JSON гражданства: {parse_err}",
-                            extra={**log_extra, "action": "citizenship_json_error"}
+                            extra={"action": "citizenship_json_error"}
                         )
 
             except Exception as citizenship_err:
                 # --- ЛОГИРОВАНИЕ ПОЛНОГО ПРОВАЛА ---
                 # Если tenacity исчерпала попытки, записываем в БД все неудачные заходы
-                logger.error(
+                ctx_logger.error(
                     f"[{dialogue.hh_response_id}] Анализ гражданства ПРОВАЛЕН после {len(citizenship_attempts)} попыток: {citizenship_err}",
-                    extra={**log_extra, "action": "citizenship_analysis_failed_total"}
+                    extra={"action": "citizenship_analysis_failed_total"}
                 )
                 for i in range(len(citizenship_attempts)):
                     await _log_llm_usage(
@@ -875,7 +892,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         vacancy_title = dialogue.vacancy.title
         vacancy_city = dialogue.vacancy.city or "город не указан"
 
-        relevant_vacancy_desc = _find_relevant_vacancy(prompt_library, vacancy_title, vacancy_city)
+        relevant_vacancy_desc = _find_relevant_vacancy(prompt_library, vacancy_title, vacancy_city, ctx_logger)
 
         system_prompt = _assemble_dynamic_prompt(
             prompt_library,
@@ -902,7 +919,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 dialogue_history=dialogue.history or [],
                 user_message=combined_masked_message,
                 current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
-                attempt_tracker=attempt_tracker # <--- Передаем список
+                attempt_tracker=attempt_tracker,
+                extra_context=log_context # <--- Передаем список
             )
             
             # --- УСПЕШНЫЙ СЦЕНАРИЙ ---
@@ -913,9 +931,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             failed_attempts = total_attempts - 1 # Все кроме последней (успешной)
             
             if failed_attempts > 0:
-                logger.warning(
+                ctx_logger.warning(
                     f"[{dialogue.hh_response_id}] Было {failed_attempts} скрытых ретраев tenacity.",
-                    extra={**log_extra, "action": "llm_retries_detected", "retry_count": failed_attempts}
+                    extra={"action": "llm_retries_detected", "retry_count": failed_attempts}
                 )
                 for i in range(failed_attempts):
                     await _log_llm_usage(db, dialogue, f"{dialogue.dialogue_state} (RETRY #{i+1})")
@@ -926,9 +944,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # В attempt_tracker лежат метки ВСЕХ попыток (например, 3 штуки).
             # Все они считаются провальными.
             
-            logger.error(
+            ctx_logger.error(
                 f"[{dialogue.hh_response_id}] LLM Request FAILED completely after {len(attempt_tracker)} attempts: {llm_error}",
-                extra={**log_extra, "action": "llm_request_failed_total"}
+                extra={"action": "llm_request_failed_total"}
             )
             
             try:
@@ -938,14 +956,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         f"{dialogue.dialogue_state} (FAILED #{i+1}: {type(llm_error).__name__})"
                     )
             except Exception as log_ex:
-                logger.error(f"Failed to log LLM errors to DB: {log_ex}")
+                ctx_logger.error(f"Failed to log LLM errors to DB: {log_ex}")
 
             raise llm_error # Пробрасываем ошибку дальше
 
         llm_duration = time.monotonic() - llm_call_start
-        logger.debug(
+        ctx_logger.debug(
             f"[{dialogue.hh_response_id}] LLM call: {llm_duration:.2f} sec.",
-            extra={**log_extra, "llm_duration": llm_duration, "action": "llm_request_complete"}
+            extra={"llm_duration": llm_duration, "action": "llm_request_complete"}
         )
 
         if llm_data is None:
@@ -966,7 +984,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     llm_data.get("usage_stats")
                 )
             except Exception as e:
-                logger.error(f"Error logging tokens for dialogue {dialogue.id}: {e}")
+                ctx_logger.error(f"Error logging tokens for dialogue {dialogue.id}: {e}")
         # ===========================
 
         # --- СПИСОК РАЗРЕШЕННЫХ СТАТУСОВ ДИАЛОГА ---
@@ -1000,10 +1018,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
         if new_state not in ALLOWED_STATES:
-            logger.error(
+            ctx_logger.error(
                 f"[{dialogue.hh_response_id}] CRITICAL: LLM hallucinated invalid state: '{new_state}'. "
                 f"Valid states are: {ALLOWED_STATES}",
-                extra={**log_extra, "action": "invalid_state_detected", "invalid_state": new_state}
+                extra={"action": "invalid_state_detected", "invalid_state": new_state}
             )
             # Вызываем ошибку, чтобы откатить транзакцию (db.rollback) и не сохранять мусор в БД
             raise ValueError(f"Invalid state returned by LLM: {new_state}")
@@ -1021,17 +1039,17 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Если дата уже есть, мы игнорируем попытки LLM назначить новую (защита от перезаписи)
         
             # 3. Запускаем Аудит (Deep Check)
-            logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {suggested_date}")
+            ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {suggested_date}")
             
             cal_context = _generate_calendar_context_2()
             # История: старая + то что юзер прислал сейчас
             full_hist = (dialogue.history or []) + user_entries_to_history
             
-            verified_date = await _verify_date_audit(db, dialogue, suggested_date, full_hist, cal_context, log_extra)
+            verified_date = await _verify_date_audit(db, dialogue, suggested_date, full_hist, cal_context, log_context)
 
             # 4. СРАВНИВАЕМ
             if verified_date != suggested_date and verified_date != "none":
-                logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {suggested_date}, Аудитор: {verified_date}")
+                ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {suggested_date}, Аудитор: {verified_date}")
 
                 # Отправляем алерт в ТГ
                 user_text_now = " ".join(all_masked_content)
@@ -1067,7 +1085,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 dialogue.history = (dialogue.history or []) + user_entries_to_history
                 
                 await db.commit()
-                logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
+                ctx_logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
                 return # ВЫХОДИМ ИЗ ФУНКЦИИ. Сообщение в HH не уйдет.
 
         # --- [END] БЛОК ВЕРИФИКАЦИИ ДАТЫ ---
@@ -1096,19 +1114,19 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         pass # Значение не изменилось
                     elif _validate_age_in_text(current_user_text, raw_age):
                         dialogue.candidate.age = raw_age
-                        logger.debug(
+                        ctx_logger.debug(
                             f"[{dialogue.hh_response_id}] Возраст {raw_age} записан (State: {current_state_at_update}).",
-                            extra={**log_extra, "action": "age_saved"}
+                            extra={"action": "age_saved"}
                         )
                     else:
-                        logger.warning(
+                        ctx_logger.warning(
                             f"[{dialogue.hh_response_id}] LLM придумала возраст {raw_age}, но в тексте его нет. Пропуск.",
-                            extra={**log_extra, "action": "age_hallucination_detected"}
+                            extra={"action": "age_hallucination_detected"}
                         )
                 else:
                     logger.debug(
                         f"[{dialogue.hh_response_id}] Игнорируем возраст {raw_age} от LLM, так как стейт '{current_state_at_update}' не подразумевает ввод возраста.",
-                        extra={**log_extra, "action": "age_update_blocked_by_state"}
+                        extra={"action": "age_update_blocked_by_state"}
                     )
 
             # --- 2. ОБРАБОТКА ГРАЖДАНСТВА ---
@@ -1118,14 +1136,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 
                 if current_state_at_update in allowed_citizenship_states:
                     dialogue.candidate.citizenship = extracted_data["citizenship"]
-                    logger.debug(
+                    ctx_logger.debug(
                         f"[{dialogue.hh_response_id}] Гражданство обновлено (State: {current_state_at_update}).",
-                        extra={**log_extra, "action": "citizenship_saved"}
+                        extra={"action": "citizenship_saved"}
                     )
                 else:
-                    logger.debug(
+                    ctx_logger.debug(
                         f"[{dialogue.hh_response_id}] Игнорируем гражданство от LLM, так как стейт '{current_state_at_update}' это запрещает.",
-                        extra={**log_extra, "action": "citizenship_update_blocked_by_state"}
+                        extra={"action": "citizenship_update_blocked_by_state"}
                     )
             # if extracted_data.get("citizenship"):
             #     dialogue.candidate.citizenship = extracted_data["citizenship"]
@@ -1147,9 +1165,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # =====================================================================
             # [START] ФИНАЛЬНАЯ ВЕРИФИКАЦИЯ ДАННЫХ ПЕРЕД РЕШЕНИЕМ
             # =====================================================================
-            logger.info(
+            ctx_logger.info(
                 f"[{dialogue.hh_response_id}] Запуск финальной верификации данных через LLM...",
-                extra={**log_extra, "action": "verification_start"}
+                extra={"action": "verification_start"}
             )
 
             # 1. Формируем полную историю текстом
@@ -1190,7 +1208,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     user_message=f"ИСТОРИЯ ДИАЛОГА:\n{full_history_text}\n\nПроанализируй и верни JSON.",
                     current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
                     attempt_tracker=verify_attempts,
-                    skip_instructions=True
+                    skip_instructions=True,
+                    extra_context=log_context
                 )
 
                 # Логируем использование токенов
@@ -1229,9 +1248,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 is_citizen_ok = (norm(db_citizenship) == norm(verify_citizenship))
 
                 if not is_age_ok or not is_citizen_ok:
-                    logger.warning(
+                    ctx_logger.warning(
                         f"[{dialogue.hh_response_id}] ВЕРИФИКАЦИЯ: Данные исправлены. Было: {db_age}/{db_citizenship}, Стало: {verify_age}/{verify_citizenship}",
-                        extra={**log_extra, "action": "verification_auto_correct"}
+                        extra={"action": "verification_auto_correct"}
                     )
                     # ЗАПИСЫВАЕМ ВЕРНЫЕ ДАННЫЕ В БД
                     if verify_age:
@@ -1273,10 +1292,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # await db.commit()
                     # return 
 
-                logger.info(f"[{dialogue.hh_response_id}] ✅ Верификация пройдена успешно.")
+                ctx_logger.info(f"[{dialogue.hh_response_id}] ✅ Верификация пройдена успешно.")
 
             except Exception as e:
-                logger.error(f"[{dialogue.hh_response_id}] Ошибка процесса верификации: {e}", exc_info=True)
+                ctx_logger.error(f"[{dialogue.hh_response_id}] Ошибка процесса верификации: {e}", exc_info=True)
                 # Если верификация упала технически - лучше не рисковать и тоже остановить процесс
                 return
 
@@ -1284,18 +1303,18 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # [END] КОНЕЦ БЛОКА ВЕРИФИКАЦИИ. ДАЛЬШЕ ИДЕТ СТАРЫЙ КОД...
             # =====================================================================
 
-            logger.info(
+            ctx_logger.info(
                 f"[{dialogue.hh_response_id}] Анкета собрана полностью. Запускаю проверку критериев.",
-                extra={**log_extra, "action": "profile_complete_start_check"}
+                extra={"action": "profile_complete_start_check"}
             )
 
             is_eligible = check_candidate_eligibility(dialogue.candidate)
 
             if not is_eligible:
                 # --- СЦЕНАРИЙ 1: ОТКАЗ ---
-                logger.info(
+                ctx_logger.info(
                     f"[{dialogue.hh_response_id}] Кандидат НЕ прошел проверку кодом (Age/Citizenship).",
-                    extra={**log_extra, "action": "qualification_failed_by_code"}
+                    extra={"action": "qualification_failed_by_code"}
                 )
 
                 # Принудительно меняем состояние и текст (игнорируем то, что написала LLM)
@@ -1307,9 +1326,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             else:
                 # --- СЦЕНАРИЙ 2: ПОДХОДИТ ---
-                logger.info(
+                ctx_logger.info(
                     f"[{dialogue.hh_response_id}] Кандидат успешно прошел проверку кодом.",
-                    extra={**log_extra, "action": "qualification_passed_by_code"}
+                    extra={"action": "qualification_passed_by_code"}
                 )
 
                 # Проверяем город
@@ -1333,18 +1352,18 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                     # Проверяем, входит ли хоть одна фраза из списка в название вакансии
                     if any(phrase in current_title_lower for phrase in excluded_vacancies):
-                        logger.info(
+                        ctx_logger.info(
                             f"[{dialogue.hh_response_id}] Вакансия '{vacancy_title}' (СПб) переведена на рекрутера (исключение).",
-                            extra={**log_extra, "action": "spb_vacancy_excluded"}
+                            extra={"action": "spb_vacancy_excluded"}
                         )
                         new_state = 'forwarded_to_researcher'
                         bot_response_text = "Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."
 
                     else:
                         # --- 2.2 СПБ (Запись на собеседование) ---
-                        logger.info(
+                        ctx_logger.info(
                             f"[{dialogue.hh_response_id}] Город СПб. Кандидат подходит. Добавляю команду для LLM на запись.",
-                            extra={**log_extra, "action": "spb_scheduling_start"}
+                            extra={"action": "spb_scheduling_start"}
                         )
 
 
@@ -1422,14 +1441,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     dialogue_id=dialogue.id, 
                     status='pending'
                 ))
-                logger.info(
+                ctx_logger.info(
                     f"[{dialogue.hh_response_id}] Переход в state 'call_later'. Добавлена запись в InactiveNotificationQueue.",
-                    extra={**log_extra, "action": "state_call_later_added"}
+                    extra={"action": "state_call_later_added"}
                 )
             else:
-                logger.debug(
+                ctx_logger.debug(
                     f"[{dialogue.hh_response_id}] State 'call_later', но диалог уже есть в таблице молчунов. Пропускаем.",
-                    extra={**log_extra, "action": "state_call_later_skip_duplicate"}
+                    extra={"action": "state_call_later_skip_duplicate"}
                 )
         # --------------------------------------------------
 
@@ -1448,13 +1467,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             if result.scalar() == 0:
                 db.add(NotificationQueue(candidate_id=dialogue.candidate.id, status='pending'))
 
-            logger.info(f"Candidate {dialogue.hh_response_id} qualified 🟢. Moving to 'interview'.")
+            ctx_logger.info(f"Candidate {dialogue.hh_response_id} qualified 🟢. Moving to 'interview'.")
 
             api_move_start = time.monotonic()
             await hh_api.move_response_to_folder(recruiter, db, dialogue.hh_response_id, 'interview')
-            logger.debug(
+            ctx_logger.debug(
                 f"[{dialogue.hh_response_id}] API move: {time.monotonic() - api_move_start:.2f} sec.",
-                extra={**log_extra, "action": "api_move_completed", "duration": time.monotonic() - api_move_start}
+                extra={"action": "api_move_completed", "duration": time.monotonic() - api_move_start}
             )
 
             # --- ДОБАВИТЬ ЭТОТ БЛОК КОДА ---
@@ -1463,7 +1482,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 interview_time = extracted_data.get("interview_time")
 
                 if interview_date and interview_time:
-                    logger.info(
+                    ctx_logger.info(
                         f"Собеседование запланировано для диалога {dialogue.id} на "
                         f"{interview_date} в {interview_time} (СПБ). Планирую напоминания."
                     )
@@ -1474,7 +1493,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         db_session=db
                     )
                 else:
-                    logger.error(
+                    ctx_logger.error(
                         f"LLM установил 'interview_scheduled_spb', но не предоставил "
                         f"interview_date или interview_time для диалога {dialogue.id}. Напоминания не будут запланированы."
                     )
@@ -1511,16 +1530,17 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         user_message=full_context_for_llm,
                         current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
                         attempt_tracker=clarification_attempts,
-                        skip_instructions=True
+                        skip_instructions=True,
+                        extra_context=log_context
                     )
 
                     # === УСПЕШНЫЙ ВЫЗОВ ===
                     total_attempts = len(clarification_attempts)
                     failed_attempts = total_attempts - 1
                     if failed_attempts > 0:
-                        logger.warning(
+                        ctx_logger.warning(
                             f"[{dialogue.hh_response_id}] Уточнение declined_vacancy: {failed_attempts} скрытых ретраев.",
-                            extra={**log_extra, "action": "decline_check_retries"}
+                            extra={"action": "decline_check_retries"}
                         )
                         for i in range(failed_attempts):
                             await _log_llm_usage(db, dialogue, f"DeclineClarification (RETRY #{i+1})")
@@ -1535,9 +1555,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 except Exception as e:
                     # === ПОЛНЫЙ ПРОВАЛ ===
-                    logger.warning(
+                    ctx_logger.warning(
                         f"[{dialogue.hh_response_id}] Ошибка при уточнении 'declined_vacancy': {e}. Считаем отказом по умолчанию.",
-                        extra={**log_extra, "action": "decline_check_failed"}
+                        extra={"action": "decline_check_failed"}
                     )
                     total_fails = len(clarification_attempts)
                     
@@ -1555,9 +1575,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         parsed = clarification_result['parsed_response']
                         is_real_decline = (parsed.get('answer') == 'yes')
                     except Exception as e:
-                        logger.warning(
+                        ctx_logger.warning(
                             f"[{dialogue.hh_response_id}] Ошибка парсинга JSON при уточнении 'declined_vacancy': {e}",
-                            extra={**log_extra, "action": "decline_check_json_error"}
+                            extra={"action": "decline_check_json_error"}
                         )
 
                 if not is_real_decline:
@@ -1571,15 +1591,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     dialogue.pending_messages = (dialogue.pending_messages or []) + [system_command]
                     dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
                     await db.commit()
-                    logger.info(
+                    ctx_logger.info(
                         f"[{dialogue.hh_response_id}] Отказ от вакансии НЕ подтверждён. Отложен системный запрос для повторной обработки.",
-                        extra={**log_extra, "action": "decline_not_confirmed"}
+                        extra={"action": "decline_not_confirmed"}
                     )
                     return  # ← ВАЖНО: выходим из функции, НЕ переводя в статус 'rejected'
                 else:
-                    logger.info(
+                    ctx_logger.info(
                         f"[{dialogue.hh_response_id}] Отказ от вакансии подтверждён LLM.",
-                        extra={**log_extra, "action": "decline_confirmed"}
+                        extra={"action": "decline_confirmed"}
                     )
                 # --- КОНЕЦ ДОПОЛНИТЕЛЬНОЙ ПРОВЕРКИ ---
 
@@ -1597,9 +1617,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         processed_at=datetime.datetime.now(datetime.timezone.utc)
                     )
                 )
-                logger.info(
+                ctx_logger.info(
                     f"[{dialogue.hh_response_id}] Статус 'declined_interview': все запланированные напоминания отменены.",
-                    extra={**log_extra, "action": "reminders_cancelled_due_to_decline"}
+                    extra={"action": "reminders_cancelled_due_to_decline"}
                 )
             # -------------------------------------------------------
 
@@ -1613,9 +1633,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # `dialogue.rejected_alerts` будет либо объектом RejectedNotificationQueue, либо None,
             # благодаря `uselist=False` в relationship.
             if dialogue.inactive_alerts:
-                logger.info(
+                ctx_logger.info(
                     f"[{dialogue.hh_response_id}] Кандидат уже в таблице молчунов. Пропускаю запись в отказники.",
-                    extra={**log_extra, "action": "skip_rejected_queue_exists_in_inactive"}
+                    extra={"action": "skip_rejected_queue_exists_in_inactive"}
                 )
             else:
                 # СЦЕНАРИЙ 1: Отказ от собеседования -> ОТДЕЛЬНАЯ ОЧЕРЕДЬ
@@ -1633,7 +1653,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             status='pending'
                         )
                         db.add(new_declined_alert)
-                        logger.info(
+                        ctx_logger.info(
                             f"Добавлено уведомление 'Отказ от собеседования' (диалог {dialogue.hh_response_id}) "
                             f"в DeclinedInterviewNotificationQueue."
                         )
@@ -1651,7 +1671,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             status='pending'
                         )
                         db.add(new_rejected_alert)
-                        logger.info(
+                        ctx_logger.info(
                             f"Добавлено уведомление об отклоненном кандидате (диалог {dialogue.hh_response_id}) "
                             f"в RejectedNotificationQueue."
                         )
@@ -1659,13 +1679,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
 
 
-            logger.info(f"Candidate {dialogue.hh_response_id} rejected 🔴. Moving to 'assessment'.")
+            ctx_logger.info(f"Candidate {dialogue.hh_response_id} rejected 🔴. Moving to 'assessment'.")
 
             api_move_start = time.monotonic()
             await hh_api.move_response_to_folder(recruiter, db, dialogue.hh_response_id, 'assessment')
-            logger.debug(
+            ctx_logger.debug(
                 f"[{dialogue.hh_response_id}] API move: {time.monotonic() - api_move_start:.2f} sec.",
-                extra={**log_extra, "action": "api_move_completed", "duration": time.monotonic() - api_move_start}
+                extra={"action": "api_move_completed", "duration": time.monotonic() - api_move_start}
             )
 
         # Если LLM не вернула текст, не отправляем сообщение
@@ -1678,9 +1698,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # прошла, но не перевела кандидата в forwarded/failed (например, ждем чего-то еще).
             # В этом случае молчание допустимо.
             if new_state == 'qualification_complete':
-                logger.info(
+                ctx_logger.info(
                     f"[{dialogue.hh_response_id}] LLM вернула пустой ответ для 'qualification_complete'. Это соответствует правилам.",
-                    extra={**log_extra, "action": "empty_response_allowed"}
+                    extra={"action": "empty_response_allowed"}
                 )
                 
                 # Сохраняем историю и стейт, но не отправляем сообщение
@@ -1697,9 +1717,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Если стейт подразумевает диалог (awaiting_age, awaiting_phone, scheduling и т.д.),
             # а бот молчит — это ошибка генерации.
             else:
-                logger.error(
+                ctx_logger.error(
                     f"[{dialogue.hh_response_id}] ОШИБКА: LLM вернула пустоту для разговорного стейта '{new_state}'. Вызываю RETRY.",
-                    extra={**log_extra, "action": "empty_response_error_retry", "state": new_state}
+                    extra={"action": "empty_response_error_retry", "state": new_state}
                 )
                 # Мы специально кидаем ошибку, чтобы сработал rollback и бот попробовал снова в следующем цикле
                 raise ValueError(f"Empty response text forbidden for conversational state: {new_state}")
@@ -1732,30 +1752,30 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             await db.flush()
             await db.commit()
 
-            logger.info(
+            ctx_logger.info(
                 f"Dialogue {dialogue.hh_response_id} processed successfully",
-                extra={**log_extra, "action": "dialogue_processed_success", "new_state": new_state}
+                extra={"action": "dialogue_processed_success", "new_state": new_state}
             )
         elif message_sent == 403:
-            logger.warning(f"Failed to send message for dialogue {dialogue.hh_response_id}. Clearing pending messages to avoid loop.")
+            ctx_logger.warning(f"Failed to send message for dialogue {dialogue.hh_response_id}. Clearing pending messages to avoid loop.")
             dialogue.pending_messages = None
             await db.commit() # Сохраняем сброс очереди сообщений
             return
         else:
-            logger.error(f"Failed to send message for dialogue {dialogue.hh_response_id}")
+            ctx_logger.error(f"Failed to send message for dialogue {dialogue.hh_response_id}")
             await db.rollback()
             return
 
     except Exception as e:
-        ctx = log_extra if 'log_extra' in locals() else {"dialogue_id": dialogue_id}
-        logger.error(
-            f"Critical error processing dialogue {dialogue_id}: {e}", 
-            exc_info=True,
-            extra={**ctx, "action": "process_dialogue_critical_error"}
+        # ctx_logger уже содержит все нужные ID, если ошибка случилась после их загрузки
+        ctx_logger.error(
+            f"Critical error processing dialogue: {e}", 
+            exc_info=True, 
+            extra={"action": "process_dialogue_critical_error"}
         )
         if db and db.is_active:
             await db.rollback()
-        raise  # Важно: пробрасываем исключение дальше
+        raise
 
     finally:
         # === ОСВОБОЖДЕНИЕ БЛОКИРОВКИ ===
@@ -1773,8 +1793,18 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
     """
     function_start_time = time.monotonic()
 
+    # 1. Создаем контекст рекрутера
+    rec_log_context = {
+        "recruiter_id": recruiter_id,
+        "worker": "handler",
+        "action": "batch_processing"
+    }
+    # 2. Создаем адаптер
+    rec_logger = logging.LoggerAdapter(logger, rec_log_context)
+
     try:
-        logger.debug(f"Stage 3: Finding pending dialogues for recruiter {recruiter_id}...")
+        # ЗАМЕНА: logger -> rec_logger
+        rec_logger.debug(f"Stage 3: Finding pending dialogues for recruiter {recruiter_id}...")
         debounce_time = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=DEBOUNCE_DELAY_SECONDS)
 
         # Быстрый запрос за списком ID
@@ -1806,13 +1836,15 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
             )
             # -------------------------
             dialogues_to_process_info = dialogues_info_result.all()
-            logger.debug(f"[Recruiter {recruiter_id}] DB query: {time.monotonic() - db_query_start:.2f}s. Found {len(dialogues_to_process_info)}")
-
+            rec_logger.debug(
+                f"DB query finished. Found {len(dialogues_to_process_info)} dialogues",
+                extra={"query_duration": time.monotonic() - db_query_start}
+            )
         if not dialogues_to_process_info:
-            logger.debug(f"No dialogues ready for recruiter {recruiter_id}")
+            rec_logger.info(f"Starting parallel processing for {len(dialogues_to_process_info)} dialogues")
             return
 
-        logger.info(f"Found {len(dialogues_to_process_info)} dialogues for parallel processing")
+        rec_logger.info(f"Found {len(dialogues_to_process_info)} dialogues for parallel processing")
 
         dialogue_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DIALOGUES)
 
@@ -1823,7 +1855,11 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
                     try:
                         await _process_single_dialogue(dialogue_id, rec_id, prompt_lib, task_db_session)
                     except Exception as e:
-                        logger.error(f"Dialogue {dialogue_id} processing failed: {e}", exc_info=True)
+                        rec_logger.error(
+                            f"Dialogue {dialogue_id} processing failed: {e}", 
+                            exc_info=True,
+                            extra={"dialogue_id": dialogue_id, "action": "single_dialogue_error"}
+                        )
                         # Ошибка одного диалога не влияет на другие
 
         gather_start = time.monotonic()
@@ -1838,33 +1874,44 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
         success_count = sum(1 for r in results if not isinstance(r, Exception))
         error_count = len(results) - success_count
 
-        logger.debug(f"[Recruiter {recruiter_id}] Batch processing: {time.monotonic() - gather_start:.2f}s")
-        logger.debug(f"Results: {success_count} success, {error_count} errors")
+        rec_logger.debug(
+            f"Batch processing complete. Results: {success_count} success, {error_count} errors",
+            extra={
+                "batch_success_count": success_count,
+                "batch_error_count": error_count,
+                "batch_duration": time.monotonic() - gather_start
+            }
+        )
 
     finally:
-        logger.debug(f"[Recruiter {recruiter_id}] process_pending_dialogues: {time.monotonic() - function_start_time:.2f}s")
-
+        rec_logger.debug(
+            "process_pending_dialogues function finished",
+            extra={"total_function_duration": time.monotonic() - function_start_time}
+        )
 
 
 
 
 async def handle_single_recruiter(rec_id: int, prompt_library: dict):
-    """Только обработка диалогов для одного рекрутера (Этап 3)"""
+    # Контекст верхнего уровня
+    rec_logger = logging.LoggerAdapter(logger, {"recruiter_id": rec_id, "worker": "handler"})
     try:
-        # Проверка токена (быстрая)
         async with SessionLocal() as check_db:
             result = await check_db.execute(
                 select(TrackedRecruiter.name, TrackedRecruiter.access_token).filter_by(id=rec_id)
             )
             recruiter_data = result.first()
             if not recruiter_data or not recruiter_data[1]:
+                rec_logger.warning(f"Recruiter {rec_id} has no token or not found")
                 return
+            
+            # Добавим имя в контекст для будущих логов
+            rec_logger.extra["recruiter_name"] = recruiter_data[0]
 
-        # Сразу переходим к обработке пендинг-сообщений
         await process_pending_dialogues(rec_id, prompt_library, None)
 
     except Exception as e:
-        logger.error(f"Worker error for recruiter {rec_id}: {e}", exc_info=True)
+        rec_logger.error(f"Worker error for recruiter: {e}", exc_info=True)
 
 
 async def run_worker_cycle(target_recruiter_ids=None):

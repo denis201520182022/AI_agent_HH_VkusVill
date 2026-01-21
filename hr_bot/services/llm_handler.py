@@ -62,7 +62,7 @@ logger.info(f"Клиент OpenAI настроен на работу через 
     # По умолчанию tenacity повторяет попытки для любого исключения, наследующегося от Exception.
     # Поэтому retry_if_exception_type явно указывать не нужно для "любых ошибок".
 )
-async def get_bot_response(system_prompt: str, dialogue_history: list, user_message: str, current_datetime_utc: datetime.datetime, attempt_tracker: list = None, skip_instructions: bool = False) -> dict:
+async def get_bot_response(system_prompt: str, dialogue_history: list, user_message: str, current_datetime_utc: datetime.datetime, attempt_tracker: list = None, skip_instructions: bool = False, extra_context: dict = None) -> dict:
     """
     Асинхронно отправляет запрос в OpenAI через прокси и получает ответ.
     """
@@ -72,7 +72,8 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
     if attempt_tracker is not None:
         attempt_tracker.append(datetime.datetime.now())
     # ----------------------------------
-    
+    # Создаем контекстный логгер
+    ctx_logger = logging.LoggerAdapter(logger, extra_context or {})
     messages = [
         {"role": "system", "content": system_prompt},
     ]
@@ -80,7 +81,7 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
     messages.append({"role": "user", "content": user_message})
     #print(messages)
     try:
-        logger.info(f"Отправка запроса к LLM через прокси...")
+        ctx_logger.info(f"🧬🧬🧬Отправка запроса к LLM через прокси...")
 
         # --- ИЗМЕНЕНИЕ: ИСПОЛЬЗУЕМ РАСПРЕДЕЛЕННЫЙ СЕМАФОР ---
         # name="llm_global" - это имя ключа в Redis (будет semaphore:llm_global)
@@ -106,22 +107,20 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
             cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0)
 
-        # Выводим информацию о токенах и кеше
-        print("\n=== ТОКЕНЫ И КЕШ ===")
-        print(f"📊 Всего токенов: {usage.total_tokens}")
-        print(f"💬 Input токены: {usage.prompt_tokens}")
-        print(f"📤 Output токены: {usage.completion_tokens}")
-        print(f"⚡ Кешированные токены: {cached_tokens}")
-        print(f"📄 Содержание ответа: {response_content}")
-
-        if usage.prompt_tokens > 0:
-            cache_percent = (cached_tokens / usage.prompt_tokens) * 100
-            print(f"📈 Процент кеша: {cache_percent:.1f}%")
-        print()
-
-        logger.info("Успешный ответ от LLM получен.")
-        logger.info(f"Использовано токенов - Total: {usage.total_tokens}, Input: {usage.prompt_tokens}, Output: {usage.completion_tokens}, Cached: {cached_tokens}")
-
+        
+        ctx_logger.info(
+            f"LLM Response received. Total tokens 📊: {usage.total_tokens}",
+            extra={
+                "action": "llm_response_success",
+                "llm_stats": {
+                    "total": usage.total_tokens,
+                    "prompt": usage.prompt_tokens,
+                    "completion": usage.completion_tokens,
+                    "cached": cached_tokens,
+                },
+                "llm_response_raw": response_content[:500]  # Логируем начало ответа для отладки
+            }
+        )
         #print(response_content)
         parsed_response = json.loads(response_content)
 
@@ -138,11 +137,12 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         # ------------------------------------------------------------
 
     except Exception as e:
-        # Логируем, что произошла ошибка и будет предпринята повторная попытка.
-        # Tenacity сам логирует попытки на уровне INFO, но здесь можно добавить WARN.
-        logger.warning(f"Ошибка при запросе к OpenAI: {type(e).__name__}: {e}. Будет предпринята повторная попытка (если не исчерпаны).", exc_info=True)
-        # КРИТИЧЕСКИ ВАЖНО: Перевыбрасываем исключение, чтобы декоратор @retry мог его поймать
-        # и решить, нужно ли повторять попытку.
+        # Используем ctx_logger вместо обычного logger
+        ctx_logger.warning(
+            f"Ошибка при запросе к OpenAI: {type(e).__name__}: {e}. Будет ретрай.", 
+            exc_info=True,
+            extra={"action": "llm_request_retry"}
+        )
         raise
 
 # Найти в конце файла или после функции get_bot_response
@@ -151,13 +151,13 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=4, max=10),
 )
-async def get_smart_bot_response(system_prompt: str, dialogue_history: list, user_message: str, current_datetime_utc: datetime.datetime, attempt_tracker: list = None, skip_instructions: bool = False) -> dict:
+async def get_smart_bot_response(system_prompt: str, dialogue_history: list, user_message: str, current_datetime_utc: datetime.datetime, attempt_tracker: list = None, skip_instructions: bool = False, extra_context: dict = None) -> dict:
     """
     Асинхронно отправляет запрос к УМНОЙ модели (gpt-4o) для сложных задач (аудит дат, верификация).
     """
     if attempt_tracker is not None:
         attempt_tracker.append(datetime.datetime.now())
-    
+    ctx_logger = logging.LoggerAdapter(logger, extra_context or {})
     # Рекомендуется использовать роль 'developer' для системных инструкций в GPT-5
     messages = [
         {"role": "developer", "content": system_prompt},
@@ -166,7 +166,7 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
     messages.append({"role": "user", "content": user_message})
 
     try:
-        logger.info(f"Отправка запроса к GPT-5 (SMART mode)...")
+        ctx_logger.info(f"🧬🧬Отправка запроса к GPT-5 (SMART mode)...")
 
         async with DistributedSemaphore(name="llm_global", limit=GLOBAL_LLM_LIMIT):
             response = await client.chat.completions.create(
@@ -187,13 +187,18 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
         if hasattr(usage, "prompt_tokens_details") and usage.prompt_tokens_details is not None:
             cached_tokens = getattr(usage.prompt_tokens_details, "cached_tokens", 0)
 
-        print("\n=== ТОКЕНЫ И КЕШ ===")
-        print(f"📊 Всего токенов: {usage.total_tokens}")
-        print(f"💬 Input токены: {usage.prompt_tokens}")
-        print(f"📤 Output токены: {usage.completion_tokens}")
-        print(f"⚡ Кешированные токены: {cached_tokens}")
-        print(f"📄 Содержание ответа: {response_content}")
-        logger.info(f"Успешный ответ от SMART LLM. Tokens: {usage.total_tokens}")
+        ctx_logger.info(
+            f"SMART LLM Response received. Tokens ⚡: {usage.total_tokens}",
+            extra={
+                "action": "smart_llm_success",
+                "llm_stats": {
+                    "total": usage.total_tokens,
+                    "prompt": usage.prompt_tokens,
+                    "completion": usage.completion_tokens,
+                    "cached": cached_tokens,
+                }
+            }
+        )
 
         return {
             "parsed_response": json.loads(response_content),
@@ -206,7 +211,7 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
         }
 
     except Exception as e:
-        logger.warning(f"Ошибка в SMART LLM: {type(e).__name__}: {e}. Ретрай...")
+        ctx_logger.warning(f"Ошибка в SMART LLM: {type(e).__name__}: {e}. Ретрай...", extra={"action": "smart_llm_retry"})
         raise
 
 
