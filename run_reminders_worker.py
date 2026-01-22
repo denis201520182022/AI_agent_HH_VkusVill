@@ -20,7 +20,7 @@ import re
 from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.logger_config import setup_logging
-from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
+from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog, InterviewFollowup
 from hr_bot.services import hh_api_real as hh_api
 from hr_bot.services import knowledge_base
 from hr_bot.services import llm_handler
@@ -135,8 +135,8 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     return
                 elif current_folder_on_hh == 404:
                     # Вакансия закрыта
-                    ctx_logger.info(f"Вакансия для диалога {dialogue_hh_id} закрыта. Обновляю статус.")
-                    dialogue.status = 'timed_out'
+                    ctx_logger.info(f"Отклик не найден (404) {dialogue_hh_id}")
+                    dialogue.status = 'not_found'
                     dialogue.reminder_level = 6
                     await db.commit()
                     return
@@ -273,7 +273,7 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                         elif status_code == 403:
                              # Вакансия закрыта или доступ запрещен
                              dialogue.reminder_level = 6
-                             dialogue.status = 'vacancy_closed'
+                             dialogue.status = 'vacancy_closed_or_resume_not_found'
                              await db.commit()
                              all_sent = False
                              break # Прерываем цикл
@@ -512,6 +512,7 @@ async def check_and_send_interview_reminders():
                         elif send_result == 403:
                             # ВАКАНСИЯ ЗАКРЫТА
                             reminder.status = 'cancelled' # Отменяем, так как отправлять бессмысленно
+                            dialogue.status = 'vacancy_closed_or_resume_not_found'
                             ctx_logger.warning(
                                 f"Напоминание {reminder.id} ОТМЕНЕНО: Вакансия закрыта/в архиве. "
                                 f"Кандидат: {candidate.full_name}, Диалог: {dialogue.hh_response_id}"
@@ -546,6 +547,224 @@ async def check_and_send_interview_reminders():
 
 
 
+async def check_and_send_followups():
+    """
+    Фоновая задача для отправки пост-собеседовательных сообщений (Follow-up).
+    Обрабатывает цепочку:
+    Step 1: Первое сообщение ("Как прошло?") -> Списание 10р -> Смена стейта диалога.
+    Step 2: Напоминание через 1 час.
+    Step 3: Напоминание на следующий день -> Если молчит, закрытие диалога.
+    """
+    logger.info("Фоновый обработчик Follow-up сообщений запущен.")
+
+    # Тексты сообщений
+    FOLLOWUP_TEMPLATES = {
+        1: "Добрый день! Подскажите, пожалуйста, у Вас получилось подойти на собеседование? Как всё прошло?",
+        2: "Напомнюсь на всякий случай 🙂 Подскажите, пожалуйста, удалось ли Вам сегодня подойти на собеседование?",
+        3: "Добрый день! Вы так и не ответили. Хотела уточнить, удалось ли Вам вчера подойти на собеседование и как всё прошло?"
+    }
+
+    try:
+        SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
+    except ZoneInfoNotFoundError:
+        logger.critical("Часовой пояс не найден. Follow-up не будет работать корректно.")
+        return
+
+    while True:
+        if shutdown_requested:
+            break
+
+        async with SessionLocal() as db_session:
+            try:
+                now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+                # Выбираем задачи с блокировкой строки (skip_locked), чтобы воркеры не мешали друг другу
+                stmt = (
+                    select(InterviewFollowup)
+                    .options(
+                        selectinload(InterviewFollowup.dialogue)
+                        .selectinload(Dialogue.recruiter),
+                        selectinload(InterviewFollowup.dialogue)
+                        .selectinload(Dialogue.inactive_alerts)
+                    )
+                    .filter(
+                        InterviewFollowup.status == 'pending',
+                        InterviewFollowup.scheduled_time_utc <= now_utc
+                    )
+                    .limit(20)
+                    .with_for_update(skip_locked=True)
+                )
+
+                result = await db_session.execute(stmt)
+                tasks = result.scalars().all()
+
+                if not tasks:
+                    await asyncio.sleep(30)
+                    continue
+
+                logger.info(f"[Follow-up] Найдено {len(tasks)} задач для отправки.")
+
+                for task in tasks:
+                    dialogue = task.dialogue
+                    if not dialogue or not dialogue.recruiter:
+                        task.status = 'error'
+                        task.processed_at = now_utc
+                        await db_session.commit()
+                        continue
+
+                    recruiter = dialogue.recruiter
+                    step = task.step
+                    message_text = FOLLOWUP_TEMPLATES.get(step)
+                    
+                    ctx_logger = logging.LoggerAdapter(logger, {
+                        "dialogue_id": dialogue.id,
+                        "step": step,
+                        "hh_id": dialogue.hh_response_id,
+                        "worker": "followup_sender"
+                    })
+
+                    # === ЛОГИКА ШАГА 1 (ОПЛАТА И СМЕНА СТАТУСА) ===
+                    if step == 1:
+                        # 1. БЛОКИРУЕМ настройки для атомарной проверки и списания
+                        settings_res = await db_session.execute(
+                            select(AppSettings).filter_by(id=1).with_for_update()
+                        )
+                        settings = settings_res.scalar_one_or_none()
+                        
+                        cost = settings.cost_per_followup if settings else Decimal('10.00')
+
+                        # Проверка баланса ДО отправки
+                        if not settings or settings.balance < cost:
+                            ctx_logger.warning(f"Недостаточно средств ({settings.balance if settings else 0}) для Follow-up. Отмена.")
+                            task.status = 'cancelled_no_funds'
+                            task.processed_at = now_utc
+                            await db_session.commit()
+                            continue
+                        
+                        # 2. Отправка сообщения (Блокирующая операция)
+                        # Мы удерживаем лок на AppSettings, пока ждем ответа от API. 
+                        # Это гарантирует, что баланс не изменится "под ногами".
+                        send_result = await hh_api.send_message(recruiter, db_session, dialogue.hh_response_id, message_text)
+                        
+                        if send_result == 200:
+                            # УСПЕХ: Только теперь списываем деньги
+                            settings.balance -= cost
+                            settings.total_spent_on_followups += cost
+                            
+                            dialogue.dialogue_state = 'follow_up_initial'
+                            dialogue.status = 'follow_up'
+                            dialogue.interview_result = 'started_followup'
+
+                            # История
+                            new_hist = {
+                                'role': 'assistant',
+                                'content': message_text,
+                                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+                            }
+                            dialogue.history = (list(dialogue.history) if dialogue.history else []) + [new_hist]
+
+                            # Планируем Шаг 2 (через 1 час)
+                            next_time_utc = now_utc + datetime.timedelta(hours=1)
+                            db_session.add(InterviewFollowup(
+                                dialogue_id=dialogue.id,
+                                step=2,
+                                scheduled_time_utc=next_time_utc,
+                                status='pending'
+                            ))
+                            
+                            task.status = 'sent'
+                            MESSAGES_SENT_TOTAL.inc()
+                            ctx_logger.info(f"Step 1 отправлен. Списано {cost} руб. Запланирован Step 2.")
+                        
+                        elif send_result == 403:
+                            # 403: Вакансия закрыта или резюме удалено. 
+                            # Деньги НЕ списываем.
+                            task.status = 'cancelled'
+                            dialogue.status = 'vacancy_closed_or_resume_not_found'
+                            # Можно сбросить уровень напоминаний
+                            dialogue.reminder_level = 6 
+                            ctx_logger.warning("Step 1 отменен: получен 403 (Вакансия закрыта/Резюме удалено).")
+
+                        else:
+                            # Прочие ошибки (сеть и т.д.) - попробуем в следующий раз или пометим как ошибку
+                            # Деньги НЕ списываем.
+                            task.status = 'error'
+                            ctx_logger.error(f"Ошибка отправки сообщения Step 1. Code: {send_result}")
+
+                    # === ЛОГИКА ШАГА 2 (НАПОМИНАНИЕ ЧЕРЕЗ ЧАС) ===
+                    elif step == 2:
+                        send_result = await hh_api.send_message(recruiter, db_session, dialogue.hh_response_id, message_text)
+                        
+                        if send_result == 200:
+                            new_hist = {
+                                'role': 'assistant',
+                                'content': message_text,
+                                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+                            }
+                            dialogue.history = (list(dialogue.history) if dialogue.history else []) + [new_hist]
+
+                            # Планируем Шаг 3 (Завтра в 12:00 по СПб)
+                            now_spb = datetime.datetime.now(SPB_TIMEZONE)
+                            tomorrow_spb = now_spb.date() + datetime.timedelta(days=1)
+                            next_time_spb = datetime.datetime.combine(tomorrow_spb, datetime.time(12, 0)).replace(tzinfo=SPB_TIMEZONE)
+                            next_time_utc = next_time_spb.astimezone(datetime.timezone.utc)
+                            
+                            db_session.add(InterviewFollowup(
+                                dialogue_id=dialogue.id,
+                                step=3,
+                                scheduled_time_utc=next_time_utc,
+                                status='pending'
+                            ))
+                            
+                            task.status = 'sent'
+                            MESSAGES_SENT_TOTAL.inc()
+                            ctx_logger.info("Step 2 отправлен. Запланирован Step 3.")
+
+                        elif send_result == 403:
+                            task.status = 'cancelled'
+                            dialogue.status = 'vacancy_closed_or_resume_not_found'
+                            ctx_logger.warning("Step 2 отменен: получен 403.")
+                        
+                        else:
+                            task.status = 'error'
+
+                    # === ЛОГИКА ШАГА 3 (ФИНАЛЬНОЕ НАПОМИНАНИЕ) ===
+                    elif step == 3:
+                        send_result = await hh_api.send_message(recruiter, db_session, dialogue.hh_response_id, message_text)
+                        
+                        if send_result == 200:
+                            new_hist = {
+                                'role': 'assistant',
+                                'content': message_text,
+                                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+                            }
+                            dialogue.history = (list(dialogue.history) if dialogue.history else []) + [new_hist]
+                            
+                            # Финализируем диалог
+                            dialogue.interview_result = 'no_answer_after_interview'
+                            
+                            
+                            task.status = 'sent'
+                            MESSAGES_SENT_TOTAL.inc()
+                            ctx_logger.info("Step 3 отправлен. Диалог помечен как 'no_answer_after_interview'.")
+
+                        elif send_result == 403:
+                            task.status = 'cancelled'
+                            dialogue.status = 'vacancy_closed_or_resume_not_found'
+                            ctx_logger.warning("Step 3 отменен: получен 403.")
+
+                        else:
+                            task.status = 'error'
+                    
+                    # Сохраняем результат обработки конкретной задачи
+                    task.processed_at = now_utc
+                    await db_session.commit()
+
+            except Exception as e:
+                logger.error(f"Ошибка в цикле Follow-up: {e}", exc_info=True)
+                await db_session.rollback()
+
+        await asyncio.sleep(30)
 
 
 async def run_reminders_cycle(target_recruiter_ids=None):
@@ -584,7 +803,7 @@ async def main(target_recruiter_ids=None):
     # Она обрабатывает ОБЩУЮ очередь, поэтому фильтрация по рекрутерам ей не обязательна,
     # но благодаря skip_locked воркеры поделят задачи между собой.
     interview_task = asyncio.create_task(check_and_send_interview_reminders())
-    
+    followup_task = asyncio.create_task(check_and_send_followups())
     try:
         while not shutdown_requested:
             # 2. Запускаем цикл "дожимов" с фильтром
@@ -597,6 +816,7 @@ async def main(target_recruiter_ids=None):
                 await asyncio.sleep(1)
     finally:
         interview_task.cancel()
+        followup_task.cancel()
         await hh_api_real.close_api_client()
         await close_redis()
         logger.info("Reminder Worker остановлен.")

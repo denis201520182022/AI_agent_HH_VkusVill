@@ -18,12 +18,13 @@ from decimal import Decimal
 import difflib
 import re
 from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
+from hr_bot.db.models import InterviewFollowup, RescheduledNotificationQueue, DeclinedInterviewNotificationQueue, RejectedNotificationQueue
 # ... другие импорты
 from hr_bot.utils.data_verification_notifier import send_verification_alert # <--- НОВЫЙ ИМПОРТ
 from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.logger_config import setup_logging
-from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog, DeclinedInterviewNotificationQueue
+from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog, DeclinedInterviewNotificationQueue, InterviewFollowup, RescheduledNotificationQueue
 from hr_bot.services import hh_api_real as hh_api
 from hr_bot.services import knowledge_base
 from hr_bot.services import llm_handler
@@ -637,6 +638,153 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     return "\n\n".join(prompt_pieces)
 
 
+async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruiter: TrackedRecruiter, prompt_library: dict, ctx_logger):
+    """
+    Обработчик сообщений для режима Follow-up.
+    Использует блок #FOLLOWUP_LOGIC# из гугл-дока.
+    """
+    ctx_logger.info("⚡ Запуск логики Follow-up (v2)...")
+
+
+    # 1. Отмена будущих напоминаний (Clean up)
+    # Если кандидат ответил, значит напоминать больше не нужно
+    await db.execute(
+        update(InterviewFollowup)
+        .where(InterviewFollowup.dialogue_id == dialogue.id)
+        .where(InterviewFollowup.status == 'pending')
+        .values(status='cancelled', processed_at=datetime.datetime.now(datetime.timezone.utc))
+    )
+    # Сбрасываем уровень, чтобы основной воркер не вмешивался
+    dialogue.reminder_level = 0
+    
+    # 2. Сбор истории сообщений
+    pending_messages = dialogue.pending_messages or []
+    if not pending_messages:
+        return
+
+    # Переносим сообщения из pending в историю и формируем текст для LLM
+    user_text_parts = []
+    current_history = list(dialogue.history) if dialogue.history else []
+    
+    for pm in pending_messages:
+        content = pm.get('content', '') if isinstance(pm, dict) else str(pm)
+        user_text_parts.append(content)
+        
+        # Добавляем в объект истории
+        new_hist_entry = {
+            'role': 'user', 
+            'content': content, 
+            'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+        }
+        current_history.append(new_hist_entry)
+
+    full_user_text = "\n".join(user_text_parts)
+    # Очищаем очередь, так как мы их обработали
+    dialogue.pending_messages = None 
+    dialogue.history = current_history[-150:] # Сохраняем (с ограничением длины)
+
+    # 3. Формирование Промпта
+    # Основная логика Follow-up
+    followup_logic_block = prompt_library.get('#FOLLOWUP_LOGIC#', '')
+    
+    # --- НОВОЕ: Логика перезаписи и Календарь ---
+    scheduling_logic = prompt_library.get('#SCHEDULING_ALGORITHM_FOLLOW_UP#', '')
+    calendar_context = _generate_calendar_context() # Функция должна быть доступна в этом файле
+    # --------------------------------------------
+
+    # Описание вакансии
+    vacancy_desc = _find_relevant_vacancy(prompt_library, dialogue.vacancy.title, dialogue.vacancy.city, ctx_logger)
+    
+    # Собираем системный промпт со всеми инструкциями
+    system_prompt = (
+        f"{followup_logic_block}\n\n"
+        f"{scheduling_logic}\n\n"
+        f"{calendar_context}\n\n"
+        f"[ОПИСАНИЕ ВАКАНСИИ]:\n{vacancy_desc}"
+    )
+
+    # 4. Запрос к LLM
+    try:
+        llm_response = await llm_handler.get_bot_response(
+            system_prompt=system_prompt,
+            dialogue_history=dialogue.history[-10:], # Последние 10 сообщений для контекста
+            user_message=full_user_text,
+            current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
+            extra_context={"dialogue_id": dialogue.id, "action": "followup_llm_request"}
+        )
+        
+        parsed = llm_response.get('parsed_response', {})
+        usage = llm_response.get('usage_stats')
+        
+        # Логируем токены
+        if usage:
+            await _log_llm_usage(db, dialogue, "Followup_Response", usage)
+
+    except Exception as e:
+        ctx_logger.error(f"Ошибка LLM в Follow-up: {e}", exc_info=True)
+        return # Выходим, чтобы не поломать данные
+
+    # 5. Парсинг и Сохранение данных
+    response_text = parsed.get('response_text')
+    extracted_data = parsed.get('extracted_data', {})
+    intent = parsed.get('intent') # Пока просто получаем, но логику переключений не трогаем
+    
+    ctx_logger.info(f"LLM Intent: {intent}")
+
+    # Логика сохранения по ТЗ:
+    # interview_result или "no_show_reason_category" сохр в dialogue.interview_result
+    
+    res_interview = extracted_data.get('interview_result')
+    res_category = extracted_data.get('no_show_reason_category')
+    res_text = extracted_data.get('no_show_reason_text')
+
+    # Приоритет: явный результат > категория неявки
+    if res_interview:
+        dialogue.interview_result = res_interview
+        ctx_logger.info(f"Сохранен результат собеседования: {res_interview}")
+    elif res_category:
+        dialogue.interview_result = res_category
+        ctx_logger.info(f"Сохранена категория неявки как результат: {res_category}")
+    
+    # Сохраняем текст причины
+    if res_text:
+        dialogue.no_show_reason = res_text
+        ctx_logger.info("Сохранена причина неявки (текст).")
+
+    # --- НОВОЕ: Обработка перезаписи ---
+    if intent == 'reschedule_finish':
+        # Просто создаем уведомление для рекрутера, дату не парсим (по ТЗ)
+        if not dialogue.rescheduled_alerts:
+            db.add(RescheduledNotificationQueue(dialogue_id=dialogue.id, status='pending'))
+        
+        # Можно опционально пометить результат
+        dialogue.interview_result = 'rescheduled'
+        ctx_logger.info("Собеседование перезаписано. Добавлена задача в RescheduledNotificationQueue.")
+    # -----------------------------------
+    
+    # 6. Отправка ответа кандидату
+    if response_text:
+        send_res = await hh_api.send_message(recruiter, db, dialogue.hh_response_id, response_text)
+        
+        if send_res == 200:
+            # Добавляем ответ бота в историю
+            new_bot_hist = {
+                'role': 'assistant',
+                'content': response_text,
+                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+            }
+            dialogue.history = (dialogue.history or []) + [new_bot_hist]
+        elif send_res == 403:
+            ctx_logger.error(f"Не удалось отправить ответ в Follow-up. Код: {send_res}")
+            dialogue.pending_messages = None
+            dialogue.status = 'vacancy_closed_or_resume_not_found'
+            
+
+    # Обновляем время последнего изменения
+    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+    await db.commit()
+
+
 async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_library: dict, db: AsyncSession):
     """Исправленная версия с правильной работой с ORM"""
     dialogue_processing_start_time = time.monotonic()
@@ -684,7 +832,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 selectinload(Dialogue.candidate),
                 selectinload(Dialogue.rejected_alerts),
                 selectinload(Dialogue.inactive_alerts),
-                selectinload(Dialogue.declined_interview_alerts)
+                selectinload(Dialogue.declined_interview_alerts),
+                selectinload(Dialogue.followups),
+                selectinload(Dialogue.rescheduled_alerts)
             )
             .with_for_update(skip_locked=True)
         )
@@ -715,7 +865,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # Пересоздаем адаптер с полным набором данных
         ctx_logger = logging.LoggerAdapter(logger, log_context)
 
+        if dialogue.status == 'follow_up':
+            await _process_followup_logic(db, dialogue, recruiter, prompt_library, ctx_logger)
+            return # <--- ВЫХОДИМ, ЧТОБЫ ОСНОВНАЯ ЛОГИКА НЕ МЕШАЛА
+        # =========================================================================
+
+
         # Теперь этот лог выйдет со всеми ID и именами:
+
         ctx_logger.debug(f"Processing dialogue {dialogue.hh_response_id}...")
 
         ctx_logger.debug(f"[Dialogue {dialogue_id}] DB fetch took: {time.monotonic() - db_fetch_start:.4f} sec.")
@@ -1759,6 +1916,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         elif message_sent == 403:
             ctx_logger.warning(f"Failed to send message for dialogue {dialogue.hh_response_id}. Clearing pending messages to avoid loop.")
             dialogue.pending_messages = None
+            dialogue.status = 'vacancy_closed_or_resume_not_found'
             await db.commit() # Сохраняем сброс очереди сообщений
             return
         else:

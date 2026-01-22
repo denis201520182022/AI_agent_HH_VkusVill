@@ -115,6 +115,7 @@ class TrackedRecruiter(Base):
     topic_rejected_id = Column(Integer, nullable=True)   # ID темы "Отказники"
     topic_timeout_id = Column(Integer, nullable=True)    # ID темы "Молчуны"
     topic_declined_interview_id = Column(Integer, nullable=True) # ID темы "Отказ от собеседования"
+    topic_rescheduled_id = Column(Integer, nullable=True) # ID темы "Переносы / Доработанные"
     # -------------------------------------
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -145,6 +146,8 @@ class Dialogue(Base):
     response_created_at = Column(DateTime(timezone=True), nullable=True)
     
     interview_datetime_utc = Column(DateTime(timezone=True), nullable=True)
+    interview_result = Column(String(50), nullable=True) 
+    no_show_reason = Column(Text, nullable=True)
 
     # --- ДОБАВИТЬ ЭТИ ПОЛЯ ДЛЯ СТАТИСТИКИ ТОКЕНОВ ---
     total_prompt_tokens = Column(Integer, nullable=False, default=0, server_default='0')
@@ -166,6 +169,8 @@ class Dialogue(Base):
     # --- ДОБАВИТЬ НОВУЮ СВЯЗЬ С ЛОГАМИ ---
     llm_usage_logs = relationship("LlmUsageLog", back_populates="dialogue", cascade="all, delete-orphan")
     # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+    followups = relationship("InterviewFollowup", back_populates="dialogue", cascade="all, delete-orphan")
+    rescheduled_alerts = relationship("RescheduledNotificationQueue", back_populates="dialogue", uselist=False)
     
 
 class Statistic(Base):
@@ -213,6 +218,8 @@ class AppSettings(Base):
     total_spent_on_reminders = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
     cost_per_dialogue = Column(Numeric(10, 2), nullable=False, default=19.00, server_default='19.00')
     cost_per_long_reminder = Column(Numeric(10, 2), nullable=False, default=5.00, server_default='5.00')
+    cost_per_followup = Column(Numeric(10, 2), nullable=False, default=10.00, server_default='10.00')
+    total_spent_on_followups = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
     low_balance_threshold = Column(Numeric(10, 2), nullable=False, default=500.00, server_default='500.00')
     low_limit_notified = Column(Boolean, nullable=False, default=False, server_default='false')
 
@@ -299,3 +306,38 @@ class LlmUsageLog(Base):
 
     dialogue = relationship("Dialogue", back_populates="llm_usage_logs")
 # --- КОНЕЦ НОВОЙ МОДЕЛИ ---
+
+# --- НОВАЯ МОДЕЛЬ ДЛЯ POST-INTERVIEW FOLLOW-UP (ДОЖИМ ПОСЛЕ СОБЕСЕДОВАНИЯ) ---
+class InterviewFollowup(Base):
+    __tablename__ = 'interview_followups'
+    id = Column(Integer, primary_key=True, index=True)
+    
+    dialogue_id = Column(Integer, ForeignKey('dialogues.id'), nullable=False, index=True)
+    
+    # step: 
+    # 1 = Первое сообщение (вечером того же дня)
+    # 2 = Напоминание через 1 час
+    # 3 = Напоминание на следующий день в 12:00
+    step = Column(Integer, nullable=False) 
+    
+    scheduled_time_utc = Column(DateTime(timezone=True), nullable=False, index=True)
+    status = Column(String(50), nullable=False, default='pending') # 'pending', 'sent', 'cancelled', 'error'
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
+    processed_at = Column(DateTime(timezone=True))
+    
+    dialogue = relationship("Dialogue", back_populates="followups")
+# ---------------------------------------------------------------------------
+
+# --- НОВАЯ МОДЕЛЬ ДЛЯ УВЕДОМЛЕНИЙ О ПЕРЕНОСЕ СОБЕСЕДОВАНИЯ (RESCHEDULED) ---
+class RescheduledNotificationQueue(Base):
+    __tablename__ = 'rescheduled_notification_queue'
+    id = Column(Integer, primary_key=True, index=True)
+    # dialogue_id уникален
+    dialogue_id = Column(Integer, ForeignKey('dialogues.id'), unique=True, nullable=False)
+    status = Column(String(50), nullable=False, default='pending') # pending, sent, error
+    created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
+    processed_at = Column(DateTime(timezone=True))
+    
+    dialogue = relationship("Dialogue", back_populates="rescheduled_alerts")
+# ---------------------------------------------------------------------------
