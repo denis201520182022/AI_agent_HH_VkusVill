@@ -51,7 +51,7 @@ def setup_logging(log_filename: str):
     # -------------------------------
 
     root_logger = logging.getLogger()
-    root_logger.setLevel(logging.DEBUG) 
+    root_logger.setLevel(logging.INFO) 
 
     if root_logger.hasHandlers():
         root_logger.handlers.clear()
@@ -91,3 +91,7 @@ def setup_logging(log_filename: str):
     logging.getLogger('googleapiclient').setLevel(logging.WARNING)
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('asyncio').setLevel(logging.WARNING)
+    # --- ДОБАВИТЬ ВОТ ЭТО ---
+    logging.getLogger('google_auth_httplib2').setLevel(logging.WARNING) 
+    # Можно также заглушить весь пакет google, чтобы наверняка:
+    logging.getLogger('google').setLevel(logging.WARNING)

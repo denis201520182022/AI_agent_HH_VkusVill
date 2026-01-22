@@ -126,7 +126,7 @@ def get_prompt_library():
         else:
             prompt_library['vacancies'] = []
 
-        logger.info(f"Библиотека промптов успешно загружена. Найдено блоков: {len(prompt_library)}")
+        logger.debug(f"Библиотека промптов успешно загружена. Найдено блоков: {len(prompt_library)}")
         
         _cached_prompt_library = prompt_library
         _cache_timestamp = time.time()
