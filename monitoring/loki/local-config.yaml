@@ -3,6 +3,10 @@ auth_enabled: false
 server:
   http_listen_port: 3100
   grpc_listen_port: 9096
+  # --- ИСПРАВЛЕНИЕ ОШИБКИ ResourceExhausted (увеличиваем лимит до 16МБ) ---
+  grpc_server_max_recv_msg_size: 16777216
+  grpc_server_max_send_msg_size: 16777216
+  # -------------------------------------------------------------------------
 
 common:
   path_prefix: /tmp/loki
@@ -28,11 +32,12 @@ schema_config:
 ruler:
   alertmanager_url: http://localhost:9093
 
-
-# --- ДОБАВИТЬ ВОТ ЭТУ СЕКЦИЮ ---
+# --- ТВОЯ НОВАЯ СЕКЦИЯ (Полезна для приема больших объемов логов) ---
 limits_config:
   reject_old_samples: true
   reject_old_samples_max_age: 168h
-  ingestion_rate_mb: 20          # Увеличиваем лимит скорости приема до 20 МБ/с
-  ingestion_burst_size_mb: 40    # Разрешаем всплески до 40 МБ
-# -------------------------------
+  ingestion_rate_mb: 20          # Лимит скорости приема
+  ingestion_burst_size_mb: 40    # Разрешенные всплески
+  # Дополнительно рекомендую увеличить лимиты на запросы, раз у вас много логов:
+  max_entries_limit_per_query: 5000
+# -------------------------------------------------------------------

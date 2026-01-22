@@ -1,6 +1,11 @@
 
 source venv/bin/activate
 
+alembic revision --autogenerate -m "Фоллоу"
+alembic upgrade head
+
+
+
 systemctl stop hh_main.service
 systemctl status hh_reminders.service
 journalctl -u hh_main.service -f
