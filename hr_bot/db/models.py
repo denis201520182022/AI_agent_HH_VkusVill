@@ -146,6 +146,8 @@ class Dialogue(Base):
     response_created_at = Column(DateTime(timezone=True), nullable=True)
     
     interview_datetime_utc = Column(DateTime(timezone=True), nullable=True)
+    is_followup = Column(Boolean, default=False, server_default='false')
+    need_follow_up_resheduled_sent = Column(Boolean, default=False, server_default='false')
     interview_result = Column(String(50), nullable=True) 
     no_show_reason = Column(Text, nullable=True)
 
@@ -155,6 +157,8 @@ class Dialogue(Base):
     total_cached_tokens = Column(Integer, nullable=False, default=0, server_default='0')
     total_cost = Column(Numeric(12, 6), nullable=False, default=0.0, server_default='0.0')
     # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
+
 
     candidate = relationship("Candidate", back_populates="dialogues")
     vacancy = relationship("Vacancy", back_populates="dialogues")

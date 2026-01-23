@@ -172,15 +172,22 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
         ctx_logger.info(f"🧠🧠Отправка запроса к GPT-5 (SMART mode)...")
 
         async with DistributedSemaphore(name="llm_global", limit=GLOBAL_LLM_LIMIT):
-            response = await client.chat.completions.create(
-                model="gpt-5", # Или "gpt-5-thinking" для сверхсложных задач
-                messages=messages,
-                max_completion_tokens=1500, # Увеличили запас для reasoning tokens
-                response_format={"type": "json_object"},
-                # НОВЫЕ ПАРАМЕТРЫ GPT-5:
-                reasoning_effort="low",  # Максимальная точность для аудита дат
-                verbosity="low",         # Чтобы ответ был чистым JSON без лишнего текста
+            # response = await client.chat.completions.create(
+            #     model="gpt-5", # Или "gpt-5-thinking" для сверхсложных задач
+            #     messages=messages,
+            #     max_completion_tokens=1500, # Увеличили запас для reasoning tokens
+            #     response_format={"type": "json_object"},
+            #     # НОВЫЕ ПАРАМЕТРЫ GPT-5:
+            #     reasoning_effort="low",  # Максимальная точность для аудита дат
+            #     verbosity="low",         # Чтобы ответ был чистым JSON без лишнего текста
                 
+            # )
+            response = await client.chat.completions.create(
+                model="gpt-4o", 
+                messages=messages,
+                max_completion_tokens=2500,
+                response_format={"type": "json_object"},
+                frequency_penalty=0.7
             )
 
         response_content = response.choices[0].message.content

@@ -149,14 +149,8 @@ async def schedule_interview_reminders(
     # Логика: Вечер того же дня (19:00). 
     # Если собес назначен на 19:00 или позже -> переносим на следующее утро (11:00).
     
-    followup_time_spb = interview_datetime_spb.replace(hour=19, minute=0, second=0, microsecond=0)
-
-    # Если время собеса >= 19:00 (считаем это поздним вечером)
-    if interview_datetime_spb.time() >= datetime.time(19, 0):
-        # Ставим на завтра на 11:00
-        followup_time_spb = (interview_datetime_spb + datetime.timedelta(days=1)).replace(hour=11, minute=0)
-        logger.info(f"Собеседование позднее ({interview_time_str}), Follow-up перенесен на завтра 11:00.")
-
+    followup_time_spb = (interview_datetime_spb + datetime.timedelta(days=1)).replace(hour=12, minute=0, second=0, microsecond=0)
+    
     followup_time_utc = followup_time_spb.astimezone(datetime.timezone.utc)
 
     # 3. Создаем запись (только 1 шаг, остальные создадутся по цепочке)

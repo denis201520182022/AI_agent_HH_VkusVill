@@ -59,9 +59,17 @@ VACANCY_CACHE_DURATION_MINUTES = 2 # Время кэширования спис�
 REMINDER_START_HOUR_LOCAL = 9  # Например, 9:00 утра
 REMINDER_END_HOUR_LOCAL = 20 # Например, 20:00 вечера (напоминания отправляются до 19:59 включительно)
 
-PRICE_PER_MILLION_INPUT_TOKENS = 0.150  # $0.150 за 1M входных токенов (gpt-4o-mini)
-PRICE_PER_MILLION_OUTPUT_TOKENS = 0.600 # $0.600 за 1M выходных токенов (gpt-4o-mini)
-
+# Цены за 1 миллион токенов ($)
+MODEL_PRICING = {
+    "gpt-4o-mini": {
+        "input": 0.150,
+        "output": 0.600,
+    },
+    "gpt-4o": {  # Тарифы для "умной" модели (валидация дат)
+        "input": 2.500,
+        "output": 10.000,
+    }
+}
 
 def _format_timestamp_to_msk(timestamp_str: str) -> str:
     """
@@ -77,7 +85,6 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
         return "время не определено"
 
 
-
 def _validate_age_in_text(text: str, suggested_age: any) -> bool:
     """
     Проверяет, соответствует ли извлеченный LLM возраст тому, что реально написал пользователь.
@@ -90,18 +97,20 @@ def _validate_age_in_text(text: str, suggested_age: any) -> bool:
     except (ValueError, TypeError):
         return False
 
-    # 1. Простая проверка на вхождение числа как отдельного слова (чтобы не путать с 170см)
-    # Ищем число age_to_check окруженное границами слов
-    if re.search(r'\b' + str(age_to_check) + r'\b', text):
+    # 1. ИСПРАВЛЕННАЯ проверка.
+    # Вместо \b используем (?<!\d) и (?!\d) — это означает "нет цифр слева" и "нет цифр справа".
+    # Это позволит найти "51" в строках "51год", "мне 51.", "возраст 51" и т.д., но отсечет "151" или "510".
+    if re.search(r'(?<!\d)' + str(age_to_check) + r'(?!\d)', text):
         return True
 
-    # 2. Словарь числительных для критического диапазона (14-25 лет), 
-    # так как именно тут LLM чаще всего ошибается
+    # 2. Словарь числительных (оставляем без изменений)
     age_words = {
         14: "четырнадцать", 15: "пятнадцать", 16: "шестнадцать",
         17: "семнадцать", 18: "восемнадцать", 19: "девятнадцать",
         20: "двадцать", 21: "двадцать один", 22: "двадцать два",
-        23: "двадцать три", 24: "двадцать четыре", 25: "двадцать пять"
+        23: "двадцать три", 24: "двадцать четыре", 25: "двадцать пять",
+        26: "двадцать шесть", 27: "двадцать семь", 28: "двадцать восемь",
+        29: "двадцать девять", 30: "тридцать"
     }
 
     if age_to_check in age_words:
@@ -109,21 +118,23 @@ def _validate_age_in_text(text: str, suggested_age: any) -> bool:
         if word in text.lower():
             return True
 
-    # 3. Дополнительная проверка: если в тексте ЕСТЬ другие числа, а нашего нет
-    # Извлекаем все числа 14-70 из текста
+    # 3. Дополнительная проверка (оставляем без изменений)
     all_numbers_in_text = re.findall(r'\b(1[4-9]|[2-6][0-9]|70)\b', text)
     
-    # Если LLM говорит 18, а в тексте только "16" - это явная галлюцинация
     if all_numbers_in_text and str(age_to_check) not in all_numbers_in_text:
+        # Если нашли числа, но нашего среди них нет, пробуем еще раз с мягким поиском
+        # (на случай если re.findall выше что-то упустил из-за границ слов)
+        if re.search(r'(?<!\d)' + str(age_to_check) + r'(?!\d)', text):
+            return True
         logger.warning(f"AGE VALIDATION FAILED: LLM suggested {age_to_check}, but found {all_numbers_in_text} in text.")
         return False
 
-    # Если в тексте вообще нет чисел и слов-чисел, а LLM что-то "придумала"
     if not all_numbers_in_text:
+        # Если чисел вообще не нашли (например "мне полтинник"), а LLM нашла - это подозрительно, но
+        # если мы прошли проверку №1, мы бы уже вернули True.
         return False
 
     return True
-
 
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
@@ -141,37 +152,44 @@ def signal_handler(sig, frame):
     global shutdown_requested
     logger.info("Получен сигнал остановки. Завершаем работу...")
     shutdown_requested = True
-
-async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usage_stats: dict = None):
+async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usage_stats: dict = None, model_name: str = "gpt-4o-mini"):
     """
-    Универсальная функция для подсчета токенов, стоимости и записи логов в БД.
-    Обновляет общую статистику диалога и сохраняет запись в LlmUsageLog.
-    
-    :param context: Строка контекста (например: 'Citizenship_Analysis', 'awaiting_age (RETRY #1)')
-    :param usage_stats: Словарь из ответа LLM. Если None (например, при ошибке), записываются нули.
+    Универсальная функция для подсчета токенов и стоимости.
+    :param model_name: 'gpt-4o-mini' или 'gpt-4o' (для выбора тарифа)
     """
     try:
-        # 1. Извлечение данных (с защитой от None)
+        # 1. Выбор тарифа
+        pricing = MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
+        price_input = pricing["input"]
+        price_output = pricing["output"]
+
+        # 2. Извлечение данных (с защитой от None)
         stats = usage_stats or {}
         p_tokens = stats.get('prompt_tokens', 0)
         c_tokens = stats.get('completion_tokens', 0)
         cached_tokens = stats.get('cached_tokens', 0)
         total_tokens = stats.get('total_tokens', 0)
 
-        # 2. Расчет стоимости
+        # 3. Расчет стоимости
         # Обычные входные токены (минус кеш)
         non_cached_input = max(0, p_tokens - cached_tokens)
         
-        cost_input_regular = (non_cached_input / 1_000_000) * PRICE_PER_MILLION_INPUT_TOKENS
-        cost_input_cached = (cached_tokens / 1_000_000) * (PRICE_PER_MILLION_INPUT_TOKENS / 2)
-        cost_output = (c_tokens / 1_000_000) * PRICE_PER_MILLION_OUTPUT_TOKENS
+        # Расчет:
+        # Input (обычный) * цена
+        # Input (кеш) * (цена / 2) - обычно скидка 50% на кеш у OpenAI, либо измени логику под свой тариф
+        # Output * цена
+        
+        cost_input_regular = (non_cached_input / 1_000_000) * price_input
+        # Для gpt-4o-mini кеш стоит дешевле, для gpt-4o тоже. Обычно 50% от инпута.
+        cost_input_cached = (cached_tokens / 1_000_000) * (price_input / 2) 
+        cost_output = (c_tokens / 1_000_000) * price_output
         
         total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
 
-        # 3. Создание записи лога
+        # 4. Создание записи лога
         usage_log = LlmUsageLog(
             dialogue_id=dialogue.id,
-            dialogue_state_at_call=context,
+            dialogue_state_at_call=f"{context} ({model_name})", # Добавим модель в название стейта для наглядности в админке
             prompt_tokens=p_tokens,
             completion_tokens=c_tokens,
             cached_tokens=cached_tokens,
@@ -180,17 +198,16 @@ async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usa
         )
         db.add(usage_log)
 
-        # 4. Обновление счетчиков диалога (только если были токены)
+        # 5. Обновление счетчиков диалога (только если были токены)
         if total_tokens > 0:
             dialogue.total_prompt_tokens += p_tokens
             dialogue.total_completion_tokens += c_tokens
             dialogue.total_cached_tokens += cached_tokens
             dialogue.total_cost += total_call_cost
 
-        # 5. Сохранение
-        await db.commit()
-        # Refresh нужен, чтобы объект dialogue остался привязан к сессии для дальнейшей работы
-        await db.refresh(dialogue)
+        # 6. Сохранение
+        #await db.commit()
+        #await db.refresh(dialogue)
 
     except Exception as e:
         logger.error(f"Ошибка при логировании токенов ({context}): {e}")
@@ -229,7 +246,7 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
         )
 
         if response and 'usage_stats' in response:
-            await _log_llm_usage(db, dialogue, "Date_Audit_Call", response['usage_stats'])
+            await _log_llm_usage(db, dialogue, "Date_Audit_Call", response['usage_stats'], model_name="gpt-4o")
 
         parsed = response.get('parsed_response', {})
         return parsed.get("correct_date", suggested_date)
@@ -637,65 +654,90 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 
     return "\n\n".join(prompt_pieces)
 
-
 async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruiter: TrackedRecruiter, prompt_library: dict, ctx_logger):
     """
     Обработчик сообщений для режима Follow-up.
-    Использует блок #FOLLOWUP_LOGIC# из гугл-дока.
+    ИСПРАВЛЕННАЯ ВЕРСИЯ: Атомарное обновление истории и pending_messages.
     """
-    ctx_logger.info("⚡ Запуск логики Follow-up (v2)...")
-
+    ctx_logger.info("⚡ Запуск логики Follow-up (v4 - Fixed Atomicity)...")
 
     # 1. Отмена будущих напоминаний (Clean up)
-    # Если кандидат ответил, значит напоминать больше не нужно
-    await db.execute(
-        update(InterviewFollowup)
-        .where(InterviewFollowup.dialogue_id == dialogue.id)
-        .where(InterviewFollowup.status == 'pending')
-        .values(status='cancelled', processed_at=datetime.datetime.now(datetime.timezone.utc))
-    )
-    # Сбрасываем уровень, чтобы основной воркер не вмешивался
-    dialogue.reminder_level = 0
+    if dialogue.reminder_level > 0:
+        await db.execute(
+            update(InterviewFollowup)
+            .where(InterviewFollowup.dialogue_id == dialogue.id)
+            .where(InterviewFollowup.status == 'pending')
+            .values(status='cancelled', processed_at=datetime.datetime.now(datetime.timezone.utc))
+        )
+        dialogue.reminder_level = 0
     
-    # 2. Сбор истории сообщений
+    # 2. Сбор и Дедупликация сообщений (БЕЗ записи в БД пока что)
     pending_messages = dialogue.pending_messages or []
     if not pending_messages:
         return
 
-    # Переносим сообщения из pending в историю и формируем текст для LLM
-    user_text_parts = []
+    # Загружаем текущую историю (immutable копия для логики)
     current_history = list(dialogue.history) if dialogue.history else []
     
+    # Собираем ID, которые УЖЕ есть в истории
+    existing_ids = set()
+    for h in current_history:
+        mid = h.get('message_id')
+        if mid:
+            existing_ids.add(str(mid))
+
+    user_text_parts = []
+    user_entries_to_history = [] # Временный список для новых сообщений
+    
+    # Обрабатываем новые сообщения
     for pm in pending_messages:
-        content = pm.get('content', '') if isinstance(pm, dict) else str(pm)
+        # Извлекаем ID и контент
+        if isinstance(pm, dict):
+            content = pm.get('content', '')
+            msg_id = str(pm.get('message_id', f'unknown_{time.time()}'))
+            msg_timestamp = pm.get('timestamp_msk', datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK'))
+        else:
+            content = str(pm)
+            msg_id = f'legacy_{hash(content)}'
+            msg_timestamp = datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+
+        # Дедупликация: пропускаем, если ID уже есть в истории
+        if msg_id in existing_ids:
+            continue
+        
+        # Запоминаем ID, чтобы не добавить дубль внутри одной пачки
+        existing_ids.add(msg_id)
+        
         user_text_parts.append(content)
         
-        # Добавляем в объект истории
+        # Формируем запись для истории, но НЕ добавляем в dialogue.history прямо сейчас
         new_hist_entry = {
+            'message_id': msg_id,
             'role': 'user', 
             'content': content, 
-            'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+            'timestamp_msk': msg_timestamp
         }
-        current_history.append(new_hist_entry)
+        user_entries_to_history.append(new_hist_entry)
+
+    # Если после фильтрации сообщений нет (все дубли) — чистим очередь и выходим
+    if not user_text_parts:
+        ctx_logger.info("Все сообщения из pending уже есть в истории. Очистка очереди.")
+        dialogue.pending_messages = None
+        await db.commit()
+        return
 
     full_user_text = "\n".join(user_text_parts)
-    # Очищаем очередь, так как мы их обработали
-    dialogue.pending_messages = None 
-    dialogue.history = current_history[-150:] # Сохраняем (с ограничением длины)
+    
+    # ВАЖНО: Формируем "полную" историю только В ПАМЯТИ для контекста LLM.
+    # В БД пока ничего не пишем.
+    history_context_for_llm = current_history + user_entries_to_history
 
     # 3. Формирование Промпта
-    # Основная логика Follow-up
     followup_logic_block = prompt_library.get('#FOLLOWUP_LOGIC#', '')
-    
-    # --- НОВОЕ: Логика перезаписи и Календарь ---
-    scheduling_logic = prompt_library.get('#SCHEDULING_ALGORITHM_FOLLOW_UP#', '')
-    calendar_context = _generate_calendar_context() # Функция должна быть доступна в этом файле
-    # --------------------------------------------
-
-    # Описание вакансии
+    scheduling_logic = prompt_library.get('', '')
+    calendar_context = _generate_calendar_context() 
     vacancy_desc = _find_relevant_vacancy(prompt_library, dialogue.vacancy.title, dialogue.vacancy.city, ctx_logger)
     
-    # Собираем системный промпт со всеми инструкциями
     system_prompt = (
         f"{followup_logic_block}\n\n"
         f"{scheduling_logic}\n\n"
@@ -707,7 +749,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
     try:
         llm_response = await llm_handler.get_bot_response(
             system_prompt=system_prompt,
-            dialogue_history=dialogue.history[-10:], # Последние 10 сообщений для контекста
+            dialogue_history=history_context_for_llm[-10:], # Используем склеенную в памяти историю
             user_message=full_user_text,
             current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
             extra_context={"dialogue_id": dialogue.id, "action": "followup_llm_request"}
@@ -716,74 +758,115 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         parsed = llm_response.get('parsed_response', {})
         usage = llm_response.get('usage_stats')
         
-        # Логируем токены
         if usage:
             await _log_llm_usage(db, dialogue, "Followup_Response", usage)
 
     except Exception as e:
         ctx_logger.error(f"Ошибка LLM в Follow-up: {e}", exc_info=True)
-        return # Выходим, чтобы не поломать данные
+        # Если упала LLM, мы НЕ чистим pending_messages и НЕ сохраняем историю, 
+        # чтобы воркер попробовал снова в следующем цикле.
+        return 
 
-    # 5. Парсинг и Сохранение данных
+    # 5. Парсинг данных
     response_text = parsed.get('response_text')
     extracted_data = parsed.get('extracted_data', {})
-    intent = parsed.get('intent') # Пока просто получаем, но логику переключений не трогаем
+    intent = parsed.get('intent') 
     
     ctx_logger.info(f"LLM Intent: {intent}")
 
-    # Логика сохранения по ТЗ:
-    # interview_result или "no_show_reason_category" сохр в dialogue.interview_result
-    
+    # Сохранение результатов анализа (в объект dialogue, но коммит будет в конце)
     res_interview = extracted_data.get('interview_result')
     res_category = extracted_data.get('no_show_reason_category')
     res_text = extracted_data.get('no_show_reason_text')
 
-    # Приоритет: явный результат > категория неявки
     if res_interview:
         dialogue.interview_result = res_interview
-        ctx_logger.info(f"Сохранен результат собеседования: {res_interview}")
     elif res_category:
         dialogue.interview_result = res_category
-        ctx_logger.info(f"Сохранена категория неявки как результат: {res_category}")
     
-    # Сохраняем текст причины
     if res_text:
         dialogue.no_show_reason = res_text
-        ctx_logger.info("Сохранена причина неявки (текст).")
 
-    # --- НОВОЕ: Обработка перезаписи ---
-    if intent == 'reschedule_finish':
-        # Просто создаем уведомление для рекрутера, дату не парсим (по ТЗ)
-        if not dialogue.rescheduled_alerts:
-            db.add(RescheduledNotificationQueue(dialogue_id=dialogue.id, status='pending'))
+    # --- ОБРАБОТКА ПЕРЕХОДА НА ЗАПИСЬ (RESCHEDULE) ---
+    if intent == 'reschedule_process':
+        ctx_logger.info("Follow-up: Кандидат согласился на перезапись. Переключаем на основной алгоритм.")
         
-        # Можно опционально пометить результат
-        dialogue.interview_result = 'rescheduled'
-        ctx_logger.info("Собеседование перезаписано. Добавлена задача в RescheduledNotificationQueue.")
-    # -----------------------------------
-    
-    # 6. Отправка ответа кандидату
+        # 1. Снимаем флаг Follow-up
+        dialogue.is_followup = False
+        dialogue.need_follow_up_resheduled_sent = True
+        
+        # 2. Меняем стейт на начало записи
+        dialogue.dialogue_state = 'init_scheduling_spb'
+        
+        # 3. Формируем системную команду для основного воркера
+        system_command = {
+            'message_id': f'sys_cmd_reschedule_{time.time()}',
+            'role': 'user',
+            'content': '[SYSTEM COMMAND] Кандидат хочет перенести собеседование (пришел из Follow-up). Начни запись на собеседование в Санкт-Петербурге (предложи выбрать день).'
+        }
+        
+        # 4. СОХРАНЯЕМ ИСТОРИЮ (Важно!)
+        # Нам нужно сохранить сообщения пользователя, которые он написал в follow-up, 
+        # чтобы они остались в истории основного диалога.
+        # current_history + user_entries_to_history (мы их собрали в начале функции)
+        final_history = current_history + user_entries_to_history
+        dialogue.history = final_history[-150:]
+        
+        # 5. Кладем команду в очередь
+        dialogue.pending_messages = [system_command]
+        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+        
+        # 6. Сохраняем и ВЫХОДИМ.
+        # Мы специально НЕ отправляем response_text от Follow-up модели,
+        # так как основная модель в следующем цикле сама сгенерирует вопрос с календарем.
+        await db.commit()
+        return 
+    # -------------------------------------------------
+
+    # 6. Отправка и АТОМАРНОЕ сохранение
+    # Если есть текст ответа - отправляем
     if response_text:
         send_res = await hh_api.send_message(recruiter, db, dialogue.hh_response_id, response_text)
         
         if send_res == 200:
-            # Добавляем ответ бота в историю
+            # УСПЕХ: Теперь формируем финальную историю и сохраняем всё разом
             new_bot_hist = {
+                'message_id': f'bot_followup_{time.time()}',
                 'role': 'assistant',
                 'content': response_text,
                 'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
             }
-            dialogue.history = (dialogue.history or []) + [new_bot_hist]
+            
+            # Соединяем: Старая история + Новые сообщения юзера + Ответ бота
+            final_history = current_history + user_entries_to_history + [new_bot_hist]
+            dialogue.history = final_history[-150:]
+            
+            # Чистим очередь
+            dialogue.pending_messages = None
+            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+            
+            await db.commit() # <--- ЕДИНСТВЕННЫЙ COMMIT
+            ctx_logger.info("Follow-up диалог успешно обновлен и сохранен.")
+            
         elif send_res == 403:
-            ctx_logger.error(f"Не удалось отправить ответ в Follow-up. Код: {send_res}")
+            ctx_logger.error(f"Не удалось отправить ответ (403). Закрываем диалог.")
             dialogue.pending_messages = None
             dialogue.status = 'vacancy_closed_or_resume_not_found'
+            await db.commit()
             
+    else:
+        # Если LLM решила промолчать (странно для follow-up, но допустим)
+        # Мы все равно должны сохранить сообщения пользователя, чтобы не застрять
+        ctx_logger.info("LLM не вернула текст ответа. Сохраняем только сообщения пользователя.")
+        
+        final_history = current_history + user_entries_to_history
+        dialogue.history = final_history[-150:]
+        dialogue.pending_messages = None
+        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+        
+        await db.commit()
 
-    # Обновляем время последнего изменения
-    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-    await db.commit()
-
+    
 
 async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_library: dict, db: AsyncSession):
     """Исправленная версия с правильной работой с ORM"""
@@ -865,7 +948,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # Пересоздаем адаптер с полным набором данных
         ctx_logger = logging.LoggerAdapter(logger, log_context)
 
-        if dialogue.status == 'follow_up':
+        if dialogue.is_followup:
             await _process_followup_logic(db, dialogue, recruiter, prompt_library, ctx_logger)
             return # <--- ВЫХОДИМ, ЧТОБЫ ОСНОВНАЯ ЛОГИКА НЕ МЕШАЛА
         # =========================================================================
@@ -952,7 +1035,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             await _log_llm_usage(db, dialogue, f"Citizenship_Analysis (RETRY #{i+1})")
                             
                     
-                    await db.commit()
+                    #await db.commit()
+                    await db.flush()
                     await db.refresh(dialogue)
 
                     # 3. Обработка полученного результата
@@ -1184,68 +1268,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             raise ValueError(f"Invalid state returned by LLM: {new_state}")
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
 
-        # --- [START] БЛОК ВЕРИФИКАЦИИ ДАТЫ И ПОВТОРНОЙ ГЕНЕРАЦИИ ---
-        extracted_data = llm_response.get("extracted_data")
-        
-        # 1. Проверяем, прислала ли модель дату
-        if extracted_data and extracted_data.get("interview_date"):
-            suggested_date = extracted_data["interview_date"]
-            suggested_time = extracted_data.get("interview_time", "время не указано")
-
-            # 2. Проверяем, НЕТ ЛИ уже записанной даты в БД (interview_datetime_utc)
-            # Если дата уже есть, мы игнорируем попытки LLM назначить новую (защита от перезаписи)
-        
-            # 3. Запускаем Аудит (Deep Check)
-            ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {suggested_date}")
-            
-            cal_context = _generate_calendar_context_2()
-            # История: старая + то что юзер прислал сейчас
-            full_hist = (dialogue.history or []) + user_entries_to_history
-            
-            verified_date = await _verify_date_audit(db, dialogue, suggested_date, full_hist, cal_context, log_context)
-
-            # 4. СРАВНИВАЕМ
-            if verified_date != suggested_date and verified_date != "none":
-                ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {suggested_date}, Аудитор: {verified_date}")
-
-                # Отправляем алерт в ТГ
-                user_text_now = " ".join(all_masked_content)
-                full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
-                
-                from hr_bot.utils.data_verification_notifier import send_date_conflict_alert # Импортируй заранее
-                await send_date_conflict_alert(
-                    dialogue_id=dialogue.id,
-                    hh_response_id=dialogue.hh_response_id,
-                    user_said=user_text_now,
-                    llm_suggested=suggested_date,
-                    verified_date=verified_date,
-                    history_text=full_hist_text
-                )
-
-                # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
-                correction_cmd = {
-                    'message_id': f'sys_date_corr_{time.time()}',
-                    'role': 'user',
-                    'content': (
-                        f"[SYSTEM INSTRUCTION] В прошлом шаге ты ошибся и предложил дату {suggested_date}. "
-                        f"На самом деле пользователь выбрал {verified_date} (согласно календарю). "
-                        f"Сгенерируй ответ заново, подтвердив правильную дату ({verified_date}) и время ({suggested_time}). "
-                        f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
-                    )
-                }
-
-                # Кладем в очередь и прерываем текущий цикл (не отправляем сообщение в HH!)
-                dialogue.pending_messages = [correction_cmd]
-                dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                
-                # Сохраняем историю (чтобы не потерять сообщение юзера, которое мы только что обработали)
-                dialogue.history = (dialogue.history or []) + user_entries_to_history
-                
-                await db.commit()
-                ctx_logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
-                return # ВЫХОДИМ ИЗ ФУНКЦИИ. Сообщение в HH не уйдет.
-
-        # --- [END] БЛОК ВЕРИФИКАЦИИ ДАТЫ ---
 
         # Обновляем статус
         if dialogue.status == 'new':
@@ -1609,6 +1631,143 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 )
         # --------------------------------------------------
 
+        if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status == 'qualified':
+            
+            # --- ДОБАВИТЬ ЭТОТ БЛОК КОДА ---
+            if new_state == 'interview_scheduled_spb':
+                interview_date = extracted_data.get("interview_date")
+                interview_time = extracted_data.get("interview_time")
+
+
+                # [START] ВАЛИДАЦИЯ ДАТЫ ПЕРЕД ЗАПИСЬЮ
+                if interview_date:
+                    # Используем уже извлеченную переменную interview_date как suggested_date
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {interview_date}")
+                    
+                    cal_context = _generate_calendar_context_2()
+                    # История: старая + то что юзер прислал сейчас
+                    full_hist = (dialogue.history or []) + user_entries_to_history
+                    
+                    verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
+
+                    # СРАВНИВАЕМ
+                    if verified_date != interview_date and verified_date != "none":
+                        ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
+
+                        # Отправляем алерт в ТГ
+                        user_text_now = " ".join(all_masked_content)
+                        full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
+                        
+                        from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
+                        await send_date_conflict_alert(
+                            dialogue_id=dialogue.id,
+                            hh_response_id=dialogue.hh_response_id,
+                            user_said=user_text_now,
+                            llm_suggested=interview_date,
+                            verified_date=verified_date,
+                            history_text=full_hist_text
+                        )
+
+                        # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
+                        correction_cmd = {
+                            'message_id': f'sys_date_corr_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM INSTRUCTION] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
+                                f"На самом деле пользователь выбрал {verified_date} (согласно календарю). "
+                                f"Сгенерируй ответ заново, подтвердив правильную дату ({verified_date}) и время ({interview_time}). "
+                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
+                            )
+                        }
+
+                        # Кладем в очередь
+                        dialogue.pending_messages = [correction_cmd]
+                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        
+                        # Сохраняем историю
+                        dialogue.history = (dialogue.history or []) + user_entries_to_history
+                        
+                        # ВАЖНО: Мы уже успели поставить статус qualified выше. 
+                        # Но так как мы делаем return, сообщение кандидату не уйдет, 
+                        # а в следующем цикле бот исправится.
+                        await db.commit()
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
+                        return # <--- ПРЕРЫВАЕМ ТЕКУЩУЮ ОБРАБОТКУ
+                # [END] ВАЛИДАЦИЯ ДАТЫ
+
+                # [START] ОБРАБОТКА ПЕРЕНОСА (RESCHEDULE)
+                # Если у диалога УЖЕ была записана дата (interview_datetime_utc не пустой), 
+                # значит кандидат перезаписывается.
+                    if dialogue.interview_datetime_utc is not None:
+                        ctx_logger.info(
+                            f"[{dialogue.hh_response_id}] 🔄 Обнаружен перенос собеседования. Старая дата в БД: {dialogue.interview_datetime_utc}."
+                        )
+
+                        # 1. Если это перенос после Follow-up (по флагу) -> RescheduledNotificationQueue
+                        if dialogue.need_follow_up_resheduled_sent:
+                            ctx_logger.info(
+                                f"[{dialogue.hh_response_id}] Флаг need_follow_up_resheduled_sent=True. "
+                                f"Создаю уведомление в RescheduledNotificationQueue."
+                            )
+                            
+                            if dialogue.rescheduled_alerts:
+                                # Обновляем существующую запись
+                                if dialogue.rescheduled_alerts.status != 'pending':
+                                    dialogue.rescheduled_alerts.status = 'pending'
+                                    dialogue.rescheduled_alerts.processed_at = None
+                                    db.add(dialogue.rescheduled_alerts)
+                            else:
+                                # Создаем новую
+                                new_resched_alert = RescheduledNotificationQueue(
+                                    dialogue_id=dialogue.id,
+                                    status='pending'
+                                )
+                                db.add(new_resched_alert)
+
+                            dialogue.need_follow_up_resheduled_sent = False
+                        
+                        # 2. Иначе (обычный перенос) -> DeclinedInterviewNotificationQueue
+                        else:
+                            ctx_logger.info(
+                                f"[{dialogue.hh_response_id}] Обычный перенос (флаг False). "
+                                f"Создаю уведомление в DeclinedInterviewNotificationQueue."
+                            )
+                            
+                            if dialogue.declined_interview_alerts:
+                                # Обновляем существующую запись
+                                if dialogue.declined_interview_alerts.status != 'pending':
+                                    dialogue.declined_interview_alerts.status = 'pending'
+                                    dialogue.declined_interview_alerts.processed_at = None
+                                    db.add(dialogue.declined_interview_alerts)
+                            else:
+                                # Создаем новую
+                                reschedule_alert = DeclinedInterviewNotificationQueue(
+                                    dialogue_id=dialogue.id,
+                                    status='pending'
+                                )
+                                db.add(reschedule_alert)
+                    # [END] ОБРАБОТКА ПЕРЕНОСА
+
+                if interview_date and interview_time:
+                    ctx_logger.info(
+                        f"Собеседование запланировано для диалога {dialogue.id} на "
+                        f"{interview_date} в {interview_time} (СПБ). Планирую напоминания."
+                    )
+                    await interview_reminder_manager.schedule_interview_reminders(
+                        dialogue_id=dialogue.id,
+                        interview_date_str=interview_date,
+                        interview_time_str=interview_time,
+                        db_session=db
+                    )
+                    dialogue.state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                    
+                else:
+                    ctx_logger.error(
+                        f"LLM установил 'interview_scheduled_spb', но не предоставил "
+                        f"interview_date или interview_time для диалога {dialogue.id}. Напоминания не будут запланированы."
+                    )
+            # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
         if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status != 'qualified':
             dialogue.status = 'qualified'
 
@@ -1638,6 +1797,63 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 interview_date = extracted_data.get("interview_date")
                 interview_time = extracted_data.get("interview_time")
 
+
+                # [START] ВАЛИДАЦИЯ ДАТЫ ПЕРЕД ЗАПИСЬЮ
+                if interview_date:
+                    # Используем уже извлеченную переменную interview_date как suggested_date
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {interview_date}")
+                    
+                    cal_context = _generate_calendar_context_2()
+                    # История: старая + то что юзер прислал сейчас
+                    full_hist = (dialogue.history or []) + user_entries_to_history
+                    
+                    verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
+
+                    # СРАВНИВАЕМ
+                    if verified_date != interview_date and verified_date != "none":
+                        ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
+
+                        # Отправляем алерт в ТГ
+                        user_text_now = " ".join(all_masked_content)
+                        full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
+                        
+                        from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
+                        await send_date_conflict_alert(
+                            dialogue_id=dialogue.id,
+                            hh_response_id=dialogue.hh_response_id,
+                            user_said=user_text_now,
+                            llm_suggested=interview_date,
+                            verified_date=verified_date,
+                            history_text=full_hist_text
+                        )
+
+                        # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
+                        correction_cmd = {
+                            'message_id': f'sys_date_corr_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM INSTRUCTION] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
+                                f"На самом деле пользователь выбрал {verified_date} (согласно календарю). "
+                                f"Сгенерируй ответ заново, подтвердив правильную дату ({verified_date}) и время ({interview_time}). "
+                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
+                            )
+                        }
+
+                        # Кладем в очередь
+                        dialogue.pending_messages = [correction_cmd]
+                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        
+                        # Сохраняем историю
+                        dialogue.history = (dialogue.history or []) + user_entries_to_history
+                        
+                        # ВАЖНО: Мы уже успели поставить статус qualified выше. 
+                        # Но так как мы делаем return, сообщение кандидату не уйдет, 
+                        # а в следующем цикле бот исправится.
+                        await db.commit()
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
+                        return # <--- ПРЕРЫВАЕМ ТЕКУЩУЮ ОБРАБОТКУ
+                # [END] ВАЛИДАЦИЯ ДАТЫ
+
                 if interview_date and interview_time:
                     ctx_logger.info(
                         f"Собеседование запланировано для диалога {dialogue.id} на "
@@ -1649,6 +1865,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         interview_time_str=interview_time,
                         db_session=db
                     )
+                    dialogue.state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                    
                 else:
                     ctx_logger.error(
                         f"LLM установил 'interview_scheduled_spb', но не предоставил "

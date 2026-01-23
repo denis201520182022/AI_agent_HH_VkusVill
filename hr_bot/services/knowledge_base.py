@@ -11,7 +11,7 @@ if __name__ == '__main__':
 
 logger = logging.getLogger(__name__)
 
-DOCUMENT_ID = '1rVenA2akaMaoMYLj7GAxZxlqwZS0X3j0NlZtsBSNp_8'
+DOCUMENT_ID = '1JjXxElQhUyo3fPttvHq6ECvBeB4e0NvOd5W4ITMSgUI'
 SCOPES = ['https://www.googleapis.com/auth/documents.readonly']
 SERVICE_ACCOUNT_FILE = 'credentials.json' # Убедись, что файл лежит в корне проекта, откуда запускаешь скрипт
 CACHE_TTL_SECONDS = 120

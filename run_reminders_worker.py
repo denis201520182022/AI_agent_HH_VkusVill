@@ -651,9 +651,7 @@ async def check_and_send_followups():
                             settings.balance -= cost
                             settings.total_spent_on_followups += cost
                             
-                            dialogue.dialogue_state = 'follow_up_initial'
-                            dialogue.status = 'follow_up'
-                            dialogue.interview_result = 'started_followup'
+                            
 
                             # История
                             new_hist = {
@@ -662,6 +660,7 @@ async def check_and_send_followups():
                                 'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
                             }
                             dialogue.history = (list(dialogue.history) if dialogue.history else []) + [new_hist]
+                            dialogue.is_followup = True
 
                             # Планируем Шаг 2 (через 1 час)
                             next_time_utc = now_utc + datetime.timedelta(hours=1)
