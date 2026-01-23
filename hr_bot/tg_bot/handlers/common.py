@@ -11,6 +11,14 @@ from sqlalchemy import func, cast, Date
 from sqlalchemy.orm import Session
 from aiogram.utils.formatting import Text, Bold, Italic
 
+from hr_bot.tg_bot.keyboards import (
+    user_keyboard, admin_keyboard, 
+    stats_main_menu_keyboard, stats_regular_keyboard,      # Добавлено
+    stats_followup_keyboard, back_to_stats_main_keyboard,  # Добавлено
+    export_date_options_keyboard, 
+    cancel_fsm_keyboard, create_stats_export_keyboard
+)
+
 from hr_bot.db.models import (
     TelegramUser, Statistic, Vacancy, TrackedRecruiter,
     InactiveNotificationQueue, RejectedNotificationQueue, NotificationQueue, Dialogue
@@ -319,3 +327,33 @@ async def generate_and_send_excel(message: Message, start_date: date, end_date: 
     )
     await msg_wait.delete()
     await state.clear()
+
+
+# 1. Обработка выбора "Обычная статистика"
+@router.callback_query(F.data == "stats_regular")
+async def stats_regular_choice(callback: CallbackQuery):
+    await callback.message.edit_text("Выбрана обычная статистика. Выберите формат:", reply_markup=stats_regular_keyboard)
+    await callback.answer()
+
+# 2. Обработка выбора "Молчуны" (Заглушка)
+@router.callback_query(F.data == "stats_silent")
+async def stats_silent_choice(callback: CallbackQuery):
+    await callback.message.edit_text("🤐 Раздел 'Молчуны' находится в разработке.", reply_markup=back_to_stats_main_keyboard)
+    await callback.answer()
+
+# 3. Обработка выбора "Follow up"
+@router.callback_query(F.data == "stats_followup")
+async def stats_followup_choice(callback: CallbackQuery):
+    await callback.message.edit_text("Выбрана статистика Follow up. Выберите формат:", reply_markup=stats_followup_keyboard)
+    await callback.answer()
+
+# 4. Возврат в главное меню статистики
+@router.callback_query(F.data == "stats_back_to_main")
+async def stats_back_to_main(callback: CallbackQuery):
+    await callback.message.edit_text("Выберите режим работы со статистикой:", reply_markup=stats_main_menu_keyboard)
+    await callback.answer()
+
+# 5. Заглушки для кнопок внутри Follow up
+@router.callback_query(F.data.in_(["followup_7days_stub", "followup_excel_stub"]))
+async def followup_stubs(callback: CallbackQuery):
+    await callback.answer("Данная функция для Follow up пока не реализована", show_alert=True)

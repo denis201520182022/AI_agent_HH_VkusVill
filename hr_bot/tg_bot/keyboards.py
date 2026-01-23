@@ -30,12 +30,38 @@ admin_keyboard = ReplyKeyboardMarkup(
 
 # --- Inline-клавиатуры для Статистики ---
 
-# Главное меню статистики
+# --- Новое меню статистики ---
+
+# Главный уровень
 stats_main_menu_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text="👁️ Посмотреть за 7 дней (текст)", callback_data="view_stats_7days")],
-        [InlineKeyboardButton(text="📥 Выгрузить в Excel (выбор дат)", callback_data="export_excel_start")]
+        [InlineKeyboardButton(text="📊 Обычная статистика", callback_data="stats_regular")],
+        [InlineKeyboardButton(text="🤐 Молчуны", callback_data="stats_silent")],
+        [InlineKeyboardButton(text="🔄 Follow up", callback_data="stats_followup")]
     ]
+)
+
+# Подменю: Обычная статистика
+stats_regular_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="👁️ Посмотреть за 7 дней (текст)", callback_data="view_stats_7days")],
+        [InlineKeyboardButton(text="📥 Выгрузить в Excel", callback_data="export_excel_start")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="stats_back_to_main")]
+    ]
+)
+
+# Подменю: Follow up
+stats_followup_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="👁️ За 7 дней (заглушка)", callback_data="followup_7days_stub")],
+        [InlineKeyboardButton(text="📥 Выгрузить Excel (заглушка)", callback_data="followup_excel_stub")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="stats_back_to_main")]
+    ]
+)
+
+# Кнопка возврата для заглушек
+back_to_stats_main_keyboard = InlineKeyboardMarkup(
+    inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="stats_back_to_main")]]
 )
 
 # Быстрые диапазоны для Excel
