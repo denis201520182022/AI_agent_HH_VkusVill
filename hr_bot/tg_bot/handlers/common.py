@@ -73,7 +73,7 @@ def _build_followup_7day_stats_content(db_session: Session) -> Text:
             # Пришли (успех или отказ)
             visited = base_query.filter(Dialogue.interview_result.in_(['success', 'refusal', 'self_refusal'])).count()
             # Не пришли (есть категория причины)
-            no_shows = base_query.filter(Dialogue.no_show_reason_category.is_not(None)).count()
+            no_shows = base_query.filter(Dialogue.no_show_reason.is_not(None)).count()
 
             day_str = day.strftime('%d.%m (%a)')
             content_parts.extend([
@@ -117,9 +117,9 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
             "Был в дожиме": 1 if d.was_in_followup else 0,
             "Переносов": d.reschedule_count or 0,
             "Пришел": 1 if d.interview_result in ['success', 'refusal', 'self_refusal'] else 0,
-            "Не пришел": 1 if d.no_show_reason_category else 0,
+            "Не пришел": 1 if d.no_show_reason else 0,
             "Результат": d.interview_result or "-",
-            "Категория причины": d.no_show_reason_category or "-"
+            "Категория причины": d.no_show_reason or "-"
         })
 
     df_base = pd.DataFrame(rows)

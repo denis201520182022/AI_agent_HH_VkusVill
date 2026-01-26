@@ -1,7 +1,7 @@
 
 source venv/bin/activate
 
-alembic revision --autogenerate -m "Фоллоу2"
+alembic revision --autogenerate -m "Cnfn2"
 alembic upgrade head
 
 
