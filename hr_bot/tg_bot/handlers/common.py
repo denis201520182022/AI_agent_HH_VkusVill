@@ -89,6 +89,8 @@ def _build_followup_7day_stats_content(db_session: Session) -> Text:
     if not has_data:
         return Text("📊 Данных по Follow-up за 7 дней не найдено.")
     return Text(*content_parts)
+
+
 async def generate_followup_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
     msg_wait = await message.answer("⏳ Формирую детальную аналитику по Follow-up...")
     
@@ -123,7 +125,8 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
             "Взяли_число": 1 if d.interview_result == 'success' else 0,
             "Отказали_число": 1 if d.interview_result == 'refusal' else 0,
             "Сами отказались_число": 1 if d.interview_result == 'self_refusal' else 0,
-            "Не пришло": 1 if (d.no_show_reason or d.no_show_reason) else 0
+            "Не пришло": 1 if (d.no_show_reason or d.no_show_reason) else 0,
+            "Причина неявки": d.no_show_reason or "-"
         })
 
     df_base = pd.DataFrame(rows)
@@ -208,11 +211,27 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
 
         for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
-            ws.set_column('A:A', 20, num_fmt)
-            ws.set_column('B:E', 15, num_fmt)
-            ws.set_column('F:H', 18, perc_fmt) # Колонки процентов (Взяли, Отказали, Сами)
-            ws.set_column('I:I', 15, num_fmt)
-            ws.set_column('J:J', 22, perc_fmt) # Доходимость
+            
+            # А) ЗАКРЕПЛЯЕМ ШАПКУ (первая строка всегда видна при прокрутке)
+            ws.freeze_panes(1, 0)
+            
+            # Б) АВТОМАТИЧЕСКАЯ ШИРИНА СТОЛБЦОВ
+            # Берем данные из соответствующего DataFrame для этого листа
+            if sheet_name == 'Свод по датам': current_df = df_date
+            elif sheet_name == 'Свод по рекрутерам': current_df = df_rec
+            elif sheet_name == 'Свод по городам': current_df = df_city
+            elif sheet_name == 'Свод по вакансиям': current_df = df_vac
+            else: current_df = df_base # 'Общий список'
+
+            for i, col in enumerate(current_df.columns):
+                # Вычисляем максимальную длину: либо название колонки, либо самое длинное значение в ней
+                column_len = max(
+                    current_df[col].astype(str).str.len().max(), # Самое длинное значение
+                    len(str(col))                                # Длина заголовка
+                ) + 3 # Добавляем небольшой запас
+                
+                # Устанавливаем ширину (если заголовок с процентами, делаем чуть шире)
+                ws.set_column(i, i, column_len, num_fmt if '%' not in col else perc_fmt)
 
     output.seek(0)
     await message.answer_document(
