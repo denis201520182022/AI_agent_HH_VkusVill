@@ -1333,70 +1333,124 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ (для Time Selection и Final Booking)
         # =====================================================================
         # Список состояний, в которых нам критично важно, чтобы дата была верной
-        DATE_CRITICAL_STATES = ['scheduling_spb_time', 'interview_scheduled_spb']
+        DATE_CRITICAL_STATES = ['scheduling_spb_day','scheduling_spb_time', 'interview_scheduled_spb']
 
         if new_state in DATE_CRITICAL_STATES:
             interview_date = extracted_data.get("interview_date")
             interview_time = extracted_data.get("interview_time")
 
             if interview_date:
-                ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором (в состоянии {new_state}): {interview_date}")
-                
-                cal_context = _generate_calendar_context_2()
-                # История: старая + то, что юзер прислал сейчас
-                full_hist = (dialogue.history or []) + user_entries_to_history
-                
-                verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
 
-                # СРАВНИВАЕМ
-                if verified_date != interview_date and verified_date != "none":
-                    ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
-
-                    # --- ВЫЧИСЛЯЕМ ДЕНЬ НЕДЕЛИ ---
-                    try:
-                        v_date_obj = datetime.datetime.strptime(verified_date, '%Y-%m-%d')
-                        weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-                        v_weekday = weekdays_ru[v_date_obj.weekday()]
-                    except Exception:
-                        v_weekday = "указанный день"
-
-                    # Отправляем алерт в ТГ
-                    user_text_now = " ".join(all_masked_content)
-                    full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
+                # ЭТАП 0: Python-подсказка дня недели (Hint)
+                # ---------------------------------------------------------
+                try:
+                    # 1. Вычисляем реальный день недели через Python
+                    v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
+                    weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+                    correct_weekday = weekdays_ru[v_date_obj.weekday()]
                     
-                    await send_date_conflict_alert(
-                        dialogue_id=dialogue.id,
-                        hh_response_id=dialogue.hh_response_id,
-                        user_said=user_text_now,
-                        llm_suggested=interview_date,
-                        verified_date=f"{verified_date} ({v_weekday})",
-                        history_text=full_hist_text
+                    # 2. Формируем маркер команды для проверки на дубликаты
+                    hint_marker = f"[SYSTEM COMMAND] Внимание!!! {interview_date} это  {correct_weekday}!!! Учти это при генерации ответа."
+                    
+                    # 3. Проверяем последние 4 сообщения в истории на наличие этого маркера
+                    history_to_check = (dialogue.history or [])[-4:]
+                    already_hinted = any(hint_marker in str(m.get('content', '')) for m in history_to_check)
+                    
+                    if not already_hinted:
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Добавляю подсказку дня недели: {interview_date} -> {correct_weekday}")
+                        
+                        hint_cmd = {
+                            'message_id': f'sys_hint_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM COMMAND] Внимание!!! {interview_date} это  {correct_weekday}!!! Учти это при генерации ответа.")
+                        }
+                        
+                        # Сохраняем текущий прогресс истории и отправляем на перегенерацию
+                        dialogue.history = (dialogue.history or []) + [hint_cmd]
+                        dialogue.pending_messages = user_entries_to_history
+                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        
+                        await db.commit()
+                        return # <--- Уходим на перегенерацию
+                except Exception as e:
+                    ctx_logger.error(f"Ошибка в этапе Hint валидации даты: {e}")
+
+                # --- НОВАЯ ПРОВЕРКА: Сравнение с данными в БД ---
+                already_stored_date_str = None
+                if dialogue.interview_datetime_utc:
+                    # Конвертируем UTC из базы в дату МСК для корректного сравнения
+                    already_stored_date_str = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE).strftime('%Y-%m-%d')
+                
+                # Если даты совпадают, пропускаем дорогой аудит
+                if already_stored_date_str == interview_date:
+                    ctx_logger.info(
+                        f"[{dialogue.hh_response_id}] Дата {interview_date} уже подтверждена в БД. Пропуск аудита.",
+                        extra={"action": "skip_audit_date_match"}
                     )
+                    # Чтобы логика не шла в ветку аудита, оборачиваем её в else или используем флаг
+                    run_audit = False
+                else:
+                    run_audit = True
 
-                    # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
-                    # Добавляем день недели в инструкцию, чтобы LLM исправила и текст, и JSON
-                    correction_cmd = {
-                        'message_id': f'sys_date_corr_{time.time()}',
-                        'role': 'user',
-                        'content': (
-                            f"[SYSTEM COMMAND] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
-                            f"На самом деле пользователь выбрал {v_weekday} ({verified_date}) согласно календарю. "
-                            f"Сгенерируй ответ заново, подтвердив ПРАВИЛЬНУЮ дату ({v_weekday}, {verified_date}). "
-                            f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
-                        )
-                    }
-
-                    # Кладем в очередь и сохраняем историю
-                    dialogue.pending_messages = [correction_cmd]
-                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                    dialogue.history = (dialogue.history or []) + user_entries_to_history
+                if run_audit:
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором (в состоянии {new_state}): {interview_date}")
                     
-                    await db.commit()
-                    ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление даты ({v_weekday}).")
-                    return # <--- ПРЕРЫВАЕМ обработку, сообщение кандидату НЕ уходит
-        # =====================================================================
-        # [END] КОНЕЦ БЛОКА ВАЛИДАЦИИ
-        # =====================================================================
+                    cal_context = _generate_calendar_context_2()
+                    # История: старая + то, что юзер прислал сейчас
+                    full_hist = (dialogue.history or []) + user_entries_to_history
+                    
+                    verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
+
+                    # СРАВНИВАЕМ
+                    if verified_date != interview_date and verified_date != "none":
+                        ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
+
+                        # --- ВЫЧИСЛЯЕМ ДЕНЬ НЕДЕЛИ ---
+                        try:
+                            v_date_obj = datetime.datetime.strptime(verified_date, '%Y-%m-%d')
+                            weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+                            v_weekday = weekdays_ru[v_date_obj.weekday()]
+                        except Exception:
+                            v_weekday = "указанный день"
+
+                        # Отправляем алерт в ТГ
+                        user_text_now = " ".join(all_masked_content)
+                        full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
+                        
+                        await send_date_conflict_alert(
+                            dialogue_id=dialogue.id,
+                            hh_response_id=dialogue.hh_response_id,
+                            user_said=user_text_now,
+                            llm_suggested=interview_date,
+                            verified_date=f"{verified_date} ({v_weekday})",
+                            history_text=full_hist_text
+                        )
+
+                        # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
+                        # Добавляем день недели в инструкцию, чтобы LLM исправила и текст, и JSON
+                        correction_cmd = {
+                            'message_id': f'sys_date_corr_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM COMMAND] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
+                                f"На самом деле пользователь выбрал {v_weekday} ({verified_date}) согласно календарю. "
+                                f"Сгенерируй ответ заново, подтвердив ПРАВИЛЬНУЮ дату ({v_weekday}, {verified_date}). "
+                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
+                            )
+                        }
+
+                        # Кладем в очередь и сохраняем историю
+                        dialogue.pending_messages = [correction_cmd]
+                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        dialogue.history = (dialogue.history or []) + user_entries_to_history
+                        
+                        await db.commit()
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление даты ({v_weekday}).")
+                        return # <--- ПРЕРЫВАЕМ обработку, сообщение кандидату НЕ уходит
+            # =====================================================================
+            # [END] КОНЕЦ БЛОКА ВАЛИДАЦИИ
+            # =====================================================================
 
         # Обновляем статус
         if dialogue.status == 'new':
