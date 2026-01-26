@@ -661,6 +661,7 @@ async def check_and_send_followups():
                             }
                             dialogue.history = (list(dialogue.history) if dialogue.history else []) + [new_hist]
                             dialogue.is_followup = True
+                            dialogue.was_in_followup = True
 
                             # Планируем Шаг 2 (через 1 час)
                             next_time_utc = now_utc + datetime.timedelta(hours=1)

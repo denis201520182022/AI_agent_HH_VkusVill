@@ -1738,6 +1738,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                         dialogue.need_follow_up_resheduled_sent = False
                         dialogue.dialogue_state = 'post_qualification_chat'
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Счетчик переносов увеличен: {dialogue.reschedule_count}")
+                        dialogue.reschedule_count = (dialogue.reschedule_count or 0) + 1
                     
                     # 2. Иначе (обычный перенос) -> DeclinedInterviewNotificationQueue
                     else:

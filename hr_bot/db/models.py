@@ -150,6 +150,8 @@ class Dialogue(Base):
     need_follow_up_resheduled_sent = Column(Boolean, default=False, server_default='false')
     interview_result = Column(String(50), nullable=True) 
     no_show_reason = Column(Text, nullable=True)
+    was_in_followup = Column(Boolean, default=False, server_default='false')
+    reschedule_count = Column(Integer, default=0, server_default='0')
 
     # --- ДОБАВИТЬ ЭТИ ПОЛЯ ДЛЯ СТАТИСТИКИ ТОКЕНОВ ---
     total_prompt_tokens = Column(Integer, nullable=False, default=0, server_default='0')

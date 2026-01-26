@@ -50,6 +50,140 @@ router = Router()
 class ExportStates(StatesGroup):
     waiting_for_range = State()
 
+class FollowupExportStates(StatesGroup):
+    waiting_for_range = State()
+
+
+def _build_followup_7day_stats_content(db_session: Session) -> Text:
+    content_parts = [Bold("🤖 Статистика Follow-up (7 дней):"), "\n\n"]
+    days = [date.today() - timedelta(days=i) for i in range(7)]
+    has_data = False
+
+    for day in days:
+        # Назначено (любые диалоги, где есть дата собеса на этот день создания)
+        base_query = db_session.query(Dialogue).filter(cast(Dialogue.created_at, Date) == day, Dialogue.interview_datetime_utc.is_not(None))
+        total_sched = base_query.count()
+
+        if total_sched > 0:
+            has_data = True
+            # Вступили в дожим
+            fu_entered = base_query.filter(Dialogue.was_in_followup == True).count()
+            # Переназначено (был в FU и есть переносы)
+            resched = base_query.filter(Dialogue.was_in_followup == True, Dialogue.reschedule_count > 0).count()
+            # Пришли (успех или отказ)
+            visited = base_query.filter(Dialogue.interview_result.in_(['success', 'refusal', 'self_refusal'])).count()
+            # Не пришли (есть категория причины)
+            no_shows = base_query.filter(Dialogue.no_show_reason_category.is_not(None)).count()
+
+            day_str = day.strftime('%d.%m (%a)')
+            content_parts.extend([
+                Bold(f"📅 {day_str}"), "\n",
+                f"   Назначено: {total_sched}\n",
+                f"   - Вступили в дожим: {fu_entered}\n",
+                f"   - Переназначено: {resched}\n",
+                f"   - ✅ Пришли: {visited}\n",
+                f"   - ❌ Не пришли: {no_shows}\n",
+                "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+            ])
+
+    if not has_data:
+        return Text("📊 Данных по Follow-up за 7 дней не найдено.")
+    return Text(*content_parts)
+
+async def generate_followup_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
+    msg_wait = await message.answer("⏳ Формирую детальную аналитику по Follow-up...")
+    
+    # 1. СБОР ДАННЫХ
+    query = db.query(Dialogue).filter(
+        cast(Dialogue.created_at, Date) >= start_date,
+        cast(Dialogue.created_at, Date) <= end_date,
+        Dialogue.interview_datetime_utc.is_not(None)
+    )
+    dialogues = query.all()
+
+    if not dialogues:
+        await msg_wait.edit_text("🤷 За этот период назначенных собеседований не найдено.")
+        await state.clear()
+        return
+
+    rows = []
+    for d in dialogues:
+        rows.append({
+            "Дата": d.created_at.strftime("%d.%m.%Y"),
+            "Рекрутер": d.recruiter.name if d.recruiter else "Не указан",
+            "Город": d.vacancy.city if d.vacancy else "Не указан",
+            "Вакансия": d.vacancy.title if d.vacancy else "Не указана",
+            "Назначено": 1,
+            "Был в дожиме": 1 if d.was_in_followup else 0,
+            "Переносов": d.reschedule_count or 0,
+            "Пришел": 1 if d.interview_result in ['success', 'refusal', 'self_refusal'] else 0,
+            "Не пришел": 1 if d.no_show_reason_category else 0,
+            "Результат": d.interview_result or "-",
+            "Категория причины": d.no_show_reason_category or "-"
+        })
+
+    df_base = pd.DataFrame(rows)
+
+    # 2. ФУНКЦИЯ ДЛЯ СВОДНЫХ ЛИСТОВ (как в основной стате)
+    def create_fu_summary(groupby_col):
+        summary = df_base.groupby(groupby_col).agg({
+            'Назначено': 'sum',
+            'Был в дожиме': 'sum',
+            'Переносов': 'sum',
+            'Пришел': 'sum',
+            'Не пришел': 'sum'
+        }).reset_index()
+        
+        # Считаем конверсии для Follow-up
+        summary['Доходимость %'] = (summary['Пришел'] / summary['Назначено']).fillna(0)
+        summary['Доля дожимов %'] = (summary['Был в дожиме'] / summary['Назначено']).fillna(0)
+        
+        # Итоговая строка
+        total = summary.sum(numeric_only=True)
+        total[groupby_col] = 'ИТОГО'
+        # Пересчет конверсий для ИТОГО
+        t_sch = total['Назначено'] if total['Назначено'] > 0 else 1
+        total['Доходимость %'] = total['Пришел'] / t_sch
+        total['Доля дожимов %'] = total['Был в дожиме'] / t_sch
+        
+        return pd.concat([summary, pd.DataFrame([total])], ignore_index=True)
+
+    # Генерируем листы
+    df_date = create_fu_summary('Дата')
+    df_rec = create_fu_summary('Рекрутер')
+    df_city = create_fu_summary('Город')
+    df_vac = create_fu_summary('Вакансия')
+
+    # 3. ЗАПИСЬ В EXCEL
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
+        df_rec.to_excel(writer, index=False, sheet_name='Свод по рекрутерам')
+        df_city.to_excel(writer, index=False, sheet_name='Свод по городам')
+        df_vac.to_excel(writer, index=False, sheet_name='Свод по вакансиям')
+        df_base.to_excel(writer, index=False, sheet_name='Общий список')
+
+        # Форматирование (копируем стиль основного отчета)
+        workbook = writer.book
+        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1})
+        num_fmt = workbook.add_format({'border': 1})
+
+        for sheet_name in writer.sheets:
+            ws = writer.sheets[sheet_name]
+            ws.set_column('A:Z', 18, num_fmt)
+            # Ищем колонки с процентами и красим их
+            if sheet_name != 'Общий список':
+                ws.set_column(6, 7, 18, perc_fmt) # Колонки G и H (Доходимость и Доля дожимов)
+
+    output.seek(0)
+    await message.answer_document(
+        BufferedInputFile(output.read(), filename=f"Followup_Report_{start_date}_{end_date}.xlsx"),
+        caption=f"📈 Детальная аналитика по дожимам ({start_date} - {end_date})"
+    )
+    await msg_wait.delete()
+    await state.clear()
+
+
 def _build_7day_stats_content(db_session: Session) -> Text:
     content_parts = [Bold("📊 Статистика за последние 7 дней:"), "\n", Italic("(взаимоисключающие категории)"), "\n\n"]
     
@@ -101,6 +235,12 @@ def _build_7day_stats_content(db_session: Session) -> Text:
 
     if not has_any_data:
         return Text("📊 Данных за последние 7 дней не найдено.")
+
+
+
+
+
+
 
     return Text(*content_parts)
 @router.message(CommandStart())
@@ -329,31 +469,65 @@ async def generate_and_send_excel(message: Message, start_date: date, end_date: 
     await state.clear()
 
 
-# 1. Обработка выбора "Обычная статистика"
+
+
+
+# Кнопка "Статистика за 7 дней" в меню Follow-up
+@router.callback_query(F.data == "followup_7days_stats")
+async def view_followup_text_stats(callback: CallbackQuery, db_session: Session):
+    content = _build_followup_7day_stats_content(db_session)
+    # Добавили reply_markup, чтобы можно было вернуться в меню
+    await callback.message.edit_text(**content.as_kwargs(), reply_markup=back_to_stats_main_keyboard)
+    await callback.answer()
+
+# Кнопка "Экспорт в Excel" в меню Follow-up
+@router.callback_query(F.data == "followup_excel_start") # Проверь этот callback_data в клавиатуре
+async def followup_export_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(FollowupExportStates.waiting_for_range)
+    await callback.message.answer(
+        "📊 [FOLLOW-UP] За какой период выгрузить Excel?",
+        reply_markup=export_date_options_keyboard
+    )
+    await callback.answer()
+
+# Обработка выбора диапазона (быстрые кнопки)
+@router.callback_query(FollowupExportStates.waiting_for_range, F.data.startswith("export_range_"))
+async def followup_export_quick(callback: CallbackQuery, state: FSMContext, db_session: Session):
+    days_count = int(callback.data.split("_")[-1])
+    start_date = date.today() - timedelta(days=days_count-1)
+    await generate_followup_excel(callback.message, start_date, date.today(), db_session, state)
+    await callback.answer()
+
+# Обработка ручного ввода даты
+@router.message(FollowupExportStates.waiting_for_range)
+async def followup_export_manual(message: Message, state: FSMContext, db_session: Session):
+    try:
+        parts = message.text.split("-")
+        start_date = datetime.strptime(parts[0].strip(), "%d.%m.%Y").date()
+        end_date = datetime.strptime(parts[1].strip(), "%d.%m.%Y").date()
+        await generate_followup_excel(message, start_date, end_date, db_session, state)
+    except Exception:
+        await message.answer("❌ Формат: 01.01.2024 - 10.01.2024")
+
+# Обработка выбора "Обычная статистика"
 @router.callback_query(F.data == "stats_regular")
 async def stats_regular_choice(callback: CallbackQuery):
     await callback.message.edit_text("Выбрана обычная статистика. Выберите формат:", reply_markup=stats_regular_keyboard)
     await callback.answer()
 
-# 2. Обработка выбора "Молчуны" (Заглушка)
-@router.callback_query(F.data == "stats_silent")
-async def stats_silent_choice(callback: CallbackQuery):
-    await callback.message.edit_text("🤐 Раздел 'Молчуны' находится в разработке.", reply_markup=back_to_stats_main_keyboard)
-    await callback.answer()
-
-# 3. Обработка выбора "Follow up"
+# Обработка выбора "Follow up"
 @router.callback_query(F.data == "stats_followup")
 async def stats_followup_choice(callback: CallbackQuery):
     await callback.message.edit_text("Выбрана статистика Follow up. Выберите формат:", reply_markup=stats_followup_keyboard)
     await callback.answer()
 
-# 4. Возврат в главное меню статистики
+# Возврат в главное меню статистики
 @router.callback_query(F.data == "stats_back_to_main")
 async def stats_back_to_main(callback: CallbackQuery):
     await callback.message.edit_text("Выберите режим работы со статистикой:", reply_markup=stats_main_menu_keyboard)
     await callback.answer()
 
-# 5. Заглушки для кнопок внутри Follow up
-@router.callback_query(F.data.in_(["followup_7days_stub", "followup_excel_stub"]))
-async def followup_stubs(callback: CallbackQuery):
-    await callback.answer("Данная функция для Follow up пока не реализована", show_alert=True)
+
+@router.callback_query(F.data == "stats_silent")
+async def stats_silent_handler(callback: CallbackQuery):
+    await callback.answer("Раздел 'Молчуны' в разработке", show_alert=True)

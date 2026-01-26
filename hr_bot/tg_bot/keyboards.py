@@ -51,10 +51,11 @@ stats_regular_keyboard = InlineKeyboardMarkup(
 )
 
 # Подменю: Follow up
+# Подменю: Follow up (ИСПРАВЛЕНО)
 stats_followup_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
-        [InlineKeyboardButton(text="👁️ За 7 дней (заглушка)", callback_data="followup_7days_stub")],
-        [InlineKeyboardButton(text="📥 Выгрузить Excel (заглушка)", callback_data="followup_excel_stub")],
+        [InlineKeyboardButton(text="👁️ Посмотреть за 7 дней (текст)", callback_data="followup_7days_stats")],
+        [InlineKeyboardButton(text="📥 Выгрузить в Excel", callback_data="followup_excel_start")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="stats_back_to_main")]
     ]
 )
