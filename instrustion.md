@@ -1,7 +1,7 @@
 
 source venv/bin/activate
 
-alembic revision --autogenerate -m "Фоллоу"
+alembic revision --autogenerate -m "Фоллоу2"
 alembic upgrade head
 
 

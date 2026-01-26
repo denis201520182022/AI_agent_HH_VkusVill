@@ -791,34 +791,31 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
     if intent == 'reschedule_process':
         ctx_logger.info("Follow-up: Кандидат согласился на перезапись. Переключаем на основной алгоритм.")
         
-        # 1. Снимаем флаг Follow-up
         dialogue.is_followup = False
         dialogue.need_follow_up_resheduled_sent = True
+        dialogue.dialogue_state = 'init_scheduling_spb' # Было .state (исправлено)
         
-        # 2. Меняем стейт на начало записи
-        dialogue.dialogue_state = 'init_scheduling_spb'
-        
-        # 3. Формируем системную команду для основного воркера
         system_command = {
             'message_id': f'sys_cmd_reschedule_{time.time()}',
             'role': 'user',
             'content': '[SYSTEM COMMAND] Кандидат хочет перенести собеседование (пришел из Follow-up). Начни запись на собеседование в Санкт-Петербурге (предложи выбрать день).'
         }
+
+        # ТРЕТИЙ ПУНКТ: Сохраняем системную команду в историю
+        sys_hist_entry = {
+            'message_id': system_command['message_id'],
+            'role': 'system_command',
+            'content': system_command['content'],
+            'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+        }
         
-        # 4. СОХРАНЯЕМ ИСТОРИЮ (Важно!)
-        # Нам нужно сохранить сообщения пользователя, которые он написал в follow-up, 
-        # чтобы они остались в истории основного диалога.
-        # current_history + user_entries_to_history (мы их собрали в начале функции)
-        final_history = current_history + user_entries_to_history
+        # Сохраняем: старая история + ответы юзера + системная команда
+        final_history = current_history + user_entries_to_history + [sys_hist_entry]
         dialogue.history = final_history[-150:]
         
-        # 5. Кладем команду в очередь
         dialogue.pending_messages = [system_command]
         dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
         
-        # 6. Сохраняем и ВЫХОДИМ.
-        # Мы специально НЕ отправляем response_text от Follow-up модели,
-        # так как основная модель в следующем цикле сама сгенерирует вопрос с календарем.
         await db.commit()
         return 
     # -------------------------------------------------
@@ -834,7 +831,9 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
                 'message_id': f'bot_followup_{time.time()}',
                 'role': 'assistant',
                 'content': response_text,
-                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
+                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK'),
+                'extracted_data': extracted_data, # Добавлено
+                'state': 'followup'               # Добавлено
             }
             
             # Соединяем: Старая история + Новые сообщения юзера + Ответ бота
@@ -1267,7 +1266,74 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Вызываем ошибку, чтобы откатить транзакцию (db.rollback) и не сохранять мусор в БД
             raise ValueError(f"Invalid state returned by LLM: {new_state}")
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
+        # =====================================================================
+        # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ (для Time Selection и Final Booking)
+        # =====================================================================
+        # Список состояний, в которых нам критично важно, чтобы дата была верной
+        DATE_CRITICAL_STATES = ['scheduling_spb_time', 'interview_scheduled_spb']
 
+        if new_state in DATE_CRITICAL_STATES:
+            interview_date = extracted_data.get("interview_date")
+            interview_time = extracted_data.get("interview_time")
+
+            if interview_date:
+                ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором (в состоянии {new_state}): {interview_date}")
+                
+                cal_context = _generate_calendar_context_2()
+                # История: старая + то, что юзер прислал сейчас
+                full_hist = (dialogue.history or []) + user_entries_to_history
+                
+                verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
+
+                # СРАВНИВАЕМ
+                if verified_date != interview_date and verified_date != "none":
+                    ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
+
+                    # --- ВЫЧИСЛЯЕМ ДЕНЬ НЕДЕЛИ ---
+                    try:
+                        v_date_obj = datetime.datetime.strptime(verified_date, '%Y-%m-%d')
+                        weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+                        v_weekday = weekdays_ru[v_date_obj.weekday()]
+                    except Exception:
+                        v_weekday = "указанный день"
+
+                    # Отправляем алерт в ТГ
+                    user_text_now = " ".join(all_masked_content)
+                    full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
+                    
+                    await send_date_conflict_alert(
+                        dialogue_id=dialogue.id,
+                        hh_response_id=dialogue.hh_response_id,
+                        user_said=user_text_now,
+                        llm_suggested=interview_date,
+                        verified_date=f"{verified_date} ({v_weekday})",
+                        history_text=full_hist_text
+                    )
+
+                    # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
+                    # Добавляем день недели в инструкцию, чтобы LLM исправила и текст, и JSON
+                    correction_cmd = {
+                        'message_id': f'sys_date_corr_{time.time()}',
+                        'role': 'user',
+                        'content': (
+                            f"[SYSTEM COMMAND] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
+                            f"На самом деле пользователь выбрал {v_weekday} ({verified_date}) согласно календарю. "
+                            f"Сгенерируй ответ заново, подтвердив ПРАВИЛЬНУЮ дату ({v_weekday}, {verified_date}). "
+                            f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
+                        )
+                    }
+
+                    # Кладем в очередь и сохраняем историю
+                    dialogue.pending_messages = [correction_cmd]
+                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                    dialogue.history = (dialogue.history or []) + user_entries_to_history
+                    
+                    await db.commit()
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление даты ({v_weekday}).")
+                    return # <--- ПРЕРЫВАЕМ обработку, сообщение кандидату НЕ уходит
+        # =====================================================================
+        # [END] КОНЕЦ БЛОКА ВАЛИДАЦИИ
+        # =====================================================================
 
         # Обновляем статус
         if dialogue.status == 'new':
@@ -1639,134 +1705,83 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 interview_time = extracted_data.get("interview_time")
 
 
-                # [START] ВАЛИДАЦИЯ ДАТЫ ПЕРЕД ЗАПИСЬЮ
-                if interview_date:
-                    # Используем уже извлеченную переменную interview_date как suggested_date
-                    ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {interview_date}")
-                    
-                    cal_context = _generate_calendar_context_2()
-                    # История: старая + то что юзер прислал сейчас
-                    full_hist = (dialogue.history or []) + user_entries_to_history
-                    
-                    verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
+                
 
-                    # СРАВНИВАЕМ
-                    if verified_date != interview_date and verified_date != "none":
-                        ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
-
-                        # Отправляем алерт в ТГ
-                        user_text_now = " ".join(all_masked_content)
-                        full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
-                        
-                        from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
-                        await send_date_conflict_alert(
-                            dialogue_id=dialogue.id,
-                            hh_response_id=dialogue.hh_response_id,
-                            user_said=user_text_now,
-                            llm_suggested=interview_date,
-                            verified_date=verified_date,
-                            history_text=full_hist_text
-                        )
-
-                        # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
-                        correction_cmd = {
-                            'message_id': f'sys_date_corr_{time.time()}',
-                            'role': 'user',
-                            'content': (
-                                f"[SYSTEM INSTRUCTION] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
-                                f"На самом деле пользователь выбрал {verified_date} (согласно календарю). "
-                                f"Сгенерируй ответ заново, подтвердив правильную дату ({verified_date}) и время ({interview_time}). "
-                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
-                            )
-                        }
-
-                        # Кладем в очередь
-                        dialogue.pending_messages = [correction_cmd]
-                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                        
-                        # Сохраняем историю
-                        dialogue.history = (dialogue.history or []) + user_entries_to_history
-                        
-                        # ВАЖНО: Мы уже успели поставить статус qualified выше. 
-                        # Но так как мы делаем return, сообщение кандидату не уйдет, 
-                        # а в следующем цикле бот исправится.
-                        await db.commit()
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
-                        return # <--- ПРЕРЫВАЕМ ТЕКУЩУЮ ОБРАБОТКУ
-                # [END] ВАЛИДАЦИЯ ДАТЫ
-
-                # [START] ОБРАБОТКА ПЕРЕНОСА (RESCHEDULE)
-                # Если у диалога УЖЕ была записана дата (interview_datetime_utc не пустой), 
-                # значит кандидат перезаписывается.
-                    if dialogue.interview_datetime_utc is not None:
-                        ctx_logger.info(
-                            f"[{dialogue.hh_response_id}] 🔄 Обнаружен перенос собеседования. Старая дата в БД: {dialogue.interview_datetime_utc}."
-                        )
-
-                        # 1. Если это перенос после Follow-up (по флагу) -> RescheduledNotificationQueue
-                        if dialogue.need_follow_up_resheduled_sent:
-                            ctx_logger.info(
-                                f"[{dialogue.hh_response_id}] Флаг need_follow_up_resheduled_sent=True. "
-                                f"Создаю уведомление в RescheduledNotificationQueue."
-                            )
-                            
-                            if dialogue.rescheduled_alerts:
-                                # Обновляем существующую запись
-                                if dialogue.rescheduled_alerts.status != 'pending':
-                                    dialogue.rescheduled_alerts.status = 'pending'
-                                    dialogue.rescheduled_alerts.processed_at = None
-                                    db.add(dialogue.rescheduled_alerts)
-                            else:
-                                # Создаем новую
-                                new_resched_alert = RescheduledNotificationQueue(
-                                    dialogue_id=dialogue.id,
-                                    status='pending'
-                                )
-                                db.add(new_resched_alert)
-
-                            dialogue.need_follow_up_resheduled_sent = False
-                        
-                        # 2. Иначе (обычный перенос) -> DeclinedInterviewNotificationQueue
-                        else:
-                            ctx_logger.info(
-                                f"[{dialogue.hh_response_id}] Обычный перенос (флаг False). "
-                                f"Создаю уведомление в DeclinedInterviewNotificationQueue."
-                            )
-                            
-                            if dialogue.declined_interview_alerts:
-                                # Обновляем существующую запись
-                                if dialogue.declined_interview_alerts.status != 'pending':
-                                    dialogue.declined_interview_alerts.status = 'pending'
-                                    dialogue.declined_interview_alerts.processed_at = None
-                                    db.add(dialogue.declined_interview_alerts)
-                            else:
-                                # Создаем новую
-                                reschedule_alert = DeclinedInterviewNotificationQueue(
-                                    dialogue_id=dialogue.id,
-                                    status='pending'
-                                )
-                                db.add(reschedule_alert)
-                    # [END] ОБРАБОТКА ПЕРЕНОСА
-
-                if interview_date and interview_time:
+            # [START] ОБРАБОТКА ПЕРЕНОСА (RESCHEDULE)
+            # Если у диалога УЖЕ была записана дата (interview_datetime_utc не пустой), 
+            # значит кандидат перезаписывается.
+                if dialogue.interview_datetime_utc is not None:
                     ctx_logger.info(
-                        f"Собеседование запланировано для диалога {dialogue.id} на "
-                        f"{interview_date} в {interview_time} (СПБ). Планирую напоминания."
+                        f"[{dialogue.hh_response_id}] 🔄 Обнаружен перенос собеседования. Старая дата в БД: {dialogue.interview_datetime_utc}."
                     )
-                    await interview_reminder_manager.schedule_interview_reminders(
-                        dialogue_id=dialogue.id,
-                        interview_date_str=interview_date,
-                        interview_time_str=interview_time,
-                        db_session=db
-                    )
-                    dialogue.state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+
+                    # 1. Если это перенос после Follow-up (по флагу) -> RescheduledNotificationQueue
+                    if dialogue.need_follow_up_resheduled_sent:
+                        ctx_logger.info(
+                            f"[{dialogue.hh_response_id}] Флаг need_follow_up_resheduled_sent=True. "
+                            f"Создаю уведомление в RescheduledNotificationQueue."
+                        )
+                        
+                        if dialogue.rescheduled_alerts:
+                            # Обновляем существующую запись
+                            if dialogue.rescheduled_alerts.status != 'pending':
+                                dialogue.rescheduled_alerts.status = 'pending'
+                                dialogue.rescheduled_alerts.processed_at = None
+                                db.add(dialogue.rescheduled_alerts)
+                        else:
+                            # Создаем новую
+                            new_resched_alert = RescheduledNotificationQueue(
+                                dialogue_id=dialogue.id,
+                                status='pending'
+                            )
+                            db.add(new_resched_alert)
+
+                        dialogue.need_follow_up_resheduled_sent = False
+                        dialogue.dialogue_state = 'post_qualification_chat'
                     
+                    # 2. Иначе (обычный перенос) -> DeclinedInterviewNotificationQueue
+                    else:
+                        ctx_logger.info(
+                            f"[{dialogue.hh_response_id}] Обычный перенос (флаг False). "
+                            f"Создаю уведомление в DeclinedInterviewNotificationQueue."
+                        )
+                        
+                        if dialogue.declined_interview_alerts:
+                            # Обновляем существующую запись
+                            if dialogue.declined_interview_alerts.status != 'pending':
+                                dialogue.declined_interview_alerts.status = 'pending'
+                                dialogue.declined_interview_alerts.processed_at = None
+                                db.add(dialogue.declined_interview_alerts)
+                        else:
+                            # Создаем новую
+                            reschedule_alert = DeclinedInterviewNotificationQueue(
+                                dialogue_id=dialogue.id,
+                                status='pending'
+                            )
+                            
+                            db.add(reschedule_alert)
+                        dialogue.dialogue_state = 'post_qualification_chat'
+                # [END] ОБРАБОТКА ПЕРЕНОСА
                 else:
-                    ctx_logger.error(
-                        f"LLM установил 'interview_scheduled_spb', но не предоставил "
-                        f"interview_date или interview_time для диалога {dialogue.id}. Напоминания не будут запланированы."
-                    )
-            # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+                    if interview_date and interview_time:
+                        ctx_logger.info(
+                            f"Собеседование запланировано для диалога {dialogue.id} на "
+                            f"{interview_date} в {interview_time} (СПБ). Планирую напоминания."
+                        )
+                        await interview_reminder_manager.schedule_interview_reminders(
+                            dialogue_id=dialogue.id,
+                            interview_date_str=interview_date,
+                            interview_time_str=interview_time,
+                            db_session=db
+                        )
+                        dialogue.dialogue_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                        
+                    else:
+                        ctx_logger.error(
+                            f"LLM установил 'interview_scheduled_spb', но не предоставил "
+                            f"interview_date или interview_time для диалога {dialogue.id}. Напоминания не будут запланированы."
+                        )
+        # --- КОНЕЦ ДОБАВЛЕНИЯ ---
 
         if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status != 'qualified':
             dialogue.status = 'qualified'
@@ -1798,61 +1813,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 interview_time = extracted_data.get("interview_time")
 
 
-                # [START] ВАЛИДАЦИЯ ДАТЫ ПЕРЕД ЗАПИСЬЮ
-                if interview_date:
-                    # Используем уже извлеченную переменную interview_date как suggested_date
-                    ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором: {interview_date}")
-                    
-                    cal_context = _generate_calendar_context_2()
-                    # История: старая + то что юзер прислал сейчас
-                    full_hist = (dialogue.history or []) + user_entries_to_history
-                    
-                    verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
-
-                    # СРАВНИВАЕМ
-                    if verified_date != interview_date and verified_date != "none":
-                        ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
-
-                        # Отправляем алерт в ТГ
-                        user_text_now = " ".join(all_masked_content)
-                        full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
-                        
-                        from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
-                        await send_date_conflict_alert(
-                            dialogue_id=dialogue.id,
-                            hh_response_id=dialogue.hh_response_id,
-                            user_said=user_text_now,
-                            llm_suggested=interview_date,
-                            verified_date=verified_date,
-                            history_text=full_hist_text
-                        )
-
-                        # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
-                        correction_cmd = {
-                            'message_id': f'sys_date_corr_{time.time()}',
-                            'role': 'user',
-                            'content': (
-                                f"[SYSTEM INSTRUCTION] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
-                                f"На самом деле пользователь выбрал {verified_date} (согласно календарю). "
-                                f"Сгенерируй ответ заново, подтвердив правильную дату ({verified_date}) и время ({interview_time}). "
-                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
-                            )
-                        }
-
-                        # Кладем в очередь
-                        dialogue.pending_messages = [correction_cmd]
-                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                        
-                        # Сохраняем историю
-                        dialogue.history = (dialogue.history or []) + user_entries_to_history
-                        
-                        # ВАЖНО: Мы уже успели поставить статус qualified выше. 
-                        # Но так как мы делаем return, сообщение кандидату не уйдет, 
-                        # а в следующем цикле бот исправится.
-                        await db.commit()
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Диалог отправлен на повторную генерацию с исправленной датой.")
-                        return # <--- ПРЕРЫВАЕМ ТЕКУЩУЮ ОБРАБОТКУ
-                # [END] ВАЛИДАЦИЯ ДАТЫ
 
                 if interview_date and interview_time:
                     ctx_logger.info(
@@ -1865,7 +1825,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         interview_time_str=interview_time,
                         db_session=db
                     )
-                    dialogue.state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                    dialogue.dialogue_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
                     
                 else:
                     ctx_logger.error(
