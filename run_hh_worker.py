@@ -402,61 +402,71 @@ def _generate_calendar_context() -> str:
     """
     moscow_tz = ZoneInfo("Europe/Moscow")
     current_datetime_utc = datetime.datetime.now(moscow_tz)
-    weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
     
-    # Словарь для склонения в "следующий/следующая/следующее"
+    weekdays_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    months_ru = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+    ]
+    
+    # Склонения для "следующий"
     weekday_next_form = {
-        "понедельник": "Следующий понедельник",
-        "вторник": "Следующий вторник",
-        "среда": "Следующая среда",
-        "четверг": "Следующий четверг",
-        "пятница": "Следующая пятница",
-        "суббота": "Следующая суббота",
-        "воскресенье": "Следующее воскресенье"
+        "Понедельник": "Следующий понедельник",
+        "Вторник": "Следующий вторник",
+        "Среда": "Следующая среда",
+        "Четверг": "Следующий четверг",
+        "Пятница": "Следующая пятница",
+        "Суббота": "Следующая суббота",
+        "Воскресенье": "Следующее воскресенье"
     }
 
     current_weekday = weekdays_ru[current_datetime_utc.weekday()]
-    current_date_str = current_datetime_utc.strftime("%Y-%m-%d")
+    current_date_str = current_datetime_utc.strftime("%Y.%m.%d")
     current_time_str = current_datetime_utc.strftime("%H:%M")
 
-    # Собираем информацию о днях недели для отслеживания повторений
-    weekday_occurrences = {}
-    
     calendar_context_lines = []
-    for i in range(14):
+    
+    # Генерируем на 21 день (3 недели)
+    for i in range(21):
         date_cursor = current_datetime_utc + datetime.timedelta(days=i)
-        wd_name = weekdays_ru[date_cursor.weekday()]
-        date_str = date_cursor.strftime("%Y-%m-%d")
+        wd_idx = date_cursor.weekday()
+        wd_name = weekdays_ru[wd_idx]
         
-        # Отслеживаем, сколько раз встречался этот день недели
-        if wd_name not in weekday_occurrences:
-            weekday_occurrences[wd_name] = 0
-        weekday_occurrences[wd_name] += 1
+        day = date_cursor.day
+        month_name = months_ru[date_cursor.month - 1]
+        date_dotted = date_cursor.strftime("%Y.%m.%d")
         
-        # Формируем префикс и суффикс
-        prefix = ""
-        suffix = ""
-        
+        # Определяем статус (сегодня/завтра/послезавтра или просто день)
         if i == 0:
-            prefix = "(СЕГОДНЯ) "
-            suffix = " ← ТЫ ЗДЕСЬ"
-            day_label = wd_name.capitalize()
+            status = "сегодня "
+            label = wd_name
         elif i == 1:
-            prefix = "(ЗАВТРА) "
-            day_label = wd_name.capitalize()
+            status = "завтра "
+            label = wd_name
         elif i == 2:
-            prefix = "(ПОСЛЕЗАВТРА) "
-            day_label = wd_name.capitalize()
+            status = "послезавтра "
+            label = wd_name
+        elif 7 <= i < 14:
+            # Вторая неделя
+            status = ""
+            label = weekday_next_form[wd_name]
+        elif i >= 14:
+            # Третья неделя
+            status = ""
+            label = f"Через неделю в {wd_name.lower()}"
         else:
-            # Для остальных дней
-            if weekday_occurrences[wd_name] == 2:
-                # Второе упоминание дня недели - добавляем "Следующий"
-                day_label = weekday_next_form[wd_name]
-            else:
-                # Первое упоминание или третье+ - просто название с заглавной
-                day_label = wd_name.capitalize()
+            status = ""
+            label = wd_name
         
-        calendar_context_lines.append(f"{prefix}{date_str} {day_label}{suffix}")
+        # Формируем строку по вашему шаблону
+        # сегодня Понедельник - 26 января - дата: 2026.01.26
+        line = f"{status}{label} - {day} {month_name} - дата: {date_dotted}"
+        
+        # Добавляем маркер текущего дня для модели
+        if i == 0:
+            line += " ← ТЫ ЗДЕСЬ"
+            
+        calendar_context_lines.append(line)
 
     calendar_string = "\n".join(calendar_context_lines)
 
@@ -493,67 +503,89 @@ def _generate_calendar_context() -> str:
     return calendar_context
 
 
+
+
 def _generate_calendar_context_2() -> str:
     """
     Генерирует текстовый блок с календарем и правилами работы с датами.
+    
+    Генерирует расширенный текстовый блок с календарем на 3 недели.
+    Формат: сегодня Понедельник - 26 января - дата: 2026.01.26
     """
     moscow_tz = ZoneInfo("Europe/Moscow")
     current_datetime_utc = datetime.datetime.now(moscow_tz)
-    weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
     
-    # Словарь для склонения в "следующий/следующая/следующее"
+    weekdays_ru = ["Понедельник", "Вторник", "Среда", "Четверг", "Пятница", "Суббота", "Воскресенье"]
+    months_ru = [
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря"
+    ]
+
+
+    
+    # Склонения для "следующий"
     weekday_next_form = {
-        "понедельник": "Следующий понедельник",
-        "вторник": "Следующий вторник",
-        "среда": "Следующая среда",
-        "четверг": "Следующий четверг",
-        "пятница": "Следующая пятница",
-        "суббота": "Следующая суббота",
-        "воскресенье": "Следующее воскресенье"
+        "Понедельник": "Следующий понедельник",
+        "Вторник": "Следующий вторник",
+        "Среда": "Следующая среда",
+        "Четверг": "Следующий четверг",
+        "Пятница": "Следующая пятница",
+        "Суббота": "Следующая суббота",
+        "Воскресенье": "Следующее воскресенье"
     }
 
     current_weekday = weekdays_ru[current_datetime_utc.weekday()]
-    current_date_str = current_datetime_utc.strftime("%Y-%m-%d")
+    current_date_str = current_datetime_utc.strftime("%Y.%m.%d")
     current_time_str = current_datetime_utc.strftime("%H:%M")
 
-    # Собираем информацию о днях недели для отслеживания повторений
-    weekday_occurrences = {}
-    
     calendar_context_lines = []
-    for i in range(14):
+
+# Заголовок таблицы (очень важно для GPT)
+    calendar_context_lines.append(
+        "IDX | DATE | WEEKDAY | RELATIVE | HUMAN_LABEL | MARKER"
+    )
+
+    for i in range(21):
         date_cursor = current_datetime_utc + datetime.timedelta(days=i)
-        wd_name = weekdays_ru[date_cursor.weekday()]
-        date_str = date_cursor.strftime("%Y-%m-%d")
-        
-        # Отслеживаем, сколько раз встречался этот день недели
-        if wd_name not in weekday_occurrences:
-            weekday_occurrences[wd_name] = 0
-        weekday_occurrences[wd_name] += 1
-        
-        # Формируем префикс и суффикс
-        prefix = ""
-        suffix = ""
-        
+        wd_idx = date_cursor.weekday()
+        wd_name = weekdays_ru[wd_idx]
+
+        day = date_cursor.day
+        month_name = months_ru[date_cursor.month - 1]
+        date_dotted = date_cursor.strftime("%Y.%m.%d")
+
+        # Определяем статус
         if i == 0:
-            prefix = "(СЕГОДНЯ) "
-            suffix = " ← ТЫ ЗДЕСЬ"
-            day_label = wd_name.capitalize()
+            relative = "СЕГОДНЯ"
+            human_label = f"сегодня {wd_name} - {day} {month_name}"
         elif i == 1:
-            prefix = "(ЗАВТРА) "
-            day_label = wd_name.capitalize()
+            relative = "ЗАВТРА"
+            human_label = f"завтра {wd_name} - {day} {month_name}"
         elif i == 2:
-            prefix = "(ПОСЛЕЗАВТРА) "
-            day_label = wd_name.capitalize()
+            relative = "ПОСЛЕЗАВТРА"
+            human_label = f"послезавтра {wd_name} - {day} {month_name}"
+        elif 7 <= i < 14:
+            relative = "СЛЕДУЮЩАЯ_НЕДЕЛЯ"
+            human_label = f"{weekday_next_form[wd_name]} - {day} {month_name}"
+        elif i >= 14:
+            relative = "ЧЕРЕЗ_НЕДЕЛЮ"
+            human_label = f"Через неделю в {wd_name.lower()} - {day} {month_name}"
         else:
-            # Для остальных дней
-            if weekday_occurrences[wd_name] == 2:
-                # Второе упоминание дня недели - добавляем "Следующий"
-                day_label = weekday_next_form[wd_name]
-            else:
-                # Первое упоминание или третье+ - просто название с заглавной
-                day_label = wd_name.capitalize()
-        
-        calendar_context_lines.append(f"{prefix}{date_str} {day_label}{suffix}")
+            relative = ""
+            human_label = f"{wd_name} - {day} {month_name}"
+
+        marker = "ТЫ_ЗДЕСЬ" if i == 0 else ""
+
+        line = (
+            f"{i} | "
+            f"{date_dotted} | "
+            f"{wd_name} | "
+            f"{relative} | "
+            f"{human_label} | "
+            f"{marker}"
+        )
+
+        calendar_context_lines.append(line)
 
     calendar_string = "\n".join(calendar_context_lines)
 
@@ -563,30 +595,61 @@ def _generate_calendar_context_2() -> str:
         f"СЕГОДНЯ: {current_weekday}, {current_date_str}\n\n"
         f"СЕЙЧАС: {current_time_str} (МСК)\n"
         f"⚠️ ВАЖНО: Ты ОЧЕНЬ ПЛОХО считаешь даты в уме. НИКОГДА НЕ ВЫЧИСЛЯЙ ДАТЫ САМОСТОЯТЕЛЬНО!\n"
-        f"Используй ТОЛЬКО эту таблицу (таблица начинается с СЕГОДНЯ и идет на 14 дней вперед):\n\n"
+        f"Используй ТОЛЬКО эту таблицу (таблица начинается с СЕГОДНЯ и идет на 21 дней вперед):\n\n"
         f"{calendar_string}\n\n"
+
+        f"ОПИСАНИЕ КОЛОНОК:\n"
+        f"IDX — порядковый номер строки\n"
+        f"DATE — дата (ЕДИНСТВЕННЫЙ источник истины)\n"
+        f"WEEKDAY — день недели\n"
+        f"RELATIVE — относительный статус дня\n"
+        f"HUMAN_LABEL — человекочитаемая подпись\n"
+        f"MARKER — специальные метки (например, ТЫ_ЗДЕСЬ)\n\n"
+
         f"ПРАВИЛА РАБОТЫ С ДАТАМИ:\n"
-        f"1. Кандидат говорит просто день недели ('понедельник', 'вторник'):\n"
-        f"   → Найди ПЕРВУЮ строку с этим днем (без слова 'Следующий')\n"
-        f"   → Скопируй дату из этой строки\n\n"
-        f"2. Если кандидат говорит 'СЛЕДУЮЩИЙ [день недели]' (например, 'следующий понедельник'):\n"
-        f"   → Бери такой день из списка выше, где написано 'СЛЕДУЮЩИЙ [день недели]' (например, 'следующий понедельник')\n\n"
-        f"   → Скопируй дату из этой строки\n\n"
-        f"4. Если кандидат говорит 'сегодня', 'завтра', 'послезавтра':\n"
-        f"   → Ищи в списке пометку 'СЕГОДНЯ', 'ЗАВТРА' или 'ПОСЛЕЗАВТРА'\n\n"
-        f"5. Если кандидат называет дату:\n"
-        f"   →  Ищи в списке эту дату и бери ее\n\n"
-        f"6. Если кандидат называет день недели который совпадает с сегодняшним, но не говорит 'сегодня', то он имеет ввиду этот день недели на следующей недели \n"
-        
-        f"7. ВСЕГДА копируй дату ТОЧНО из таблицы в формате YYYY-MM-DD\n"
-        f"8. НИКОГДА не изобретай даты сам - только из этой таблицы!\n"
+        f"1. Если кандидат говорит ТОЛЬКО день недели ('понедельник', 'вторник'):\n"
+        f"   → Найди ПЕРВУЮ строку, где WEEKDAY совпадает\n"
+        f"   → И поле RELATIVE пустое\n"
+        f"   → Скопируй DATE\n\n"
+
+        f"2. Если кандидат говорит 'СЛЕДУЮЩИЙ <день недели>' (например, 'следующий понедельник'):\n"
+        f"   → Найди строку, где WEEKDAY совпадает\n"
+        f"   → И RELATIVE = СЛЕДУЮЩАЯ_НЕДЕЛЯ\n"
+        f"   → Скопируй DATE\n\n"
+
+        f"3. Если кандидат говорит 'сегодня':\n"
+        f"   → Найди строку, где RELATIVE = СЕГОДНЯ\n"
+        f"   → Скопируй DATE\n\n"
+
+        f"4. Если кандидат говорит 'завтра':\n"
+        f"   → Найди строку, где RELATIVE = ЗАВТРА\n"
+        f"   → Скопируй DATE\n\n"
+
+        f"5. Если кандидат говорит 'послезавтра':\n"
+        f"   → Найди строку, где RELATIVE = ПОСЛЕЗАВТРА\n"
+        f"   → Скопируй DATE\n\n"
+
+        f"6. Если кандидат называет дату:\n"
+        f"   → Найди строку, где DATE совпадает\n"
+        f"   → Используй эту DATE\n\n"
+
+        f"7. Если кандидат называет день недели, совпадающий с сегодняшним, но НЕ говорит 'сегодня':\n"
+        f"   → Найди строку, где WEEKDAY совпадает\n"
+        f"   → И RELATIVE = СЛЕДУЮЩАЯ_НЕДЕЛЯ\n"
+        f"   → Скопируй DATE\n\n"
+
+        f"8. ВСЕГДА используй ТОЛЬКО значение из колонки DATE\n"
+        f"9. НИКОГДА не вычисляй даты вручную\n"
+        f"10. КАЖДАЯ СТРОКА ТАБЛИЦЫ = ОДИН КАЛЕНДАРНЫЙ ДЕНЬ\n"
+        f"11. НЕ ОБЪЕДИНЯЙ СТРОКИ И НЕ СОЗДАВАЙ НОВЫЕ ДАТЫ\n"
         f"═══════════════════════════════════════════════════════════\n"
         f"ПРИМЕРЫ:\n"
         f"═══════════════════════════════════════════════════════════\n"
-        f"Кандидат: 'понедельник' → Ты ищешь 'Понедельник'\n"
-        f"Кандидат: 'следующий понедельник' → Ты ищешь строчку 'Следующий понедельник'\n"
-        f"Кандидат: 'завтра' → Ты ищешь строчку с пометкой '(ЗАВТРА)'\n"
+        f"Кандидат: 'понедельник' → WEEKDAY=Понедельник, RELATIVE пусто → DATE\n"
+        f"Кандидат: 'следующий понедельник' → WEEKDAY=Понедельник, RELATIVE=СЛЕДУЮЩАЯ_НЕДЕЛЯ → DATE\n"
+        f"Кандидат: 'завтра' → RELATIVE=ЗАВТРА → DATE\n"
     )
+
     return calendar_context
 
 def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str) -> str:
