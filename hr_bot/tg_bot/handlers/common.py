@@ -89,7 +89,6 @@ def _build_followup_7day_stats_content(db_session: Session) -> Text:
     if not has_data:
         return Text("📊 Данных по Follow-up за 7 дней не найдено.")
     return Text(*content_parts)
-
 async def generate_followup_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
     msg_wait = await message.answer("⏳ Формирую детальную аналитику по Follow-up...")
     
@@ -108,77 +107,117 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
 
     rows = []
     for d in dialogues:
+        # Логика определения "Вступил в диалог" (кандидат ответил на дожим)
+        # Считаем ответившим, если был дожим И бот смог записать результат или причину неявки
+        has_reply = 1 if (d.was_in_followup and (d.interview_result or d.no_show_reason)) else 0
+        
         rows.append({
             "Дата": d.created_at.strftime("%d.%m.%Y"),
             "Рекрутер": d.recruiter.name if d.recruiter else "Не указан",
             "Город": d.vacancy.city if d.vacancy else "Не указан",
             "Вакансия": d.vacancy.title if d.vacancy else "Не указана",
             "Назначено": 1,
-            "Был в дожиме": 1 if d.was_in_followup else 0,
-            "Переносов": d.reschedule_count or 0,
-            "Пришел": 1 if d.interview_result in ['success', 'refusal', 'self_refusal'] else 0,
-            "Не пришел": 1 if d.no_show_reason else 0,
-            "Результат": d.interview_result or "-",
-            "Категория причины": d.no_show_reason or "-"
+            "Инициировано follow up": 1 if d.was_in_followup else 0,
+            "Вступили в follow up": has_reply,
+            "Пришло": 1 if d.interview_result in ['success', 'refusal', 'self_refusal'] else 0,
+            "Взяли_число": 1 if d.interview_result == 'success' else 0,
+            "Отказали_число": 1 if d.interview_result == 'refusal' else 0,
+            "Сами отказались_число": 1 if d.interview_result == 'self_refusal' else 0,
+            "Не пришло": 1 if (d.no_show_reason or d.no_show_reason_category) else 0
         })
 
     df_base = pd.DataFrame(rows)
 
-    # 2. ФУНКЦИЯ ДЛЯ СВОДНЫХ ЛИСТОВ (как в основной стате)
+    # 2. ФУНКЦИЯ ДЛЯ СВОДНЫХ ТАБЛИЦ
     def create_fu_summary(groupby_col):
+        # Группируем и суммируем все показатели
         summary = df_base.groupby(groupby_col).agg({
             'Назначено': 'sum',
-            'Был в дожиме': 'sum',
-            'Переносов': 'sum',
-            'Пришел': 'sum',
-            'Не пришел': 'sum'
+            'Инициировано follow up': 'sum',
+            'Вступили в follow up': 'sum',
+            'Пришло': 'sum',
+            'Взяли_число': 'sum',
+            'Отказали_число': 'sum',
+            'Сами отказались_число': 'sum',
+            'Не пришло': 'sum'
         }).reset_index()
-        
-        # Считаем конверсии для Follow-up
-        summary['Доходимость %'] = (summary['Пришел'] / summary['Назначено']).fillna(0)
-        summary['Доля дожимов %'] = (summary['Был в дожиме'] / summary['Назначено']).fillna(0)
-        
-        # Итоговая строка
-        total = summary.sum(numeric_only=True)
-        total[groupby_col] = 'ИТОГО'
-        # Пересчет конверсий для ИТОГО
-        t_sch = total['Назначено'] if total['Назначено'] > 0 else 1
-        total['Доходимость %'] = total['Пришел'] / t_sch
-        total['Доля дожимов %'] = total['Был в дожиме'] / t_sch
-        
-        return pd.concat([summary, pd.DataFrame([total])], ignore_index=True)
 
-    # Генерируем листы
+        # Расчет процентов
+        # Взяли/Отказали/Сами — это % от тех, кто ПРИШЕЛ
+        # Используем .div с fillna, чтобы не было ошибок при делении на 0
+        summary['Взяли'] = (summary['Взяли_count' if False else 'Взяли_число'] / summary['Пришло']).fillna(0)
+        summary['Отказали'] = (summary['Отказали_число'] / summary['Пришло']).fillna(0)
+        summary['Сами отказались'] = (summary['Сами отказались_число'] / summary['Пришло']).fillna(0)
+        
+        # Доходимость — это % Пришедших от Назначенных
+        summary['Доходимость'] = (summary['Пришло'] / summary['Назначено']).fillna(0)
+
+        # Переименовываем для красоты (согласно ТЗ)
+        summary = summary.rename(columns={
+            'Взяли': 'Взяли (% от пришло)',
+            'Отказали': 'Отказали (% от пришло)',
+            'Сами отказались': 'Сами отказались (% от пришло)',
+            'Доходимость': 'Доходимость (пришли от назначено)'
+        })
+
+        # Финальный порядок столбцов
+        final_cols = [
+            groupby_col, 'Назначено', 'Инициировано follow up', 'Вступили в follow up', 
+            'Пришло', 'Взяли (% от пришло)', 'Отказали (% от пришло)', 
+            'Сами отказались (% от пришло)', 'Не пришло', 'Доходимость (пришли от назначено)'
+        ]
+        
+        res = summary[final_cols]
+
+        # Итоговая строка
+        total = res.sum(numeric_only=True)
+        total[groupby_col] = 'ИТОГО'
+        
+        # Пересчет процентов для ИТОГО (чтобы не суммировались проценты)
+        t_pri = total['Пришло'] if total['Пришло'] > 0 else 1
+        t_naz = total['Назначено'] if total['Назначено'] > 0 else 1
+        
+        total['Взяли (% от пришло)'] = df_base['Взяли_число'].sum() / t_pri
+        total['Отказали (% от пришло)'] = df_base['Отказали_число'].sum() / t_pri
+        total['Сами отказались (% от пришло)'] = df_base['Сами отказались_число'].sum() / t_pri
+        total['Доходимость (пришли от назначено)'] = total['Пришло'] / t_naz
+
+        return pd.concat([res, pd.DataFrame([total])], ignore_index=True)
+
+    # Листы
     df_date = create_fu_summary('Дата')
     df_rec = create_fu_summary('Рекрутер')
     df_city = create_fu_summary('Город')
     df_vac = create_fu_summary('Вакансия')
 
-    # 3. ЗАПИСЬ В EXCEL
+    # 3. СОХРАНЕНИЕ
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
         df_rec.to_excel(writer, index=False, sheet_name='Свод по рекрутерам')
         df_city.to_excel(writer, index=False, sheet_name='Свод по городам')
         df_vac.to_excel(writer, index=False, sheet_name='Свод по вакансиям')
-        df_base.to_excel(writer, index=False, sheet_name='Общий список')
+        
+        # Для общего списка просто выведем сырые данные (без расчетов процентов на каждой строке)
+        df_base.to_excel(writer, index=False, sheet_name='Сырые данные')
 
-        # Форматирование (копируем стиль основного отчета)
         workbook = writer.book
-        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1})
-        num_fmt = workbook.add_format({'border': 1})
+        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1, 'align': 'center'})
+        num_fmt = workbook.add_format({'border': 1, 'align': 'center'})
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#CFE2F3', 'border': 1})
 
         for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
-            ws.set_column('A:Z', 18, num_fmt)
-            # Ищем колонки с процентами и красим их
-            if sheet_name != 'Общий список':
-                ws.set_column(6, 7, 18, perc_fmt) # Колонки G и H (Доходимость и Доля дожимов)
+            ws.set_column('A:A', 20, num_fmt)
+            ws.set_column('B:E', 15, num_fmt)
+            ws.set_column('F:H', 18, perc_fmt) # Колонки процентов (Взяли, Отказали, Сами)
+            ws.set_column('I:I', 15, num_fmt)
+            ws.set_column('J:J', 22, perc_fmt) # Доходимость
 
     output.seek(0)
     await message.answer_document(
-        BufferedInputFile(output.read(), filename=f"Followup_Report_{start_date}_{end_date}.xlsx"),
-        caption=f"📈 Детальная аналитика по дожимам ({start_date} - {end_date})"
+        BufferedInputFile(output.read(), filename=f"FU_Report_{start_date}_{end_date}.xlsx"),
+        caption=f"📈 Аналитика дожимов ({start_date} - {end_date})"
     )
     await msg_wait.delete()
     await state.clear()
@@ -486,6 +525,7 @@ async def followup_export_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(FollowupExportStates.waiting_for_range)
     await callback.message.answer(
         "📊 [FOLLOW-UP] За какой период выгрузить Excel?",
+        "Выберите кнопку или пришлите диапазон:\n<code>01.12.2025 - 15.12.2025</code>",
         reply_markup=export_date_options_keyboard
     )
     await callback.answer()
