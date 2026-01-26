@@ -123,7 +123,7 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
             "Взяли_число": 1 if d.interview_result == 'success' else 0,
             "Отказали_число": 1 if d.interview_result == 'refusal' else 0,
             "Сами отказались_число": 1 if d.interview_result == 'self_refusal' else 0,
-            "Не пришло": 1 if (d.no_show_reason or d.no_show_reason_category) else 0
+            "Не пришло": 1 if (d.no_show_reason or d.no_show_reason) else 0
         })
 
     df_base = pd.DataFrame(rows)
@@ -520,13 +520,15 @@ async def view_followup_text_stats(callback: CallbackQuery, db_session: Session)
     await callback.answer()
 
 # Кнопка "Экспорт в Excel" в меню Follow-up
-@router.callback_query(F.data == "followup_excel_start") # Проверь этот callback_data в клавиатуре
+@router.callback_query(F.data == "followup_excel_start")
 async def followup_export_start(callback: CallbackQuery, state: FSMContext):
     await state.set_state(FollowupExportStates.waiting_for_range)
+    # ИСПРАВЛЕНО: Текст объединен в один аргумент, добавлен parse_mode="HTML"
     await callback.message.answer(
-        "📊 [FOLLOW-UP] За какой период выгрузить Excel?",
+        "📊 [FOLLOW-UP] За какой период выгрузить Excel?\n\n"
         "Выберите кнопку или пришлите диапазон:\n<code>01.12.2025 - 15.12.2025</code>",
-        reply_markup=export_date_options_keyboard
+        reply_markup=export_date_options_keyboard,
+        parse_mode="HTML"
     )
     await callback.answer()
 
