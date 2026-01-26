@@ -638,7 +638,7 @@ def _generate_calendar_context_2() -> str:
         f"   → И RELATIVE = СЛЕДУЮЩАЯ_НЕДЕЛЯ\n"
         f"   → Скопируй DATE\n\n"
 
-        f"8. ВСЕГДА используй ТОЛЬКО значение из колонки DATE\n"
+        f"8. ВСЕГДА используй ТОЛЬКО значение из колонки DATE в формате YYYY-MM-DD\n"
         f"9. НИКОГДА не вычисляй даты вручную\n"
         f"10. КАЖДАЯ СТРОКА ТАБЛИЦЫ = ОДИН КАЛЕНДАРНЫЙ ДЕНЬ\n"
         f"11. НЕ ОБЪЕДИНЯЙ СТРОКИ И НЕ СОЗДАВАЙ НОВЫЕ ДАТЫ\n"
@@ -696,7 +696,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 
     # Если текущее состояние требует календаря, генерируем и добавляем его
     if dialogue_state in SCHEDULING_STATES:
-        calendar_block = _generate_calendar_context()
+        calendar_block = _generate_calendar_context_2()
         prompt_pieces.append(calendar_block)
     # +++ КОНЕЦ ИЗМЕНЕНИЯ +++
 
@@ -798,7 +798,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
     # 3. Формирование Промпта
     followup_logic_block = prompt_library.get('#FOLLOWUP_LOGIC#', '')
     scheduling_logic = prompt_library.get('', '')
-    calendar_context = _generate_calendar_context() 
+    calendar_context = _generate_calendar_context_2() 
     vacancy_desc = _find_relevant_vacancy(prompt_library, dialogue.vacancy.title, dialogue.vacancy.city, ctx_logger)
     
     system_prompt = (
