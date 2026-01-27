@@ -295,6 +295,19 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 exists_query = select(func.count()).select_from(Dialogue).filter_by(hh_response_id=response_id)
                 result = await db.execute(exists_query)
                 if result.scalar() > 0:
+                    scan_logger.warning(
+                        f"⚠️ Отклик {response_id} найден в 'response', но диалог уже есть в БД. "
+                        f"Выполняю повторный перенос в 'consider'."
+                    )
+                    try:
+                        # Повторная попытка переноса
+                        await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')
+                        # Можно добавить небольшой sleep, чтобы дать HH "прожевать"
+                        # await asyncio.sleep(0.5) 
+                    except Exception as move_err:
+                        scan_logger.error(f"Не удалось выполнить повторный перенос: {move_err}")
+                    
+                    # Всё равно делаем continue, так как создавать диалог заново не нужно
                     continue
 
                 # Проверка лимитов

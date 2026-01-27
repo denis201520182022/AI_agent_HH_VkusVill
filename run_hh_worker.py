@@ -725,14 +725,14 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
     ctx_logger.info("⚡ Запуск логики Follow-up (v4 - Fixed Atomicity)...")
 
     # 1. Отмена будущих напоминаний (Clean up)
-    if dialogue.reminder_level > 0:
-        await db.execute(
-            update(InterviewFollowup)
-            .where(InterviewFollowup.dialogue_id == dialogue.id)
-            .where(InterviewFollowup.status == 'pending')
-            .values(status='cancelled', processed_at=datetime.datetime.now(datetime.timezone.utc))
-        )
-        dialogue.reminder_level = 0
+    
+    await db.execute(
+        update(InterviewFollowup)
+        .where(InterviewFollowup.dialogue_id == dialogue.id)
+        .where(InterviewFollowup.status == 'pending')
+        .values(status='cancelled', processed_at=datetime.datetime.now(datetime.timezone.utc))
+    )
+
     
     # 2. Сбор и Дедупликация сообщений (БЕЗ записи в БД пока что)
     pending_messages = dialogue.pending_messages or []
@@ -1350,7 +1350,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     correct_weekday = weekdays_ru[v_date_obj.weekday()]
                     
                     # 2. Формируем маркер команды для проверки на дубликаты
-                    hint_marker = f"[SYSTEM COMMAND] Внимание!!! {interview_date} это  {correct_weekday}!!! Учти это при генерации ответа."
+                    hint_marker = f"[SYSTEM COMMAND] Внимание!!! {interview_date} это  {correct_weekday}!!! Помни про Учти это при генерации ответа."
                     
                     # 3. Проверяем последние 4 сообщения в истории на наличие этого маркера
                     history_to_check = (dialogue.history or [])[-4:]
