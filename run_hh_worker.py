@@ -1333,7 +1333,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ (для Time Selection и Final Booking)
         # =====================================================================
         # Список состояний, в которых нам критично важно, чтобы дата была верной
-        DATE_CRITICAL_STATES = ['scheduling_spb_day','scheduling_spb_time', 'interview_scheduled_spb']
+        DATE_CRITICAL_STATES = ['init_scheduling_spb','scheduling_spb_day','scheduling_spb_time', 'interview_scheduled_spb']
 
         if new_state in DATE_CRITICAL_STATES:
             interview_date = extracted_data.get("interview_date")
