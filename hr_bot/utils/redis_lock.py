@@ -158,3 +158,102 @@ async def release_lock(key: str):
         await client.delete(key)
     except Exception as e:
         logger.error(f"Redis error releasing lock '{key}': {e}")
+
+
+# hr_bot\utils\redis_lock.py
+
+# ... (импорты и get_redis_client остаются без изменений)
+# ... (DistributedSemaphore остается без изменений)
+
+class DistributedRateLimiter:
+    """
+    Распределенный ограничитель скорости (Rate Limiter) на основе Redis.
+    Использует принцип скользящего окна с счетчиком и TTL (Sliding Window Counter).
+    """
+    def __init__(self, name: str, limit: int, period: float):
+        self.client = get_redis_client()
+        # Ключ будет: rate_limit:hh_api_global
+        self.key_name = f"rate_limit:{name}"
+        self.limit = limit
+        self.period = period
+        # Lua-скрипт для атомарного инкремента и установки TTL
+        self._lua_script = """
+        local key = KEYS[1]
+        local limit = tonumber(ARGV[1])
+        local period = tonumber(ARGV[2])
+
+        -- 1. Инкрементируем счетчик (возвращает новое значение)
+        local current = redis.call('incr', key)
+
+        -- 2. Если это первый запрос в окне, устанавливаем TTL
+        if current == 1 then
+            redis.call('expire', key, period)
+            -- Возвращаем 1 (Успех), и TTL (для ожидания)
+            return {1, period}
+        end
+
+        -- 3. Если счетчик превышает лимит
+        if current > limit then
+            -- Возвращаем 0 (Лимит превышен), и текущий TTL
+            local ttl = redis.call('ttl', key)
+            return {0, ttl}
+        else
+            -- Возвращаем 1 (Успех), и текущий TTL
+            local ttl = redis.call('ttl', key)
+            return {1, ttl}
+        end
+        """
+        # Загружаем скрипт в Redis
+        self.script_sha = None
+
+    async def _load_script(self):
+        if self.script_sha is None:
+            self.script_sha = await self.client.script_load(self._lua_script)
+            logger.debug(f"Loaded DistributedRateLimiter script with SHA: {self.script_sha}")
+        
+    async def __aenter__(self):
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        pass # Для Rate Limiter не нужно освобождать ресурс (декрементировать)
+
+    async def acquire(self):
+        """Ждет, пока не появится слот в окне лимита."""
+        await self._load_script()
+
+        while True:
+            try:
+                # ARGV: [limit, period]
+                # Результат: [0 или 1 (статус), TTL (для ожидания)]
+                result = await self.client.evalsha(
+                    self.script_sha, 1, self.key_name, self.limit, int(self.period)
+                )
+
+                status = result[0]
+                ttl = result[1]
+
+                if status == 1:
+                    # Успешно захватили слот
+                    return True
+                
+                # Лимит превышен (status == 0)
+                if ttl > 0:
+                    # Ждем оставшееся время в окне (TTL) + небольшой буфер
+                    wait_time = ttl + 0.1 
+                    logger.warning(
+                        f"⏳ Rate Limit '{self.key_name}' is EXCEEDED ({self.limit} req / {self.period}s). "
+                        f"Waiting for {wait_time:.2f}s (TTL: {ttl})..."
+                    )
+                    await asyncio.sleep(wait_time)
+                else:
+                    # TTL истек или не установлен (менее вероятный сценарий, 
+                    # если скрипт сработал корректно). Ждем короткое время.
+                    await asyncio.sleep(0.1)
+
+            except Exception as e:
+                logger.error(f"Redis error acquiring rate limit '{self.key_name}': {e}", exc_info=True)
+                await asyncio.sleep(1) # Ждем дольше при ошибке Redis
+
+
+# ... (остальной код в redis_lock.py, включая close_redis, acquire_lock, release_lock)

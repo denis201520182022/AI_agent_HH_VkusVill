@@ -13,8 +13,7 @@ from hr_bot.utils.system_notifier import send_system_alert
 import httpx
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from aiolimiter import AsyncLimiter
-from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
-from hr_bot.utils.redis_lock import DistributedLock
+from hr_bot.utils.redis_lock import DistributedSemaphore, DistributedRateLimiter # <--- Добавь
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -30,7 +29,10 @@ GLOBAL_HH_API_LIMIT = int(os.getenv("GLOBAL_HH_API_CONCURRENCY"))
 # MAX_CONCURRENT_REQUESTS = 80
 # API_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
 
-HH_API_RATE_LIMITER = AsyncLimiter(100, 1) # 2 запроса в секунду
+# УДАЛЯЕМ ЛОКАЛЬНЫЙ ОГРАНИЧИТЕЛЬ (AsyncLimiter)
+# HH_API_RATE_LIMITER = AsyncLimiter(100, 1) # 2 запроса в секунду
+# ЗАМЕНЯЕМ ЕГО НА РАСПРЕДЕЛЕННЫЙ
+HH_API_RATE_LIMITER_GLOBAL = DistributedRateLimiter(name="hh_api_rate", limit=100, period=1.0) # 100 запросов в секунду
 
 # Создаем глобальный клиент с пулом соединений
 # Создаем глобальный клиент БЕЗ ПРОКСИ, но с пулом соединений (для скорости)
@@ -43,7 +45,7 @@ shared_api_client = httpx.AsyncClient(
 _refresh_locks = {} # Словарь для хранения локов по ID рекрутера
 
 # ИЗМЕНЕНИЕ: Тип db изменен на AsyncSession
-async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str | None: 
+async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str | None:
     now = datetime.datetime.now(datetime.timezone.utc)
 
     # 1. Быстрая проверка токена (без лока)
@@ -53,16 +55,13 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
     # 2. РАСПРЕДЕЛЕННАЯ БЛОКИРОВКА ЧЕРЕЗ REDIS
     # Имя ключа уникально для каждого рекрутера. Limit=1 работает как Mutex.
     lock_name = f"refresh_token_lock:{recruiter.recruiter_id}"
-    
+
     # Пытаемся захватить право на обновление. Ждем, если кто-то уже обновляет.
-    async with DistributedLock(name=lock_name, timeout=60, wait_timeout=60):
-        # [!!!] ЭТО САМАЯ ВАЖНАЯ СТРОКА [!!!]
-        # Мы закрываем текущую транзакцию, чтобы следующая команда увидела 
-        # данные, записанные ДРУГИМ воркером только что.
-        await db.commit() 
+    async with DistributedSemaphore(name=lock_name, limit=1, timeout=60):
         
-        # Теперь читаем свежее состояние из БД
-        await db.refresh(recruiter)
+        await db.commit()
+        await db.refresh(recruiter) # Принудительно обновляем данные рекрутера из БД
+        # --- КОНЕЦ ДОБАВЛЕННОГО БЛОКА ---
 
         # 4. Повторная проверка токена (вдруг пока мы ждали лока, другая задача уже обновила его)
         if recruiter.access_token and recruiter.token_expires_at and recruiter.token_expires_at > now:
@@ -102,7 +101,7 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
         except Exception as e:
             logger.error(f"Network error refreshing token: {e}")
             return None
-        
+
         response_log = (
             f"<--🚨🚨🚨 TOKEN EXCHANGE RESPONSE\n  Status Code: {response.status_code}\n"
             f"  Headers: {response.headers}\n  Body: {response.text}"
@@ -121,9 +120,9 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
                 recruiter.refresh_token = tokens["refresh_token"]
             recruiter.token_expires_at = now + datetime.timedelta(seconds=tokens["expires_in"] - 300)
             # ИЗМЕНЕНИЕ: db.add(recruiter) вместо await asyncio.to_thread(db.add, recruiter)
-            db.add(recruiter) 
+            db.add(recruiter)
             # ИЗМЕНЕНИЕ: await db.commit() вместо await asyncio.to_thread(db.commit)
-            await db.commit() 
+            await db.commit()
             logger.info(f"Успешно получен новый access_token для рекрутера {recruiter.name}.")
             await send_system_alert(f"✅ Успешно сохранен новый токен для {recruiter.name}.", alert_type="admin_only")
             return recruiter.access_token
@@ -185,7 +184,7 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
                 )
                 await send_system_alert(error_message, alert_type="admin_only")
                 return None
-                
+
 @retry(
     stop=stop_after_attempt(3),  # Пытаемся 3 раза (1 оригинал + 2 повтора)
     wait=wait_fixed(5),          # Ждем 5 секунд между попытками
@@ -193,7 +192,7 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
     reraise=True # Если все попытки провалятся, последняя ошибка будет выброшена дальше
 )
 # ИЗМЕНЕНИЕ: Тип db изменен на AsyncSession
-async def _make_request( 
+async def _make_request(
     recruiter: TrackedRecruiter,
     db: AsyncSession,
     method: str,
@@ -217,9 +216,9 @@ async def _make_request(
         f"REQUEST -->\n  Method: {method}\n  URL: {url}\n  Headers: {headers}\n"
         f"  Params: {kwargs.get('params')}\n  Data: {kwargs.get('data')}\n  JSON: {kwargs.get('json')}"
     )
-    
 
-    async with HH_API_RATE_LIMITER:
+
+    async with HH_API_RATE_LIMITER_GLOBAL:
         # --- ИЗМЕНЕНИЕ: Глобальный семафор ---
         async with DistributedSemaphore(name="hh_api_global", limit=GLOBAL_HH_API_LIMIT):
             # ИСПОЛЬЗУЕМ ГЛОБАЛЬНЫЙ КЛИЕНТ
@@ -260,16 +259,16 @@ async def _make_request(
             if should_refresh_token:
                 recruiter.access_token = None
                 # ИЗМЕНЕНИЕ: await db.commit() вместо await asyncio.to_thread(db.commit)
-                await db.commit() 
-                
+                await db.commit()
+
                 token = await get_access_token(recruiter, db)
                 if not token:
                     raise ConnectionError(f"Не удалось повторно получить токен для {recruiter.name}")
-                
+
                 headers["Authorization"] = f"Bearer {token}"
                 headers["HH-User-Agent"] = "ZaBota-Bot/1.0 (hbfys@mail.com)"
-                async with HH_API_RATE_LIMITER:
-                    async with API_SEMAPHORE:
+                async with HH_API_RATE_LIMITER_GLOBAL:
+                    async with DistributedSemaphore(name="hh_api_global", limit=GLOBAL_HH_API_LIMIT):
                         async with httpx.AsyncClient(timeout=60) as client:
                             # Повторный запрос после обновления токена
                             response = await client.request(method, url, headers=headers, **kwargs)
@@ -278,7 +277,7 @@ async def _make_request(
 
     if response.status_code in [201, 204]:
         return None
-        
+
     response.raise_for_status()
     return response.json() if response.content else None
 
@@ -316,7 +315,7 @@ async def get_responses_from_folder(
         async def fetch_for_vacancy(vid):
             all_items_for_vacancy = []
             page = 0
-            
+
             stop_fetching_for_this_vacancy = False
             if since_datetime:
                 logger.debug(f"  [DEBUG] Для вакансии {vid}, since_datetime (UTC): {since_datetime.isoformat()}")
@@ -330,7 +329,7 @@ async def get_responses_from_folder(
                         "order_by": "created_at",
                         "order": "desc"
                     }
-                    
+
                     # --- ИСПРАВЛЕНИЕ: ИСПОЛЬЗУЕМ КОРРЕКТНЫЕ ПАРАМЕТРЫ ФИЛЬТРАЦИИ ОБНОВЛЕНИЙ ---
                     if check_for_updates:
                         if folder_id == 'response':
@@ -367,12 +366,12 @@ async def get_responses_from_folder(
                                         f"    Parsed 'created_at' (UTC): {item_created_at.isoformat()}\n"
                                         f"    Сравнение: {item_created_at.isoformat()} < {since_datetime.isoformat()} = {item_created_at < since_datetime}"
                                     )
-                                    
+
                                     if item_created_at < since_datetime:
                                         logger.debug(f"  [DEBUG] Вакансия {vid}, стр {page}, отклик {item.get('id')}: ОТБРОШЕН, СТАРЕЕ since_datetime. Активирую раннюю остановку.")
-                                        stop_fetching_for_this_vacancy = True 
-                                        break 
-                                    else: 
+                                        stop_fetching_for_this_vacancy = True
+                                        break
+                                    else:
                                         new_items_to_add.append(item)
                                         logger.debug(f"  [DEBUG] Вакансия {vid}, стр {page}, отклик {item.get('id')}: ДОБАВЛЕН в new_items_to_add (прошел проверку даты).")
                                 except ValueError:
@@ -389,7 +388,7 @@ async def get_responses_from_folder(
                     all_items_for_vacancy.extend(new_items_to_add)
                     logger.debug(f"  [DEBUG] Для вакансии {vid}: all_items_for_vacancy теперь содержит {len(all_items_for_vacancy)} элементов (после страницы {page}).")
 
-                    if stop_fetching_for_this_vacancy: 
+                    if stop_fetching_for_this_vacancy:
                          logger.debug(f"  [DEBUG] Вакансия {vid}: Флаг ранней остановки активен. Завершаю пагинацию для этой вакансии.")
                          break
 
@@ -497,11 +496,11 @@ async def send_message(recruiter: TrackedRecruiter, db: AsyncSession, negotiatio
             try:
                 error_body = e.response.json()
                 errors_list = error_body.get("errors", [])
-                
+
                 # Проверяем на invalid_vacancy (вакансия закрыта) И resume_not_found (резюме удалено)
                 # Если любая из этих ошибок - возвращаем 403, чтобы воркер остановил диалог
                 fatal_errors = ["invalid_vacancy", "resume_not_found"]
-                
+
                 if any(err.get("value") in fatal_errors for err in errors_list):
                     logger.warning(
                         f"⚠️ Сообщение не отправлено в диалог {negotiation_id}. "
@@ -533,7 +532,7 @@ async def move_response_to_folder(recruiter: TrackedRecruiter, db: AsyncSession,
         endpoint = f"negotiations/{folder_id}/{negotiation_id}"
         # db здесь передается в _make_request, которое уже обновлено для AsyncSession
         await _make_request(recruiter, db, "PUT", endpoint)
-        
+
         logger.info(f"УСПЕХ: Отклик {negotiation_id} был успешно перемещен в папку '{folder_id}'.")
 
     except httpx.HTTPStatusError as e:
@@ -542,11 +541,11 @@ async def move_response_to_folder(recruiter: TrackedRecruiter, db: AsyncSession,
             try:
                 error_body = e.response.json()
                 errors_list = error_body.get("errors", [])
-                
+
                 # Проверяем на ошибки "резюме не найдено" или "вакансия закрыта/архивная"
                 # Если это они, то перемещать больше некуда, просто логируем и выходим, не ломая воркер
                 fatal_errors = ["resume_not_found", "invalid_vacancy"]
-                
+
                 if any(err.get("value") in fatal_errors for err in errors_list):
                     logger.warning(
                         f"⚠️ Не удалось переместить отклик {negotiation_id} в папку {folder_id}. "
@@ -555,7 +554,7 @@ async def move_response_to_folder(recruiter: TrackedRecruiter, db: AsyncSession,
                     return # Выходим успешно, считаем что действие "выполнено" (или невозможно выполнить)
             except Exception:
                 pass # Если JSON не парсится, пробрасываем ошибку дальше
-        
+
         # Если ошибка другая - логируем и пробрасываем, чтобы tenacity (если есть) или внешний код её увидел
         logger.error(f"Не удалось переместить отклик {negotiation_id} в папку {folder_id}: {e}", exc_info=True)
         raise e
@@ -575,14 +574,14 @@ async def get_negotiation_current_folder(recruiter: TrackedRecruiter, db: AsyncS
     try:
         logger.debug(f"Запрос текущей папки для отклика {hh_response_id} от рекрутера {recruiter.name}...")
         negotiation_data = await _make_request(recruiter, db, "GET", f"negotiations/{hh_response_id}")
-        
+
         # --- КОРРЕКТНОЕ ИСПРАВЛЕНИЕ ЗДЕСЬ ---
         if negotiation_data and negotiation_data.get("employer_state") and negotiation_data["employer_state"].get("id"):
             folder_id = negotiation_data["employer_state"]["id"] # <--- ИЗМЕНЕНИЕ: ИСПОЛЬЗУЕМ "employer_state"
             logger.debug(f"Отклик {hh_response_id} находится в папке '{folder_id}'.")
             return folder_id
         # --- КОНЕЦ ИСПРАВЛЕНИЯ ---
-        
+
         logger.warning(f"Не удалось определить папку для отклика {hh_response_id}. Возможно, отклик удален или данные неполны.")
         return None
     except httpx.HTTPStatusError as http_error:
@@ -595,7 +594,7 @@ async def get_negotiation_current_folder(recruiter: TrackedRecruiter, db: AsyncS
     except Exception as e:
         logger.error(f"Ошибка при получении текущей папки для отклика {hh_response_id}: {e}", exc_info=True)
         return None
-    
+
 async def close_api_client():
     """Закрывает глобальный клиент при остановке приложения."""
     await shared_api_client.aclose()
