@@ -14,6 +14,7 @@ import httpx
 from tenacity import retry, stop_after_attempt, wait_fixed, retry_if_exception_type
 from aiolimiter import AsyncLimiter
 from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
+from hr_bot.utils.redis_lock import DistributedLock
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -54,10 +55,14 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
     lock_name = f"refresh_token_lock:{recruiter.recruiter_id}"
     
     # Пытаемся захватить право на обновление. Ждем, если кто-то уже обновляет.
-    async with DistributedSemaphore(name=lock_name, limit=1, timeout=60):
-        # --- ДОБАВЛЕНО: ОБНОВЛЕНИЕ ОБЪЕКТА РЕКРУТЕРА ИЗ БД ---
-        await db.refresh(recruiter) # Принудительно обновляем данные рекрутера из БД
-        # --- КОНЕЦ ДОБАВЛЕННОГО БЛОКА ---
+    async with DistributedLock(name=lock_name, timeout=60, wait_timeout=60):
+        # [!!!] ЭТО САМАЯ ВАЖНАЯ СТРОКА [!!!]
+        # Мы закрываем текущую транзакцию, чтобы следующая команда увидела 
+        # данные, записанные ДРУГИМ воркером только что.
+        await db.commit() 
+        
+        # Теперь читаем свежее состояние из БД
+        await db.refresh(recruiter)
 
         # 4. Повторная проверка токена (вдруг пока мы ждали лока, другая задача уже обновила его)
         if recruiter.access_token and recruiter.token_expires_at and recruiter.token_expires_at > now:
