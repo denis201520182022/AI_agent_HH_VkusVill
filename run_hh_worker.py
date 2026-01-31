@@ -870,7 +870,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         # ТРЕТИЙ ПУНКТ: Сохраняем системную команду в историю
         sys_hist_entry = {
             'message_id': system_command['message_id'],
-            'role': 'system_command',
+            'role': 'system',
             'content': system_command['content'],
             'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
         }
