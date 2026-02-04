@@ -27,9 +27,9 @@ services:
   # ---------------------------------------------------------------
   # SCANNER (Только 36, 49, 47)
   # ---------------------------------------------------------------
-  vv_scanner:
+  vv_scanner_36_49_47:
     build: .
-    container_name: vv_scanner
+    container_name: vv_scanner_36_49_47
     restart: always
     command: python run_hh_scanner.py --recruiter_ids 36 49 47
     volumes:
@@ -50,9 +50,9 @@ services:
   # ---------------------------------------------------------------
   # WORKER (Только 36, 49, 47)
   # ---------------------------------------------------------------
-  vv_worker:
+  vv_worker_36_49_47:
     build: .
-    container_name: vv_worker
+    container_name: vv_worker_36_49_47
     restart: always
     command: python run_hh_worker.py --recruiter_ids 36 49 47
     volumes:
@@ -69,6 +69,281 @@ services:
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
+
+
+  #---------------------------------------------------------------------------------------------
+  # ---------------------------------------------------------------
+  # SCANNER 
+  # ---------------------------------------------------------------
+  vv_scanner_29_40_45:
+    build: .
+    container_name: vv_scanner_29_40_45
+    restart: always
+    command: python run_hh_scanner.py --recruiter_ids 29 40 45
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # WORKER 
+  # ---------------------------------------------------------------
+  vv_worker_29_40_45:
+    build: .
+    container_name: vv_worker_29_40_45
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 29 40 45
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+  #---------------------------------------------------------------------------------------------
+  # ---------------------------------------------------------------
+  # SCANNER 
+  # ---------------------------------------------------------------
+  vv_scanner_32_39_44:
+    build: .
+    container_name: vv_scanner_32_39_44
+    restart: always
+    command: python run_hh_scanner.py --recruiter_ids 32 39 44
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # WORKER 
+  # ---------------------------------------------------------------
+  vv_worker_32_39_44:
+    build: .
+    container_name: vv_worker_32_39_44
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 32 39 44
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+
+
+  # ---------------------------------------------------------------
+  # SCANNER 
+  # ---------------------------------------------------------------
+  vv_scanner_48_33_50:
+    build: .
+    container_name: vv_scanner_48_33_50
+    restart: always
+    command: python run_hh_scanner.py --recruiter_ids 48 33 50
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # WORKER 
+  # ---------------------------------------------------------------
+  vv_worker_48_33_50:
+    build: .
+    container_name: vv_worker_48_33_50
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 48 33 50
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # SCANNER 
+  # ---------------------------------------------------------------
+  vv_scanner_46_7_42:
+    build: .
+    container_name: vv_scanner_46_7_42
+    restart: always
+    command: python run_hh_scanner.py --recruiter_ids 46 7 42
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # WORKER 
+  # ---------------------------------------------------------------
+  vv_worker_46_7_42:
+    build: .
+    container_name: vv_worker_46_7_42
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 46 7 42
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+
+  # ---------------------------------------------------------------
+  # SCANNER 
+  # ---------------------------------------------------------------
+  vv_scanner_43_38_28:
+    build: .
+    container_name: vv_scanner_43_38_28
+    restart: always
+    command: python run_hh_scanner.py --recruiter_ids 43 38 28
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # WORKER 
+  # ---------------------------------------------------------------
+  vv_worker_43_38_28:
+    build: .
+    container_name: vv_worker_43_38_28
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 43 38 28
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # SCANNER 
+  # ---------------------------------------------------------------
+  vv_scanner_41_51_37:
+    build: .
+    container_name: vv_scanner_41_51_37
+    restart: always
+    command: python run_hh_scanner.py --recruiter_ids 41 51 37
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+      - ./missing_vacancies.txt:/app/missing_vacancies.txt
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # WORKER 
+  # ---------------------------------------------------------------
+  vv_worker_41_51_37:
+    build: .
+    container_name: vv_worker_41_51_37
+    restart: always
+    command: python run_hh_worker.py --recruiter_ids 41 51 37
+    volumes:
+      - ./logs:/app/logs
+      - ./credentials.json:/app/credentials.json
+    depends_on:
+      - vv_pgbouncer
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env
+    environment:
+      - DB_HOST=vv_pgbouncer
+      - DB_PORT=6432
+      - REDIS_HOST=host.docker.internal
   # ---------------------------------------------------------------
   # REMINDERS (Напоминатор для ВкусВилла)
   # ---------------------------------------------------------------
@@ -161,8 +436,7 @@ services:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-    depends_on:
-      - vv_worker
+    
 
 volumes:
   vv_grafana_data:
