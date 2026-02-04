@@ -241,7 +241,7 @@ class DistributedRateLimiter:
                 if ttl > 0:
                     # Ждем оставшееся время в окне (TTL) + небольшой буфер
                     wait_time = ttl + 0.1 
-                    logger.warning(
+                    logger.debug(
                         f"⏳ Rate Limit '{self.key_name}' is EXCEEDED ({self.limit} req / {self.period}s). "
                         f"Waiting for {wait_time:.2f}s (TTL: {ttl})..."
                     )

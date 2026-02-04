@@ -69,10 +69,16 @@ docker compose up -d --build
 http://212.193.26.118:3000
 
 
-{container_name=~".*scanner.*"}
-{container_name=~".*worker.*"}
 
-{container_name=~".*worker_r1.*"}
-{container_name="hh_scanner_r1"}
 
-{container_name=~".*scanner.*"} |= "12345"
+
+{container=~"vv_(worker|scanner|reminders).*"}
+
+{container=~"vv_scanner_.*"}
+
+{container=~"vv_worker_.*"}
+
+{container=~"vv_(worker|scanner)_36_49_47"}
+
+{container="vv_tg_bot"}
+
