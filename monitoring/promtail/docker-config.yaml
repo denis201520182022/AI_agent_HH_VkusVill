@@ -9,11 +9,14 @@ clients:
   - url: http://vv_monitoring_loki:3100/loki/api/v1/push  # <--- ИСПРАВЛЕНО: адрес новой Loki
 
 scrape_configs:
-  - job_name: vkusvill_docker  # <--- Переименовали для ясности
+  - job_name: vkusvill_docker
     docker_sd_configs:
       - host: unix:///var/run/docker.sock
         refresh_interval: 5s
     relabel_configs:
       - source_labels: ['__meta_docker_container_name']
-        regex: '/(vv_.*)' # <--- ФИЛЬТР: собирать логи только контейнеров ВкусВилла
+        regex: '/(vv_.*)'
         target_label: 'container'
+      # ДОБАВЬ ЭТО: удалять все, что не подошло под regex выше
+      - source_labels: ['container']
+        action: keep
