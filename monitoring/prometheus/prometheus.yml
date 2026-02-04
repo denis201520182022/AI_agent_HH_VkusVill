@@ -2,19 +2,15 @@ global:
   scrape_interval: 15s
 
 scrape_configs:
-  - job_name: 'hh_bots'
+  - job_name: 'vkusvill_bots' # <--- Меняем имя задачи для ясности
     # Используем DNS Discovery Докера. 
-    # Prometheus будет спрашивать DNS сервер: "Дай мне IP всех контейнеров с именем hh_worker"
+    # Prometheus будет искать контейнеры по именам сервисов из vv_ docker-compose
     dns_sd_configs:
       - names:
-          - hh_worker
-          - hh_scanner
-          - hh_reminders
-          # --- ДОБАВЛЕНЫ НОВЫЕ СЕРВИСЫ ---
-          - worker_r1
-          - scanner_r1
-          - worker_r2
-          - scanner_r2
-          # -------------------------------
+          - vv_worker
+          - vv_scanner
+          - vv_reminders
+          # Здесь НЕ нужны worker_r1, r2 и т.д., так как во ВкусВилле 
+          # мы их не создавали — всё работает в общих vv_worker/vv_scanner
         type: 'A'
         port: 8000
