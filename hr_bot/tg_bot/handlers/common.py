@@ -120,7 +120,7 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
             "Вакансия": d.vacancy.title if d.vacancy else "Не указана",
             "Назначено": 1,
             "Инициировано follow up": 1 if d.was_in_followup else 0,
-            "Вступили в follow up": has_reply,
+            "Прошли follow up": has_reply,
             "Пришло": 1 if d.interview_result in ['success', 'refusal', 'self_refusal'] else 0,
             "Взяли_число": 1 if d.interview_result == 'success' else 0,
             "Отказали_число": 1 if d.interview_result == 'refusal' else 0,
@@ -137,7 +137,7 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
         summary = df_base.groupby(groupby_col).agg({
             'Назначено': 'sum',
             'Инициировано follow up': 'sum',
-            'Вступили в follow up': 'sum',
+            'Прошли follow up': 'sum',
             'Пришло': 'sum',
             'Взяли_число': 'sum',
             'Отказали_число': 'sum',
@@ -165,7 +165,7 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
 
         # Финальный порядок столбцов
         final_cols = [
-            groupby_col, 'Назначено', 'Инициировано follow up', 'Вступили в follow up', 
+            groupby_col, 'Назначено', 'Инициировано follow up', 'Прошли follow up', 
             'Пришло', 'Взяли (% от пришло)', 'Отказали (% от пришло)', 
             'Сами отказались (% от пришло)', 'Не пришло', 'Доходимость % (пришли от назначено)'
         ]

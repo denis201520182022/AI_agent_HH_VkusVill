@@ -4,14 +4,17 @@ import re
 import os
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from dotenv import load_dotenv
 
 # Настройка простого логгера для запуска этого файла отдельно
 if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO)
 
+load_dotenv() 
+
 logger = logging.getLogger(__name__)
 
-DOCUMENT_ID = '1JjXxElQhUyo3fPttvHq6ECvBeB4e0NvOd5W4ITMSgUI'
+DOCUMENT_ID = os.getenv('GOOGLE_DOCS_ID')
 SCOPES = ['https://www.googleapis.com/auth/documents.readonly']
 SERVICE_ACCOUNT_FILE = 'credentials.json' # Убедись, что файл лежит в корне проекта, откуда запускаешь скрипт
 CACHE_TTL_SECONDS = 120

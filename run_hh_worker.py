@@ -711,7 +711,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
             prompt_pieces.append(post_qual_block)
 
     vacancy_context = (
-        "[CRITICAL CONTEXT] Ниже представлено описание ТОЛЬКО ТОЙ вакансии, на которую откликнулся кандидат. "
+        "[CRITICAL CONTEXT] Ниже представлено описание вакансии той, на которую откликнулся кандидат. "
         "Используй ИСКЛЮЧИТЕЛЬНО эту информацию при ответах на вопросы о вакансии.\n" +
         vacancy_description
     )
@@ -1428,11 +1428,22 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
                     correct_weekday = weekdays_ru[weekday_idx]
 
-                    # 2. Формируем текст инструкции в зависимости от дня недели
+                    # Определяем, относится ли вакансия к группе "Сборщики/Склад" для спец. расписания в СПб
+                    warehouse_keywords = [
+                        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
+                        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
+                    ]
+                    current_title_low = (dialogue.vacancy.title or "").lower()
+                    current_city_low = (dialogue.vacancy.city or "").lower()
+                    
+                    is_spb = 'санкт-петербург' in current_city_low
+                    is_warehouse = any(word in current_title_low for word in warehouse_keywords)
+
+                    # 2. Формируем текст инструкции в зависимости от дня недели и типа вакансии
                     if weekday_idx == 6:  # Воскресенье
                         hint_content = (
                             f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
-                            f"По воскресеньям собеседования не проводятся, запись невозможна на этот день. "
+                            f"По воскресеньям собеседования не проводятся, запись невозможна на этот день."
                         )
                     elif weekday_idx == 5:  # Суббота
                         hint_content = (
@@ -1441,9 +1452,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             f"Учти это при генерации ответа."
                         )
                     else:  # Будни (0-4)
+                        # Проверяем спец. расписание для сборщиков в СПб
+                        if is_spb and is_warehouse:
+                            slots = "10:00, 12:00, 15:00, 16:00"
+                        else:
+                            slots = "10:00, 12:00, 16:00"
+                            
                         hint_content = (
                             f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
-                            f"В этот день доступна запись только на 10:00, 12:00, 16:00. "
+                            f"В этот день доступна запись только на {slots}. "
                             f"Учти это при генерации ответа."
                         )
 
@@ -1713,7 +1730,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 # Проверяем город
                 city_lower = (dialogue.vacancy.city or "").lower()
-                is_spb = any(x in city_lower for x in ['санкт-петербург', 'ставрополь'])
+                is_spb = any(x in city_lower for x in ['санкт-петербург'])
 
                 if not is_spb:
                     # --- 2.1 НЕ СПБ (Регионы) ---
@@ -1730,10 +1747,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # Список фраз, которые ищем в названии
                     # Список фраз, которые ищем в названии (для этих вакансий в СПб автоматическая запись не предлагается)
                     excluded_vacancies = [
-                        'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 'уборщик', 'уборщица', 'помошник повара',
-                        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 'сканировщик', 
-                        'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
-                    ]
+                        'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 'уборщик', 'уборщица', 'помошник повара']
+                    
                     # Проверяем, входит ли хоть одна фраза из списка в название вакансии
                     if any(phrase in current_title_lower for phrase in excluded_vacancies):
                         ctx_logger.info(
