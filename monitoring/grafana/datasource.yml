@@ -4,5 +4,5 @@ datasources:
   - name: Loki
     type: loki
     access: proxy
-    url: http://vv_loki:3100  # <--- ИСПРАВЛЕНО: имя сервиса из нового docker-compose
+    url: http://loki:3100  # Используем имя сервиса Loki из docker-compose
     isDefault: true

@@ -1,12 +1,10 @@
-version: '3.8'
-
 services:
   # ---------------------------------------------------------------
-  # PGBOUNCER (Порт 6433)
+  # PGBOUNCER (Пулер соединений)
   # ---------------------------------------------------------------
-  vv_pgbouncer:
+  pgbouncer:
     image: edoburu/pgbouncer
-    container_name: vv_pgbouncer
+    container_name: hh_pgbouncer
     restart: always
     environment:
       - DB_USER=${DB_USER}
@@ -18,392 +16,228 @@ services:
       - MAX_CLIENT_CONN=1000
       - DEFAULT_POOL_SIZE=20
       - LISTEN_PORT=6432
+      # Исправлено на scram-sha-256, как выяснили в логах
       - AUTH_TYPE=scram-sha-256
     ports:
-      - "6433:6432"
+      - "6432:6432"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-  # ---------------------------------------------------------------
-  # SCANNER (Только 36, 49, 47)
-  # ---------------------------------------------------------------
-  vv_scanner_36_49_47:
+  # ==========================================
+  # РЕКРУТЕР 1 (ID: 6 - Долгополова Марина)
+  # ==========================================
+  scanner_r1:
     build: .
-    container_name: vv_scanner_36_49_47
+    container_name: hh_scanner_r1
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 36 49 47
+    command: python run_hh_scanner.py --recruiter_ids 6  # <--- ИСПРАВЛЕНО ID
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
       - ./missing_vacancies.txt:/app/missing_vacancies.txt
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
-  # ---------------------------------------------------------------
-  # WORKER (Только 36, 49, 47)
-  # ---------------------------------------------------------------
-  vv_worker_36_49_47:
+  worker_r1:
     build: .
-    container_name: vv_worker_36_49_47
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 36 49 47
+    command: python run_hh_worker.py --recruiter_ids 6   # <--- ИСПРАВЛЕНО ID
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
-
-
-  #---------------------------------------------------------------------------------------------
-  # ---------------------------------------------------------------
-  # SCANNER 
-  # ---------------------------------------------------------------
-  vv_scanner_29_40_45:
+  # ==========================================
+  # РЕКРУТЕР 2 (ID: 21 - Измайлова Анастасия)
+  # ==========================================
+  scanner_r2:
     build: .
-    container_name: vv_scanner_29_40_45
+    container_name: hh_scanner_r2
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 29 40 45
+    command: python run_hh_scanner.py --recruiter_ids 21  # <--- НОВЫЙ СЕРВИС
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
       - ./missing_vacancies.txt:/app/missing_vacancies.txt
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
-  # ---------------------------------------------------------------
-  # WORKER 
-  # ---------------------------------------------------------------
-  vv_worker_29_40_45:
+  worker_r2:
     build: .
-    container_name: vv_worker_29_40_45
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 29 40 45
+    command: python run_hh_worker.py --recruiter_ids 21   # <--- НОВЫЙ СЕРВИС
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
-  #---------------------------------------------------------------------------------------------
+
   # ---------------------------------------------------------------
-  # SCANNER 
+  # SCANNER (Общий)
   # ---------------------------------------------------------------
-  vv_scanner_32_39_44:
+  hh_scanner:
     build: .
-    container_name: vv_scanner_32_39_44
+    # container_name УБРАЛИ, чтобы можно было скейлить (docker compose up -d --scale hh_scanner=2)
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 32 39 44
+    command: python run_hh_scanner.py
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
       - ./missing_vacancies.txt:/app/missing_vacancies.txt
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER 
+  # WORKER (Общий обработчик)
   # ---------------------------------------------------------------
-  vv_worker_32_39_44:
+  hh_worker:
     build: .
-    container_name: vv_worker_32_39_44
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 32 39 44
+    command: python run_hh_worker.py
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
-
-
+    deploy:
+      mode: replicated
+      replicas: 1  # <-- Начинаем с 1. Нужно больше? docker compose up -d --scale hh_worker=5
 
   # ---------------------------------------------------------------
-  # SCANNER 
+  # ПРИМЕР: VIP WORKER (Для конкретных рекрутеров)
+  # Раскомментируй, если нужно выделить мощности под конкретных ID
   # ---------------------------------------------------------------
-  vv_scanner_48_33_50:
+  # hh_worker_vip:
+  #   build: .
+  #   restart: always
+  #   # Запускаем только для ID 1 и 5
+  #   command: python run_hh_worker.py --recruiter_ids 1 5
+  #   volumes:
+  #     - ./logs:/app/logs
+  #     - ./credentials.json:/app/credentials.json
+  #   depends_on:
+  #     - pgbouncer
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - DB_HOST=pgbouncer
+  #     - DB_PORT=6432
+  #     - REDIS_HOST=host.docker.internal
+
+  # ---------------------------------------------------------------
+  # REMINDERS (Напоминатор)
+  # ---------------------------------------------------------------
+  hh_reminders:
     build: .
-    container_name: vv_scanner_48_33_50
+    container_name: hh_reminders
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 48 33 50
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-      - ./missing_vacancies.txt:/app/missing_vacancies.txt
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-
-  # ---------------------------------------------------------------
-  # WORKER 
-  # ---------------------------------------------------------------
-  vv_worker_48_33_50:
-    build: .
-    container_name: vv_worker_48_33_50
-    restart: always
-    command: python run_hh_worker.py --recruiter_ids 48 33 50
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-
-  # ---------------------------------------------------------------
-  # SCANNER 
-  # ---------------------------------------------------------------
-  vv_scanner_46_7_42:
-    build: .
-    container_name: vv_scanner_46_7_42
-    restart: always
-    command: python run_hh_scanner.py --recruiter_ids 46 7 42
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-      - ./missing_vacancies.txt:/app/missing_vacancies.txt
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-
-  # ---------------------------------------------------------------
-  # WORKER 
-  # ---------------------------------------------------------------
-  vv_worker_46_7_42:
-    build: .
-    container_name: vv_worker_46_7_42
-    restart: always
-    command: python run_hh_worker.py --recruiter_ids 46 7 42
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-
-
-  # ---------------------------------------------------------------
-  # SCANNER 
-  # ---------------------------------------------------------------
-  vv_scanner_43_38_28:
-    build: .
-    container_name: vv_scanner_43_38_28
-    restart: always
-    command: python run_hh_scanner.py --recruiter_ids 43 38 28
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-      - ./missing_vacancies.txt:/app/missing_vacancies.txt
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-
-  # ---------------------------------------------------------------
-  # WORKER 
-  # ---------------------------------------------------------------
-  vv_worker_43_38_28:
-    build: .
-    container_name: vv_worker_43_38_28
-    restart: always
-    command: python run_hh_worker.py --recruiter_ids 43 38 28
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-
-  # ---------------------------------------------------------------
-  # SCANNER 
-  # ---------------------------------------------------------------
-  vv_scanner_41_51_37:
-    build: .
-    container_name: vv_scanner_41_51_37
-    restart: always
-    command: python run_hh_scanner.py --recruiter_ids 41 51 37
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-      - ./missing_vacancies.txt:/app/missing_vacancies.txt
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-
-  # ---------------------------------------------------------------
-  # WORKER 
-  # ---------------------------------------------------------------
-  vv_worker_41_51_37:
-    build: .
-    container_name: vv_worker_41_51_37
-    restart: always
-    command: python run_hh_worker.py --recruiter_ids 41 51 37
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-    depends_on:
-      - vv_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=vv_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
-  # ---------------------------------------------------------------
-  # REMINDERS (Напоминатор для ВкусВилла)
-  # ---------------------------------------------------------------
-  vv_reminders:
-    build: .
-    container_name: vv_reminders
-    restart: always
-    # Ограничиваем рекрутерами, чтобы не трогать базу Заботы
     command: python run_reminders_worker.py
     volumes:
       - ./logs:/app/logs
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # TELEGRAM BOT (Для ВкусВилла)
+  # TELEGRAM BOT
   # ---------------------------------------------------------------
-  vv_tg_bot:
+  tg_bot:
     build: .
-    container_name: vv_tg_bot
+    container_name: hh_tg_bot
     restart: always
     command: python run_telegram_bot.py
     volumes:
       - ./logs:/app/logs
     depends_on:
-      - vv_pgbouncer
+      - pgbouncer
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
 
+    # ---------------------------------------------------------------
+  # LOKI (База данных логов)
   # ---------------------------------------------------------------
-  # МОНИТОРИНГ (Новые порты: Loki 3101, Grafana 3001)
-  # ---------------------------------------------------------------
-  vv_loki:
+  loki:
     image: grafana/loki:2.9.2
-    container_name: vv_monitoring_loki
+    container_name: monitoring_loki
     restart: always
     ports:
-      - "3101:3100" # Внешний порт 3101
+      - "3100:3100"
     command: -config.file=/etc/loki/local-config.yaml
     volumes:
       - ./monitoring/loki/local-config.yaml:/etc/loki/local-config.yaml
-      - vv_loki_data:/loki
+      - loki_data:/loki
+    depends_on:
+      - pgbouncer # Просто чтобы запускался вместе с основной пачкой
 
-  vv_promtail:
-    image: grafana/promtail:latest
-    container_name: vv_monitoring_promtail
+  # ---------------------------------------------------------------
+  # PROMTAIL (Сборщик логов)
+  # ---------------------------------------------------------------
+  promtail:
+    image: grafana/promtail:latest  # <--- ОБНОВЛЯЕМ
+    container_name: monitoring_promtail
     user: root
     restart: always
     volumes:
@@ -411,33 +245,41 @@ services:
       - ./monitoring/promtail/docker-config.yaml:/etc/promtail/config.yaml
     command: -config.file=/etc/promtail/config.yaml
     depends_on:
-      - vv_loki
+      - loki
 
-  vv_grafana:
+  # ---------------------------------------------------------------
+  # GRAFANA (Визуализация)
+  # ---------------------------------------------------------------
+  grafana:
     image: grafana/grafana:latest
-    container_name: vv_monitoring_grafana
+    container_name: monitoring_grafana
     restart: always
     ports:
-      - "3001:3000" # Внешний порт 3001
+      - "3000:3000"
     environment:
+      # Логин и пароль для входа (можешь поменять)
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
+      # Автоматическое подключение Loki
       - ./monitoring/grafana/datasource.yml:/etc/grafana/provisioning/datasources/datasource.yml
-      - vv_grafana_data:/var/lib/grafana
+      # Сохраняем настройки графаны (дашборды и т.д.) даже после перезапуска
+      - grafana_data:/var/lib/grafana
     depends_on:
-      - vv_loki
+      - loki
 
-  vv_prometheus:
+  prometheus:
     image: prom/prometheus:latest
-    container_name: vv_monitoring_prometheus
+    container_name: monitoring_prometheus
     restart: always
     volumes:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-    
+    depends_on:
+      - hh_worker # Просто чтобы не стартовал раньше сети
 
+# Не забудь добавить volumes в самый конец файла (корневой уровень)
 volumes:
-  vv_grafana_data:
-  vv_loki_data:
+  grafana_data:
+  loki_data:

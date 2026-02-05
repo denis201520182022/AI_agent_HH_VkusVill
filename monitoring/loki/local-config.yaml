@@ -9,11 +9,11 @@ server:
   # -------------------------------------------------------------------------
 
 common:
-  path_prefix: /loki    # <--- ИЗМЕНЕНО с /tmp/loki на /loki
+  path_prefix: /loki
   storage:
     filesystem:
-      chunks_directory: /loki/chunks # <--- ИЗМЕНЕНО
-      rules_directory: /loki/rules   # <--- ИЗМЕНЕНО
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
   replication_factor: 1
   ring:
     kvstore:
