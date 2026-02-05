@@ -722,7 +722,7 @@ async def check_and_send_declined_interview_alerts(bot: Bot, health_monitor: Tas
                     safe_phone_number = escape_markdown(candidate.phone_number or "—")
                     
                     message_text = (
-                        f"🙅‍♂️ *Кандидат отказался от собеседования*\n\n"
+                        f"*Кандидат перенес или отменил собеседование*\n\n"
                         f"Вакансия: ✨*{safe_vacancy_title}*✨\n"
                         f"Город: 📍*{safe_city}*📍\n"
                         f"Имя: {safe_masked_name}\n"

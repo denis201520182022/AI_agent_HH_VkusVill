@@ -82,3 +82,6 @@ http://212.193.26.118:3000
 
 {container="vv_tg_bot"}
 
+
+
+{container=~"vv_(worker|scanner|reminders).*"} != "Rate Limit"

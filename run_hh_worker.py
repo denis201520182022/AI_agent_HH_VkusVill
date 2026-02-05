@@ -220,17 +220,24 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
     recent_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_messages[-10:]])
     
     verify_prompt = (
-        f"Ты — технический контролер системы бронирования. Твоя задача — беспристрастно проверить работу первой модели.\n\n"
+        f"Ты — строгий технический аудитор системы записи. Твоя задача — проверить, соответствует ли дата, предложенная первой моделью, ЖЕЛАНИЮ КАНДИДАТА.\n\n"
         f"[ДИНАМИЧЕСКИЙ КАЛЕНДАРЬ]\n{calendar_context}\n\n"
-        f"[ЗАДАЧА]\n"
-        f"Проанализируй диалог и ПОСЛЕДНЕЕ намерение кандидата. Первая модель предложила: {suggested_date}\n\n"
-        f"ПРАВИЛА АНАЛИЗА:\n"
-        f"1. Если дата {suggested_date} точно соответствует словам кандидата и календарю — подтверди её.\n"
-        f"2. Если модель ошиблась (кандидат просил 'субботу', а это другая дата) — найди и верни ПРАВИЛЬНУЮ дату из календаря.\n"
-        f"3. Если кандидат вообще не называл дату — верни 'none'.\n\n"
+        f"[ВВОДНЫЕ ДАННЫЕ]\n"
+        f"Первая модель предлагает записать на: {suggested_date}\n\n"
+        f"⚠️ КРИТИЧЕСКИ ВАЖНЫЕ ПРАВИЛА АНАЛИЗА (ЧИТАЙ ВНИМАТЕЛЬНО):\n"
+        f"1. АБСОЛЮТНЫЙ ПРИОРИТЕТ — у ПОСЛЕДНЕГО сообщения кандидата.\n"
+        f"   - Если ранее договорились на одну дату, но в конце кандидат спросил 'А можно завтра?' или 'Давайте в пятницу' — значит, он ПЕРЕДУМАЛ.\n"
+        f"   - В этом случае ты ОБЯЗАН вернуть новую дату (завтра/пятницу), а не ту, что была согласована ранее.\n\n"
+        f"2. Сверь дату с календарем:\n"
+        f"   - Если кандидат говорит например 'завтра' — ищи в календаре строку с меткой ЗАВТРА.\n"
+        f"   - Если кандидат говорит день недели (напр. Вторник) — бери ближайший Вторник из таблицы (если не сказано 'следующий').\n\n"
+        f"3. Вердикт:\n"
+        f"   - Если {suggested_date} совпадает с ПОСЛЕДНИМ желанием кандидата — верни её.\n"
+        f"   - Если первая модель проигнорировала смену даты кандидатом — верни ПРАВИЛЬНУЮ дату.\n"
+        f"   - Если кандидат вообще не называл дату или отказался называть — верни 'none'.\n\n"
         f"Ответ строго в формате JSON:\n"
         f"{{\n"
-        f'  "reasoning": "КРАТКОЕ ОБОСНОВАНИЕ ВЫВОДА. Например: Кандидат сказал «в субботу», что по календарю 2026-02-07, а не {suggested_date}.",\n'
+        f'  "reasoning": "Обоснование. Пример: Кандидат сначала согласился на 20-е число, но в последнем сообщении спросил про завтра (21-е). Первая модель ошиблась, оставив 20-е.",\n'
         f'  "correct_date": "YYYY-MM-DD или none"\n'
         f"}}"
     )
@@ -1352,15 +1359,33 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # Конвертируем UTC из базы в дату МСК для корректного сравнения
                     already_stored_date_str = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE).strftime('%Y-%m-%d')
                 
-                # Если даты совпадают, пропускаем дорогой аудит
+                # [FIX START] --- Умная логика запуска аудита ---
+                run_audit = True # По умолчанию проверяем
+                
+                # Если даты совпадают, проверяем, не пытается ли пользователь сменить дату текстом
                 if already_stored_date_str == interview_date:
-                    ctx_logger.info(
-                        f"[{dialogue.hh_response_id}] Дата {interview_date} уже подтверждена в БД. Пропуск аудита.",
-                        extra={"action": "skip_audit_date_match"}
-                    )
-                    run_audit = False
-                else:
-                    run_audit = True
+                    # Слова-триггеры, указывающие на обсуждение времени
+                    time_triggers = [
+                        "завтра", "послезавтра", "сегодня", 
+                        "понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресен"
+                        
+                    ]
+                    # Берем последнее сообщение пользователя
+                    last_user_msg = combined_masked_message.lower()
+                    
+                    # Если в тексте НЕТ слов о времени, то верим совпадению дат и пропускаем аудит (экономим $)
+                    if not any(trigger in last_user_msg for trigger in time_triggers):
+                        ctx_logger.info(
+                            f"[{dialogue.hh_response_id}] Дата {interview_date} совпадает с БД и нет новых триггеров времени. Пропуск аудита.",
+                            extra={"action": "skip_audit_date_match"}
+                        )
+                        run_audit = False
+                    else:
+                         ctx_logger.info(
+                            f"[{dialogue.hh_response_id}] Дата совпадает, но в тексте найдены временные триггеры ('завтра' и т.п.). ПРИНУДИТЕЛЬНЫЙ АУДИТ.",
+                            extra={"action": "force_audit_due_to_keywords"}
+                        )
+                # [FIX END] -------------------------------------
 
                 if run_audit:
                     ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором (в состоянии {new_state}): {interview_date}")
@@ -1436,7 +1461,11 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     current_title_low = (dialogue.vacancy.title or "").lower()
                     current_city_low = (dialogue.vacancy.city or "").lower()
                     
-                    is_spb = 'санкт-петербург' in current_city_low
+                    # --- ИЗМЕНЕНИЕ: Добавлены Мурино и Кудрово ---
+                    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                    is_spb = any(city in current_city_low for city in target_cities)
+                    # ---------------------------------------------
+                    
                     is_warehouse = any(word in current_title_low for word in warehouse_keywords)
 
                     # 2. Формируем текст инструкции в зависимости от дня недели и типа вакансии
@@ -1558,7 +1587,52 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
     #and dialogue.dialogue_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']  # <-- ДОБАВИТЬ
     #and new_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']
         and is_candidate_profile_complete(dialogue.candidate)):
-            
+            # === [START] ПРОВЕРКА: ЗАДАВАЛСЯ ЛИ ВОПРОС ПРО ТЕЛЕФОН ===
+            # Проверяем только если телефона физически нет в базе
+            if not dialogue.candidate.phone_number:
+                
+                # Ключевые слова, которые бот обязан был использовать
+                phone_keywords = ["телефон", "номер"]
+                
+                was_phone_asked = False
+                
+                # Пробегаем по истории сообщений БОТА
+                history_to_check = dialogue.history or []
+                for msg in history_to_check:
+                    if msg.get('role') == 'assistant':
+                        content_lower = str(msg.get('content', '')).lower()
+                        if any(kw in content_lower for kw in phone_keywords):
+                            was_phone_asked = True
+                            break
+                
+                # Если вопроса не было -> Прерываем завершение и пинаем бота
+                if not was_phone_asked:
+                    ctx_logger.warning(
+                        f"[{dialogue.hh_response_id}] 🛑 БЛОКИРОВКА ЗАВЕРШЕНИЯ: Бот забыл спросить телефон (ключевые слова не найдены).",
+                        extra={"action": "forced_phone_question"}
+                    )
+                    
+                    system_command = {
+                        'message_id': f'sys_cmd_ask_phone_force_{time.time()}',
+                        'role': 'user',
+                        'content': (
+                            "[SYSTEM COMMAND] Ты пытаешься завершить анкету (qualification_complete), "
+                            "но ты пропустил этап  'awaiting_phone' и не спросил номер телефона. "
+                            "Это критическая ошибка. "
+                            "Ты ОБЯЗАН спросить номер телефона. Спроси его прямо сейчас."
+                        )
+                    }
+
+                    # Меняем стейт на ожидание телефона, чтобы промпт подстроился
+                    dialogue.dialogue_state = 'clarifying_anything'
+                    # Добавляем команду
+                    dialogue.pending_messages = (dialogue.pending_messages or []) + [system_command]
+                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                    
+                    # Сохраняем и выходим, чтобы в следующем цикле бот задал вопрос
+                    await db.commit()
+                    return
+            # === [END] КОНЕЦ ПРОВЕРКИ ТЕЛЕФОНА ===
             # =====================================================================
             # [START] ФИНАЛЬНАЯ ВЕРИФИКАЦИЯ ДАННЫХ ПЕРЕД РЕШЕНИЕМ
             # =====================================================================
@@ -1584,7 +1658,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 4. Во всех остальных случаях верни название страны как есть (например "Узбекистан").
                 5. Исключение: Если кандидат прямо отказался давать свое гражданство то верни ЕАЭС (по умолчанию).
 
-                1.Исключение: Если кандидат прямо отказался говорить свой возраст то верни 18
+                1.Исключение: Если кандидат в диалоге прямо отказался говорить свой возраст (но вопрос про возраст ему задали) то верни 18
+
+                Важно!!! Если кандидат говорит например, что ему 17, но скоро 18, это значит что ему 17лет и вернуть ты должна 17.
 
                 Верни ответ ТОЛЬКО в формате JSON:
                 {
@@ -1730,7 +1806,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 # Проверяем город
                 city_lower = (dialogue.vacancy.city or "").lower()
-                is_spb = any(x in city_lower for x in ['санкт-петербург'])
+                # --- ИЗМЕНЕНИЕ: Добавлены Мурино и Кудрово ---
+                target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                is_spb = any(x in city_lower for x in target_cities)
+                # ---------------------------------------------
 
                 if not is_spb:
                     # --- 2.1 НЕ СПБ (Регионы) ---
@@ -1853,71 +1932,106 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status == 'qualified':
             
-            # --- ДОБАВИТЬ ЭТОТ БЛОК КОДА ---
+            
             if new_state == 'interview_scheduled_spb':
                 interview_date = extracted_data.get("interview_date")
                 interview_time = extracted_data.get("interview_time")
-
-
-                
 
             # [START] ОБРАБОТКА ПЕРЕНОСА (RESCHEDULE)
             # Если у диалога УЖЕ была записана дата (interview_datetime_utc не пустой), 
             # значит кандидат перезаписывается.
                 if dialogue.interview_datetime_utc is not None:
-                    ctx_logger.info(
-                        f"[{dialogue.hh_response_id}] 🔄 Обнаружен перенос собеседования. Старая дата в БД: {dialogue.interview_datetime_utc}."
-                    )
 
-                    # 1. Если это перенос после Follow-up (по флагу) -> RescheduledNotificationQueue
-                    if dialogue.need_follow_up_resheduled_sent:
-                        ctx_logger.info(
-                            f"[{dialogue.hh_response_id}] Флаг need_follow_up_resheduled_sent=True. "
-                            f"Создаю уведомление в RescheduledNotificationQueue."
-                        )
-                        
-                        if dialogue.rescheduled_alerts:
-                            # Обновляем существующую запись
-                            if dialogue.rescheduled_alerts.status != 'pending':
-                                dialogue.rescheduled_alerts.status = 'pending'
-                                dialogue.rescheduled_alerts.processed_at = None
-                                db.add(dialogue.rescheduled_alerts)
-                        else:
-                            # Создаем новую
-                            new_resched_alert = RescheduledNotificationQueue(
-                                dialogue_id=dialogue.id,
-                                status='pending'
-                            )
-                            db.add(new_resched_alert)
-
-                        dialogue.need_follow_up_resheduled_sent = False
-                        dialogue.dialogue_state = 'post_qualification_chat'
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Счетчик переносов увеличен: {dialogue.reschedule_count}")
-                        dialogue.reschedule_count = (dialogue.reschedule_count or 0) + 1
+                    # 1. ПРОВЕРКА: Действительно ли дата изменилась?
+                    # Конвертируем UTC из БД в Московское время и форматируем в строки для сравнения
+                    stored_msk_dt = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE)
+                    stored_date_str = stored_msk_dt.strftime('%Y-%m-%d')
+                    stored_time_str = stored_msk_dt.strftime('%H:%M')
                     
-                    # 2. Иначе (обычный перенос) -> DeclinedInterviewNotificationQueue
-                    else:
+                    # Флаг изменения данных
+                    is_date_changed = (stored_date_str != interview_date) or (stored_time_str != interview_time)
+
+                    if is_date_changed:
                         ctx_logger.info(
-                            f"[{dialogue.hh_response_id}] Обычный перенос (флаг False). "
-                            f"Создаю уведомление в DeclinedInterviewNotificationQueue."
+                            f"[{dialogue.hh_response_id}] 🔄 Обнаружен перенос собеседования. "
+                            f"Было: {stored_date_str} {stored_time_str}. Стало: {interview_date} {interview_time}."
                         )
+
+                        # 1. Если это перенос после Follow-up (по флагу) -> RescheduledNotificationQueue
+                        if dialogue.need_follow_up_resheduled_sent:
+                            ctx_logger.info(
+                                f"[{dialogue.hh_response_id}] Флаг need_follow_up_resheduled_sent=True. "
+                                f"Создаю уведомление в RescheduledNotificationQueue."
+                            )
                         
-                        if dialogue.declined_interview_alerts:
-                            # Обновляем существующую запись
-                            if dialogue.declined_interview_alerts.status != 'pending':
-                                dialogue.declined_interview_alerts.status = 'pending'
-                                dialogue.declined_interview_alerts.processed_at = None
-                                db.add(dialogue.declined_interview_alerts)
+                            if dialogue.rescheduled_alerts:
+                                # Обновляем существующую запись
+                                if dialogue.rescheduled_alerts.status != 'pending':
+                                    dialogue.rescheduled_alerts.status = 'pending'
+                                    dialogue.rescheduled_alerts.processed_at = None
+                                    db.add(dialogue.rescheduled_alerts)
+                            else:
+                                # Создаем новую
+                                new_resched_alert = RescheduledNotificationQueue(
+                                    dialogue_id=dialogue.id,
+                                    status='pending'
+                                )
+                                db.add(new_resched_alert)
+
+                            dialogue.need_follow_up_resheduled_sent = False
+                            dialogue.dialogue_state = 'post_qualification_chat'
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Счетчик переносов увеличен: {dialogue.reschedule_count}")
+                            dialogue.reschedule_count = (dialogue.reschedule_count or 0) + 1
+                    
+                        # 2. Иначе (обычный перенос) -> DeclinedInterviewNotificationQueue
                         else:
-                            # Создаем новую
-                            reschedule_alert = DeclinedInterviewNotificationQueue(
-                                dialogue_id=dialogue.id,
-                                status='pending'
+                            ctx_logger.info(
+                                f"[{dialogue.hh_response_id}] Обычный перенос (флаг False). "
+                                f"Создаю уведомление в DeclinedInterviewNotificationQueue."
                             )
                             
-                            db.add(reschedule_alert)
+                            if dialogue.declined_interview_alerts:
+                                # Обновляем существующую запись
+                                if dialogue.declined_interview_alerts.status != 'pending':
+                                    dialogue.declined_interview_alerts.status = 'pending'
+                                    dialogue.declined_interview_alerts.processed_at = None
+                                    db.add(dialogue.declined_interview_alerts)
+                            else:
+                                # Создаем новую
+                                reschedule_alert = DeclinedInterviewNotificationQueue(
+                                    dialogue_id=dialogue.id,
+                                    status='pending'
+                                )
+                                
+                                db.add(reschedule_alert)
+                            dialogue.dialogue_state = 'post_qualification_chat'
+
+                        # --- !!! ВАЖНОЕ ДОБАВЛЕНИЕ !!! ---
+                        # Перезаписываем напоминания на новое время
+                        if interview_date and interview_time:
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Перепланирование напоминаний на НОВУЮ дату...")
+                            await interview_reminder_manager.schedule_interview_reminders(
+                                dialogue_id=dialogue.id,
+                                interview_date_str=interview_date,
+                                interview_time_str=interview_time,
+                                db_session=db
+                            )
+                        # ---------------------------------
+
                         dialogue.dialogue_state = 'post_qualification_chat'
-                # [END] ОБРАБОТКА ПЕРЕНОСА
+
+                    else:
+                        # Дата НЕ изменилась (кандидат просто подтвердил то же самое или задал вопрос)
+                        ctx_logger.info(
+                            f"[{dialogue.hh_response_id}] ℹ️ Дата и время собеседования совпадают с БД ({stored_date_str} {stored_time_str}). "
+                            f"Логика переноса (Reschedule) ПРОПУЩЕНА."
+                        )
+                    
+                        # Всегда переводим в чат поддержки после обработки (даже если дата не менялась)
+                        dialogue.dialogue_state = 'post_qualification_chat'    
+                        # [END] ОБРАБОТКА ПЕРЕНОСА
+                
+                
                 else:
                     if interview_date and interview_time:
                         ctx_logger.info(
