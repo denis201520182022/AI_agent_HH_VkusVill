@@ -1,0 +1,33 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # 1. Мониторинг самого Prometheus
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
+
+  # 2. Мониторинг всех воркеров и сканеров
+  - job_name: 'hh_bots' # Переименовано для лучшей идентификации, чтобы не путать с ВкусВиллом
+    metrics_path: '/metrics' # Стандартный путь для большинства библиотек прометеуса
+    static_configs:
+      - targets:
+          # Рекрутер 1
+          - 'scanner_r1:8000' # Укажите порт, на котором ваши сервисы экспортируют метрики
+          - 'worker_r1:8000'
+          # Рекрутер 2
+          - 'scanner_r2:8000'
+          - 'worker_r2:8000'
+
+          # Общие сервисы
+          - 'hh_scanner:8000'
+          - 'hh_worker:8000'
+          - 'hh_reminders:8000'
+          - 'tg_bot:8000'
+    # Переименовываем метку instance, чтобы в Графане было удобно фильтровать
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: '([^:]+):.*'
+        replacement: '$1'
