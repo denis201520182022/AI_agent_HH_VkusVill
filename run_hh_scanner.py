@@ -267,7 +267,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 # --- БЕЗОПАСНЫЙ ДОСТУП К ДАННЫМ РЕЗЮМЕ ---
                 resume_info = resp.get('resume')
                 if not resume_info:
-                    rec_logger.warning(f"Отклик {response_id} без резюме. Пропуск.")
+                    rec_logger.debug(f"Отклик {response_id} без резюме. Пропуск.")
                     continue
 
                 candidate_first_name = resume_info.get('first_name', 'Неизвестно')
