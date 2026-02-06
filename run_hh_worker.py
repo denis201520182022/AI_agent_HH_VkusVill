@@ -216,8 +216,20 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
     """
     Техническая проверка даты (Аудит). Возвращает исправленную дату в формате YYYY-MM-DD.
     """
-    # Собираем последние 10 сообщений для анализа
-    recent_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in history_messages[-10:]])
+    # 1. Фильтруем системные команды и сопоставляем роли для понимания GPT-4o
+    clean_history_lines = []
+    for m in history_messages:
+        content = m.get('content', '')
+        # Пропускаем технические команды
+        if isinstance(content, str) and content.startswith('[SYSTEM COMMAND]'):
+            continue
+        
+        # Определяем человекочитаемую роль
+        role_label = "Кандидат" if m.get('role') == 'user' else "Бот"
+        clean_history_lines.append(f"{role_label}: {content}")
+
+    # 2. Берем последние 10 сообщений для анализа даты
+    recent_text = "\n".join(clean_history_lines[-10:])
     
     verify_prompt = (
         f"Ты — строгий технический аудитор системы записи. Твоя задача — проверить, соответствует ли дата, предложенная первой моделью, ЖЕЛАНИЮ КАНДИДАТА.\n\n"
@@ -234,10 +246,10 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
         f"3. Вердикт:\n"
         f"   - Если {suggested_date} совпадает с ПОСЛЕДНИМ желанием кандидата — верни её.\n"
         f"   - Если первая модель проигнорировала смену даты кандидатом — верни ПРАВИЛЬНУЮ дату.\n"
-        f"   - Если кандидат вообще не называл дату или отказался называть — верни 'none'.\n\n"
+        f"   - Если кандидат в диалоге вообще не называл дату или отказался называть — верни 'none'.\n\n"
         f"Ответ строго в формате JSON:\n"
         f"{{\n"
-        f'  "reasoning": "Обоснование. Пример: Кандидат сначала согласился на 20-е число, но в последнем сообщении спросил про завтра (21-е). Первая модель ошиблась, оставив 20-е.",\n'
+        f'  "reasoning": "Обоснование. Пример: Кандидат сначала согласился на 20-е число, но в последнем сообщении спросил про завтра (21-е). Первая модель ошиблась, оставив 20-е. Не более 2 предложений, пиши кратко",\n'
         f'  "correct_date": "YYYY-MM-DD или none"\n'
         f"}}"
     )
@@ -1229,7 +1241,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Передаем attempt_tracker в функцию
             llm_data = await llm_handler.get_bot_response(
                 system_prompt=final_system_prompt,
-                dialogue_history=dialogue.history or [],
+                dialogue_history=(dialogue.history or [])[-25:],
                 user_message=combined_masked_message,
                 current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
                 attempt_tracker=attempt_tracker,
@@ -1447,14 +1459,20 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 # Если мы дошли сюда, значит дата либо подтверждена аудитом, либо уже была в БД.
                 # Теперь проверяем время для этой даты.
                 # ---------------------------------------------------------
+                # --- ШАГ 2: ПОДСКАЗКА ДНЯ НЕДЕЛИ И РЕГЛАМЕНТА (HINT) ---
                 try:
-                    # 1. Вычисляем реальный день недели
+                    # 1. Получаем текущее время в МСК для сравнения
+                    now_msk = datetime.datetime.now(SPB_TIMEZONE)
+                    today_str = now_msk.strftime('%Y-%m-%d')
+                    current_hour = now_msk.hour
+
+                    # 2. Вычисляем данные о выбранной дате
                     v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
-                    weekday_idx = v_date_obj.weekday() # 0 = Понедельник, 6 = Воскресенье
+                    weekday_idx = v_date_obj.weekday()  # 0 = Пн, 6 = Вс
                     weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
                     correct_weekday = weekdays_ru[weekday_idx]
 
-                    # Определяем, относится ли вакансия к группе "Сборщики/Склад" для спец. расписания в СПб
+                    # Определяем категорию вакансии
                     warehouse_keywords = [
                         'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
                         'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
@@ -1462,44 +1480,53 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     current_title_low = (dialogue.vacancy.title or "").lower()
                     current_city_low = (dialogue.vacancy.city or "").lower()
                     
-                    # --- ИЗМЕНЕНИЕ: Добавлены Мурино и Кудрово ---
                     target_cities = ['санкт-петербург', 'мурино', 'кудрово']
                     is_spb = any(city in current_city_low for city in target_cities)
-                    # ---------------------------------------------
-                    
                     is_warehouse = any(word in current_title_low for word in warehouse_keywords)
 
-                    # 2. Формируем текст инструкции в зависимости от дня недели и типа вакансии
+                    # 3. Определяем базовые слоты по регламенту
                     if weekday_idx == 6:  # Воскресенье
-                        hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
-                            f"По воскресеньям собеседования не проводятся, запись невозможна на этот день."
-                        )
+                        slots = []
                     elif weekday_idx == 5:  # Суббота
-                        hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
-                            f"По субботам запись возможна только на 11:00 или 15:00. "
-                            f"Учти это при генерации ответа."
-                        )
-                    else:  # Будни (0-4)
-                        # Проверяем спец. расписание для сборщиков в СПб
+                        slots = ["11:00", "15:00"]
+                    else:  # Будни
                         if is_spb and is_warehouse:
-                            slots = "10:00, 12:00, 15:00, 16:00"
+                            slots = ["10:00", "12:00", "15:00", "16:00"]
                         else:
-                            slots = "10:00, 12:00, 16:00"
-                            
+                            slots = ["10:00", "12:00", "16:00"]
+
+                    # --- ЛОГИКА ФИЛЬТРАЦИИ ДЛЯ "СЕГОДНЯ" ---
+                    if interview_date == today_str and slots:
+                        # Оставляем только те слоты, которые минимум на 1 час позже текущего времени
+                        # (Чтобы у кандидата было время доехать)
+                        slots = [s for s in slots if int(s.split(':')[0]) > current_hour]
+                    # ---------------------------------------
+
+                    # 4. Формируем текст инструкции
+                    if weekday_idx == 6:
                         hint_content = (
                             f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
-                            f"В этот день доступна запись только на {slots}. "
+                            f"По воскресеньям собеседования не проводятся, запись невозможна. Предложи другой день."
+                        )
+                    elif not slots: # Если это сегодня и все слоты уже прошли
+                        hint_content = (
+                            f"[SYSTEM COMMAND] Внимание!!! Сегодня ({interview_date}) запись на собеседование уже окончена (текущее время {now_msk.strftime('%H:%M')}). "
+                            f"Запись на сегодня невозможна. Предложи кандидату выбрать другой день (например, завтра или в ближайший будний день)."
+                        )
+                    else:
+                        slots_str = ", ".join(slots)
+                        hint_content = (
+                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
+                            f"В этот день доступна запись только на {slots_str}. "
                             f"Учти это при генерации ответа."
                         )
 
-                    # 3. Проверяем историю, чтобы не зациклиться
+                    # 5. Проверяем историю, чтобы не зациклиться
                     history_to_check = (dialogue.history or [])[-5:]
                     already_hinted = any(hint_content == m.get('content') for m in history_to_check)
 
                     if not already_hinted:
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Добавляю регламент дня: {interview_date} ({correct_weekday})")
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Добавляю регламент дня: {interview_date} (Свободно: {slots})")
                         
                         hint_cmd = {
                             'message_id': f'sys_hint_{time.time()}',
@@ -1507,16 +1534,95 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             'content': hint_content
                         }
                         
-                        # Сохраняем в историю и отправляем на перегенерацию
                         dialogue.history = (dialogue.history or []) + [hint_cmd]
                         dialogue.pending_messages = user_entries_to_history 
                         dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
                         
                         await db.commit()
-                        return # <--- Уходим на перегенерацию
+                        return 
                 except Exception as e:
                     ctx_logger.error(f"Ошибка в этапе Hint валидации даты и регламента: {e}")
+            # Вот тут проверку времени
+        # =====================================================================
+        # [START] ШАГ 3: ЖЕСТКАЯ ВАЛИДАЦИЯ ВРЕМЕНИ (TIME ENFORCEMENT)
+        # =====================================================================
+        if new_state in DATE_CRITICAL_STATES:
+            interview_date = extracted_data.get("interview_date")
+            interview_time = extracted_data.get("interview_time")
 
+            # Проверяем время только если и дата, и время уже извлечены моделью
+            if interview_date and interview_time:
+                try:
+                    # 1. Снова вычисляем доступные слоты для этой даты (синхронно с логикой Hint)
+                    now_msk = datetime.datetime.now(SPB_TIMEZONE)
+                    today_str = now_msk.strftime('%Y-%m-%d')
+                    current_hour = now_msk.hour
+
+                    v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
+                    weekday_idx = v_date_obj.weekday()
+                    
+                    # Логика определения слотов (повторяем для точности проверки)
+                    warehouse_keywords = [
+                        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
+                        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
+                    ]
+                    is_warehouse = any(word in (dialogue.vacancy.title or "").lower() for word in warehouse_keywords)
+                    
+                    if weekday_idx == 6: # Вс
+                        allowed_slots = []
+                    elif weekday_idx == 5: # Сб
+                        allowed_slots = ["11:00", "15:00"]
+                    else: # Будни
+                        # Используем ту же логику СПб/Мурино/Кудрово, что и выше
+                        target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                        is_spb_area = any(city in (dialogue.vacancy.city or "").lower() for city in target_cities)
+                        allowed_slots = ["10:00", "12:00", "15:00", "16:00"] if (is_spb_area and is_warehouse) else ["10:00", "12:00", "16:00"]
+
+                    # Фильтр для "сегодня"
+                    if interview_date == today_str:
+                        allowed_slots = [s for s in allowed_slots if int(s.split(':')[0]) > current_hour]
+
+                    # 2. СРАВНЕНИЕ: Проверяем, входит ли время от LLM в список разрешенных
+                    # Мы используем .strip() и проверяем вхождение, чтобы избежать ошибок формата (например "10:00" vs "10:00 ")
+                    clean_time = interview_time.strip()
+                    
+                    if clean_time not in allowed_slots:
+                        ctx_logger.warning(f"🚨 МОДЕЛЬ ОШИБЛАСЬ СО ВРЕМЕНЕМ! Выбрано: {clean_time}, Доступно: {allowed_slots}")
+
+                        # Формируем текст ошибки
+                        if not allowed_slots:
+                            if weekday_idx == 6:
+                                error_msg = f"По воскресеньям ({interview_date}) собеседования не проводятся."
+                            else:
+                                error_msg = f"На сегодня ({interview_date}) запись уже окончена."
+                        else:
+                            error_msg = f"На дату {interview_date} доступно только время: {', '.join(allowed_slots)}. Слот {clean_time} недоступен."
+
+                        time_corr_cmd = {
+                            'message_id': f'sys_time_corr_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM COMMAND] {error_msg} "
+                                f"Предложи выбрать из доступных слотов: {', '.join(allowed_slots) if allowed_slots else 'другой день'}."
+                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_time' в JSON на null, пока кандидат не выберет корректный вариант. Когда кандидат определится со временем, верни его в поле 'interview_time'."
+                            )
+                        }
+
+                        # Сохраняем историю (включая сообщения юзера из этой итерации!) и отправляем на перегенерацию
+                        dialogue.history = (dialogue.history or []) + user_entries_to_history + [time_corr_cmd]
+                        dialogue.pending_messages = user_entries_to_history + [time_corr_cmd]# Чтобы LLM видела, на что она отвечает
+                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        
+                        await db.commit()
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление времени: {clean_time} -> {allowed_slots}")
+                        return # <--- ПРЕРЫВАЕМ и перегенерируем ответ
+
+                except Exception as e:
+                    ctx_logger.error(f"Ошибка в этапе жесткой валидации времени: {e}")
+
+        # =====================================================================
+        # [END] КОНЕЦ ШАГА 3
+        # =====================================================================    
         # Обновляем статус
         if dialogue.status == 'new':
             dialogue.status = 'in_progress'
@@ -1642,9 +1748,20 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 extra={"action": "verification_start"}
             )
 
-            # 1. Формируем полную историю текстом
-            full_history_text = "\n".join([f"{msg.get('role')}: {msg.get('content')}" for msg in (dialogue.history or [])])
-            full_history_text += "\n" + "\n".join([pm.get('content', '') if isinstance(pm, dict) else str(pm) for pm in pending_messages])
+            # 1. Объединяем историю из БД и новые сообщения, которые обработали выше
+            all_messages_for_verify = (dialogue.history or []) + user_entries_to_history
+
+            # 2. Фильтруем системный мусор и помечаем роли
+            verify_history_lines = []
+            for m in all_messages_for_verify:
+                content = m.get('content', '')
+                if isinstance(content, str) and content.startswith('[SYSTEM COMMAND]'):
+                    continue
+                
+                label = "Кандидат" if m.get('role') == 'user' else "Бот"
+                verify_history_lines.append(f"{label}: {content}")
+
+            full_history_text = "\n".join(verify_history_lines)
 
             # 2. Промпт для проверки
             verification_prompt = (
@@ -1884,23 +2001,35 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
     #and dialogue.dialogue_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']  # <-- ДОБАВИТЬ
     #and new_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']
         and not is_candidate_profile_complete(dialogue.candidate)):
+
+
+            missing_fields = []
+            if not dialogue.candidate.citizenship:
+                missing_fields.append("Гражданство")
+            if dialogue.candidate.age is None:
+                missing_fields.append("Возраст")
+            
+            missing_str = ", ".join(missing_fields)
             command_content = (
                 f"[SYSTEM COMMAND] Анкета кандидата не заполнена полностью. "
-                f"Используй историю диалога, чтобы определить, какие из необходимых данных (Возраст, гражданство) кандидат сообщил и верни их в 'extracted_data'. "
-                f"Если какие то данные еще не были предоставлены, задай прямой вопрос кандидату (или вежливо переспроси, если кандидат в течении диалога проигнорировал какой то твой вопрос)."
-            )
+                f"В базе данных отсутствуют обязательные поля: {missing_str}. "
+                f"1. Проверь историю сообщений: возможно, кандидат уже называл эти данные, тогда просто извлеки их в 'extracted_data'. "
+                f"2. Если данных в истории нет, ты ОБЯЗАН задать прямой вопрос кандидату и уточнить: {missing_str}. "
+                f"НЕ ПЕРЕХОДИ в состояние qualification_complete, пока не получишь эти данные.")
+                
 
             system_command = {
                 'message_id': f'sys_cmd_{time.time()}',
                 'role': 'user',
                 'content': command_content
             }
-
-            dialogue.pending_messages = (dialogue.pending_messages or []) + [system_command]
+            dialogue.history = (dialogue.history or []) + user_entries_to_history
+            dialogue.pending_messages =  [system_command]
             dialogue.dialogue_state = 'clarifying_anything'
             # важно обновить last_updated, чтобы воркер как можно скорее обработал это изменение
             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
             await db.commit()
+            ctx_logger.info(f"[{dialogue.hh_response_id}] Анкета не полная. Не хватает: {missing_str}. Отправлено на уточнение.")
             return
 
             #Сюда надо код, который даст команду llm (просто положит в пендинг сообщение с ролью user что анкета не полная, кандидат не сообщил какие то данные, проверь какие данные и запроси их)
@@ -2115,21 +2244,38 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             if new_state == 'declined_vacancy':
                 # --- ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА ОТКАЗА ---
-                # Собираем всю историю диалога + pending_messages для анализа
-                # --- ДОПОЛНИТЕЛЬНАЯ ПРОВЕРКА ОТКАЗА с ПОЛНЫМ УЧЁТОМ ---
-                full_dialogue_text = "\n".join(
-                    [entry.get('content', '') for entry in (dialogue.history or [])]
-                )
-                pending_text = "\n".join(
-                    [pm.get('content', '') for pm in (dialogue.pending_messages or []) if isinstance(pm, dict)]
-                )
-                full_context_for_llm = (full_dialogue_text + "\n" + pending_text).strip()
+                
+                # 1. Объединяем историю и текущие (pending) сообщения
+                all_msgs = (dialogue.history or []) + (dialogue.pending_messages or [])
+                
+                # 2. Фильтруем и добавляем метки ролей
+                clean_history_with_roles = []
+                for m in all_msgs:
+                    if not isinstance(m, dict):
+                        continue
+                        
+                    content = m.get('content', '')
+                    role = m.get('role', '')
+
+                    # Пропускаем технические команды
+                    if content.startswith("[SYSTEM COMMAND]"):
+                        continue
+                    
+                    # Определяем понятную метку роли
+                    role_label = "Кандидат" if role == "user" else "Бот"
+                    
+                    clean_history_with_roles.append(f"{role_label}: {content}")
+                
+                # 3. Берем последние 20 сообщений
+                recent_context_text = "\n".join(clean_history_with_roles[-20:])
+                full_context_for_llm = recent_context_text.strip()
 
                 clarification_prompt = (
                     'Проанализируй диалог и определи: действительно ли кандидат чётко отказался от вакансии? '
+                    'Смотри только на реплики с пометкой "Кандидат". '
                     'Верни ответ строго в формате JSON: {"answer": "yes" или "no"} '
-                    'Ответ "yes" — только если кандидат прямо сказал, что вакансия его не интересует. '
-                    'Если есть хоть малейшее сомнение — верни "no".'
+                    'Ответ "yes" — только если кандидат прямо сказал, что вакансия его не интересует или он отказывается. '
+                    'Если кандидат задает вопросы или сомневается — верни "no".'
                 )
 
                 clarification_attempts = []
@@ -2137,8 +2283,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 try:
                     clarification_result = await llm_handler.get_bot_response(
                         system_prompt=clarification_prompt,
-                        dialogue_history=[],
-                        user_message=full_context_for_llm,
+                        dialogue_history=[], 
+                        user_message=f"ИСТОРИЯ ДИАЛОГА (последние реплики):\n{full_context_for_llm}",
                         current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
                         attempt_tracker=clarification_attempts,
                         skip_instructions=True,
