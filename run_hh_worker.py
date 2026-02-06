@@ -259,7 +259,7 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
             await _log_llm_usage(db, dialogue, "Date_Audit_Call", response['usage_stats'], model_name="gpt-4o")
 
         parsed = response.get('parsed_response', {})
-        return parsed.get("correct_date", suggested_date)
+        return parsed.get("correct_date", suggested_date), parsed.get("reasoning", "Без обоснования")
     except Exception as e:
         logger.error(f"Критическая ошибка аудита даты: {e}", extra=log_extra)
         return suggested_date # В случае падения пропускаем как есть (fallback)
@@ -1394,7 +1394,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # История: старая + то, что юзер прислал сейчас
                     full_hist = (dialogue.history or []) + user_entries_to_history
                     
-                    verified_date = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
+                    verified_date, audit_reason = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
 
                     # СРАВНИВАЕМ
                     if verified_date != interview_date and verified_date != "none":
@@ -1418,7 +1418,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             user_said=user_text_now,
                             llm_suggested=interview_date,
                             verified_date=f"{verified_date} ({v_weekday})",
-                            history_text=full_hist_text
+                            history_text=full_hist_text,
+                            reasoning=audit_reason
                         )
 
                         # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
@@ -1653,21 +1654,23 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 ПРАВИЛА НОРМАЛИЗАЦИИ ГРАЖДАНСТВА:
                 1. Если кандидат гражданин РФ (России), Беларуси (РБ, Республика Беларусь), Киргизии, Армении или Казахстана -> верни строго "ЕАЭС".
-                2. Если другое гражданство, но кандидат сказал, что у него есть именно ВНЖ РФ -> верни строго "внж рф".
-                3. Если другое гражданство, но кандидат сказал, что у него есть именно РВП РФ -> верни строго "рвп рф".
-                4. Во всех остальных случаях верни название страны как есть (например "Узбекистан").
+                2. Если другое гражданство, но кандидат сказал, что у него есть именно ВНЖ РФ (другие документы не считаются!) -> верни строго "внж рф".
+                3. Если другое гражданство, но кандидат сказал, что у него есть именно РВП РФ (другие документы не считаются!) -> верни строго "рвп рф".
+                
+                4. Во всех остальных случаях (только когда не подходят пункты 1, 2, 3) верни название страны как есть (например "Узбекистан").
                 5. Исключение: Если кандидат прямо отказался давать свое гражданство то верни ЕАЭС (по умолчанию).
 
                 1.Исключение: Если кандидат в диалоге прямо отказался говорить свой возраст (но вопрос про возраст ему задали) то верни 18
 
                 Важно!!! Если кандидат говорит например, что ему 17, но скоро 18, это значит что ему 17лет и вернуть ты должна 17.
-                Важно: Виза, студенческая виза, рабочая виза и тд не считаются за гражданство или внж, или рвп, это другие отдельные документы, на них не обращай внимание
+                Важно!!! Виза, студенческая виза, рабочая виза, патент и тд не считаются за гражданство или внж, или рвп, это другие отдельные документы, на них не обращай внимание.
                 Кандидат может писать не на русском языке, это не меняет суть, не отвлекайся на это.
                 
                 Верни ответ ТОЛЬКО в формате JSON:
                 {
                     "age": <целое число или null>,
-                    "citizenship": "<строка или null>"
+                    "citizenship": "<строка или null>",
+                    "reasoning": "<твой краткий анализ и обоснование выбора этих значений, не более двух предложений>"
                 }
                 """
             )
@@ -1753,7 +1756,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         llm_age=verify_age,
                         llm_citizenship=verify_citizenship,
                         history_text=full_history_text,
-                        pending_messages_json=saved_pending_json  # <--- Передаем сохраненный JSON
+                        pending_messages_json=saved_pending_json,
+                        reasoning=verified_data.get('reasoning', "Обоснование не предоставлено")  # <--- Передаем сохраненный JSON
                     )
 
                     # # 3. БЛОКИРУЕМ ДИАЛОГ

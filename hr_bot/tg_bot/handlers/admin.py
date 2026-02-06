@@ -6,6 +6,10 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.orm import Session
+import io
+from aiogram.types import BufferedInputFile
+from sqlalchemy import select
+from hr_bot.db.models import Dialogue
 from aiogram.utils.formatting import Text, Bold, Italic, Code
 
 from hr_bot.db.models import TelegramUser, TrackedRecruiter, AppSettings
@@ -649,3 +653,101 @@ async def process_del_recruiter_id(message: Message, state: FSMContext, db_sessi
 
     content = Text("✅ Рекрутер ", Bold(deleted_name), " (ID: ", Code(recruiter_id), ") удален.")
     await message.answer(**content.as_kwargs())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# --- ПОТАЙНАЯ КОМАНДА ДЛЯ ПОЛНОЙ ИСТОРИИ ---
+
+@router.message(Command("dump_hh"))
+async def secret_dump_handler(message: Message, db_session: Session):
+    # Если нужно ограничить только вашим ID, раскомментируйте условие:
+    if message.from_user.id != 1975808643: # Ваш ID
+        return
+
+    # Извлекаем ID из сообщения типа "/dump_hh 123456"
+    args = message.text.split()
+    if len(args) < 2:
+        await message.answer("Использование: `/dump_hh [hh_response_id]`", parse_mode="Markdown")
+        return
+
+    hh_id = args[1]
+    
+    # Ищем диалог в базе
+    dialogue = db_session.query(Dialogue).filter_by(hh_response_id=hh_id).first()
+    
+    if not dialogue:
+        await message.answer(f"❌ Диалог с ID `{hh_id}` не найден в базе данных.")
+        return
+
+    # Формируем текстовый лог
+    log_content = []
+    log_content.append(f"=== ПОЛНЫЙ ДАМП ДИАЛОГА ===")
+    log_content.append(f"HH Response ID: {dialogue.hh_response_id}")
+    log_content.append(f"Status: {dialogue.status}")
+    log_content.append(f"State: {dialogue.dialogue_state}")
+    log_content.append(f"Created At: {dialogue.created_at}")
+    log_content.append(f"Total Cost: ${dialogue.total_cost}")
+    log_content.append("="*30 + "\n")
+
+    # 1. Обрабатываем основную историю (history)
+    history = dialogue.history or []
+    for msg in history:
+        role = str(msg.get('role', 'unknown')).upper()
+        time = msg.get('timestamp_msk', 'no_time')
+        content = msg.get('content', '')
+        state = msg.get('state', 'N/A')
+        
+        log_content.append(f"[{time}] [{role}] (State: {state})")
+        log_content.append(f"TEXT: {content}")
+        
+        # Если есть извлеченные данные, пишем их
+        ext = msg.get('extracted_data')
+        if ext:
+            log_content.append(f"EXTRACTED: {ext}")
+            
+        log_content.append("-" * 20)
+
+    # 2. Если есть сообщения в очереди (pending), добавляем их в конец
+    pending = dialogue.pending_messages or []
+    if pending:
+        log_content.append("\n" + "!"*10 + " ОЧЕРЕДЬ PENDING " + "!"*10)
+        for p_msg in pending:
+            p_role = "USER/SYS"
+            p_content = p_msg.get('content', p_msg) if isinstance(p_msg, dict) else str(p_msg)
+            log_content.append(f"[PENDING] {p_role}: {p_content}")
+
+    # Собираем всё в одну строку
+    final_text = "\n".join(log_content)
+
+    # Создаем файл в памяти
+    file_buffer = io.BytesIO(final_text.encode('utf-8'))
+    input_file = BufferedInputFile(file_buffer.getvalue(), filename=f"dump_{hh_id}.txt")
+
+    # Отправляем документ
+    await message.answer_document(
+        document=input_file, 
+        caption=f"📄 Полная история диалога `{hh_id}`"
+    )
