@@ -53,7 +53,7 @@ DEBOUNCE_DELAY_SECONDS = 0
 CYCLE_PAUSE_SECONDS = 1
 TEST_NEGOTIATION_ID = None # Установите в None для боевого режима
 MAX_CONCURRENT_RECRUITERS = 10 #одновременно рекрутеров
-MAX_CONCURRENT_DIALOGUES = 40 #одновременно диалогов
+MAX_CONCURRENT_DIALOGUES = 80 #одновременно диалогов
 VACANCY_CACHE_DURATION_MINUTES = 2 # Время кэширования списка вакансий для рекрутера
 # Новые константы для окна доставки напоминаний (местное время сервера)
 REMINDER_START_HOUR_LOCAL = 9  # Например, 9:00 утра
