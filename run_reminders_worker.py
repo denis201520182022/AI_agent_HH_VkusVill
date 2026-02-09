@@ -772,7 +772,7 @@ async def run_reminders_cycle(target_recruiter_ids=None):
     start_time = time.monotonic()
     
     async with SessionLocal() as db:
-        query = select(TrackedRecruiter.id)
+        query = select(TrackedRecruiter.id).filter(TrackedRecruiter.is_auth_active == True)
         # --- ИЗМЕНЕНИЕ: Фильтрация ---
         if target_recruiter_ids:
             query = query.filter(TrackedRecruiter.id.in_(target_recruiter_ids))

@@ -46,6 +46,9 @@ _refresh_locks = {} # Словарь для хранения локов по ID 
 
 # ИЗМЕНЕНИЕ: Тип db изменен на AsyncSession
 async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str | None:
+    if not recruiter.is_auth_active:
+        return None
+    
     now = datetime.datetime.now(datetime.timezone.utc)
 
     # 1. Быстрая проверка токена (без лока)
@@ -61,7 +64,8 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
         
         await db.commit()
         await db.refresh(recruiter) # Принудительно обновляем данные рекрутера из БД
-        # --- КОНЕЦ ДОБАВЛЕННОГО БЛОКА ---
+        if not recruiter.is_auth_active:
+            return None
 
         # 4. Повторная проверка токена (вдруг пока мы ждали лока, другая задача уже обновила его)
         if recruiter.access_token and recruiter.token_expires_at and recruiter.token_expires_at > now:
@@ -119,7 +123,7 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
             if "refresh_token" in tokens:
                 recruiter.refresh_token = tokens["refresh_token"]
             recruiter.token_expires_at = now + datetime.timedelta(seconds=tokens["expires_in"] - 300)
-            # ИЗМЕНЕНИЕ: db.add(recruiter) вместо await asyncio.to_thread(db.add, recruiter)
+            recruiter.is_auth_active = True
             db.add(recruiter)
             # ИЗМЕНЕНИЕ: await db.commit() вместо await asyncio.to_thread(db.commit)
             await db.commit()
@@ -138,11 +142,10 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
                         f"Возвращаем старый токен, так как он все еще действителен."
                     )
                     recruiter.token_expires_at = now + datetime.timedelta(minutes=5)
-                    # ИЗМЕНЕНИЕ: db.add(recruiter) вместо await asyncio.to_thread(db.add, recruiter)
                     db.add(recruiter)
-                    # ИЗМЕНЕНИЕ: await db.commit() вместо await asyncio.to_thread(db.commit)
                     await db.commit()
                     return recruiter.access_token
+                
                 elif error_description in ["password invalidated", "token deactivated"] or oauth_error == "token-revoked":
                     logger.critical(f"Критическая ошибка авторизации для {recruiter.name}: {response.text}")
                     error_message = (
@@ -152,6 +155,10 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
                         f"Действие: Требуется провести повторную авторизацию (восстановить пароль)."
                     )
                     await send_system_alert(error_message, alert_type="admin_only")
+                    recruiter.is_auth_active = False
+                    recruiter.access_token = None
+                    db.add(recruiter)
+                    await db.commit()
                     return None
                 else:
                     logger.critical(f"Ошибка обновления токена для {recruiter.name}: {response.text}")

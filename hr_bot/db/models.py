@@ -103,6 +103,7 @@ class TrackedRecruiter(Base):
     refresh_token = Column(Text, nullable=True)
     access_token = Column(Text, nullable=True)
     token_expires_at = Column(DateTime(timezone=True), nullable=True)
+    is_auth_active = Column(Boolean, default=True, server_default="true", nullable=False)
     vacancies_last_synced_at = Column(DateTime(timezone=True), nullable=True)
     
     dialogues = relationship("Dialogue", back_populates="recruiter")

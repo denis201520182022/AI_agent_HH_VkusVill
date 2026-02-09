@@ -2682,7 +2682,7 @@ async def run_worker_cycle(target_recruiter_ids=None):
         all_recruiters_ids = []
         async with SessionLocal() as db: # Эта сессия только для получения списка ID рекрутеров
             try:
-                query = select(TrackedRecruiter.id)
+                query = select(TrackedRecruiter.id).filter(TrackedRecruiter.is_auth_active == True)
                 if target_recruiter_ids:
                     query = query.filter(TrackedRecruiter.id.in_(target_recruiter_ids))
                 

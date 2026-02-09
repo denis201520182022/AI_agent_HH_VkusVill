@@ -667,7 +667,7 @@ async def main(target_recruiter_ids=None): # Добавь аргумент
         while not shutdown_requested:
             async with SessionLocal() as db:
                 # Фильтруем рекрутеров, если переданы ID
-                query = select(TrackedRecruiter.id)
+                query = select(TrackedRecruiter.id).filter(TrackedRecruiter.is_auth_active == True)
                 if target_recruiter_ids:
                     query = query.filter(TrackedRecruiter.id.in_(target_recruiter_ids))
                 
