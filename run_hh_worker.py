@@ -879,29 +879,22 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         dialogue.is_followup = False
         dialogue.need_follow_up_resheduled_sent = True
         dialogue.dialogue_state = 'init_scheduling_spb' # Было .state (исправлено)
-        
+        # 2. Сохраняем реальные сообщения КАНДИДАТА в историю
+        # (Мы не добавляем сюда системную команду, чтобы избежать дублей в следующем цикле)
+        dialogue.history = (current_history + user_entries_to_history)
+        # 3. Формируем системную команду в pending (от имени user)
         system_command = {
             'message_id': f'sys_cmd_reschedule_{time.time()}',
             'role': 'user',
             'content': '[SYSTEM COMMAND] Кандидат хочет перенести собеседование (пришел из Follow-up). Начни запись на собеседование в Санкт-Петербурге (предложи выбрать день).'
         }
-
-        # ТРЕТИЙ ПУНКТ: Сохраняем системную команду в историю
-        sys_hist_entry = {
-            'message_id': system_command['message_id'],
-            'role': 'system',
-            'content': system_command['content'],
-            'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK')
-        }
         
-        # Сохраняем: старая история + ответы юзера + системная команда
-        final_history = current_history + user_entries_to_history + [sys_hist_entry]
-        dialogue.history = final_history[-150:]
-        
+        # 4. Кладем команду в очередь и обновляем время
         dialogue.pending_messages = [system_command]
         dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
         
         await db.commit()
+        ctx_logger.info("Follow-up: Переход в режим записи выполнен. Команда в очереди.")
         return 
     # -------------------------------------------------
 
@@ -1488,7 +1481,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     if weekday_idx == 6:  # Воскресенье
                         slots = []
                     elif weekday_idx == 5:  # Суббота
-                        slots = ["11:00", "15:00"]
+                        slots = ["14:00"]]
                     else:  # Будни
                         if is_spb and is_warehouse:
                             slots = ["10:00", "12:00", "15:00", "16:00"]
@@ -1572,7 +1565,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     if weekday_idx == 6: # Вс
                         allowed_slots = []
                     elif weekday_idx == 5: # Сб
-                        allowed_slots = ["11:00", "15:00"]
+                        allowed_slots = ["14:00"]
                     else: # Будни
                         # Используем ту же логику СПб/Мурино/Кудрово, что и выше
                         target_cities = ['санкт-петербург', 'мурино', 'кудрово']
