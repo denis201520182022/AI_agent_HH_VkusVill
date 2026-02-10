@@ -1481,7 +1481,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     if weekday_idx == 6:  # Воскресенье
                         slots = []
                     elif weekday_idx == 5:  # Суббота
-                        slots = ["14:00"]]
+                        slots = ["14:00"]
                     else:  # Будни
                         if is_spb and is_warehouse:
                             slots = ["10:00", "12:00", "15:00", "16:00"]
