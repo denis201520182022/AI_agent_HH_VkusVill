@@ -54,7 +54,7 @@ MESSAGES_RECEIVED_TOTAL = Counter('hh_bot_messages_received_total', 'Total incom
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 16, 13, 56, 0, tzinfo=datetime.timezone.utc)
 # --- КОНФИГУРАЦИЯ ---
 DEBOUNCE_DELAY_SECONDS = 0
-CYCLE_PAUSE_SECONDS = 1
+CYCLE_PAUSE_SECONDS = 0,5
 TEST_NEGOTIATION_ID = None # Установите в None для боевого режима
 MAX_CONCURRENT_RECRUITERS = 10 #одновременно рекрутеров
 MAX_CONCURRENT_DIALOGUES = 40 #одновременно диалогов
@@ -691,7 +691,7 @@ async def main(target_recruiter_ids=None): # Добавь аргумент
             await asyncio.gather(*[run_with_sem(r_id) for r_id in recruiter_ids])
             
             # Важно: пауза между циклами сканирования, чтобы не спамить API HH
-            await asyncio.sleep(0) 
+            await asyncio.sleep(CYCLE_PAUSE_SECONDS)
     finally:
         await hh_api_real.close_api_client()
         await close_redis()
