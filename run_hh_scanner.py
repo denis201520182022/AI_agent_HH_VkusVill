@@ -54,7 +54,7 @@ MESSAGES_RECEIVED_TOTAL = Counter('hh_bot_messages_received_total', 'Total incom
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 16, 13, 56, 0, tzinfo=datetime.timezone.utc)
 # --- КОНФИГУРАЦИЯ ---
 DEBOUNCE_DELAY_SECONDS = 0
-CYCLE_PAUSE_SECONDS = 0,5
+CYCLE_PAUSE_SECONDS = 0.5
 TEST_NEGOTIATION_ID = None # Установите в None для боевого режима
 MAX_CONCURRENT_RECRUITERS = 10 #одновременно рекрутеров
 MAX_CONCURRENT_DIALOGUES = 40 #одновременно диалогов
