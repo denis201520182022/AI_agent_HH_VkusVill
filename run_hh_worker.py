@@ -695,7 +695,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         'call_later': ['#QUALIFICATION_RULES#'],
 
         'init_scheduling_spb': ['#SCHEDULING_ALGORITHM#'],
-        'post_qualification_chat': ['#SCHEDULING_ALGORITHM#'],
+        #'post_qualification_chat': ['#SCHEDULING_ALGORITHM#'],
         'scheduling_spb_day': ['#SCHEDULING_ALGORITHM#'],
         'scheduling_spb_time': ['#SCHEDULING_ALGORITHM#'],
         'interview_scheduled_spb': ['#SCHEDULING_ALGORITHM#'],
@@ -1354,7 +1354,19 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             interview_date = extracted_data.get("interview_date")
             interview_time = extracted_data.get("interview_time")
 
-            if interview_date:
+            TIME_KEYWORDS = [
+                "сегодня", "завтра", "послезавтра", "понедельник", "вторник", "сред", "четверг", 
+                "пятниц", "суббот", "воскресен", "январ", "феврал", "март", "апрел", "май", "июн", 
+                "июл", "август", "сентябр", "октябр", "ноябр", "декабр", "число", "время", "числа"
+            ]
+            # Проверяем, есть ли маркеры времени в ответе бота или сообщении юзера
+            bot_text_low = (bot_response_text or "").lower()
+            user_text_low = combined_masked_message.lower()
+            
+            has_time_keywords = any(kw in bot_text_low or kw in user_text_low for kw in TIME_KEYWORDS)
+
+            # Входим в блок, если есть дата в JSON ИЛИ если в тексте обсуждают время
+            if interview_date or has_time_keywords:
 
                 # --- ШАГ 1: ВАЛИДАЦИЯ ДАТЫ (АУДИТ) ---
                 # Сначала проверяем, ту ли вообще дату выбрала модель
@@ -1391,7 +1403,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             extra={"action": "force_audit_due_to_keywords"}
                         )
                 # [FIX END] -------------------------------------
-
+                
                 if run_audit:
                     ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором (в состоянии {new_state}): {interview_date}")
                     
@@ -1447,6 +1459,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         await db.commit()
                         ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление даты ({v_weekday}).")
                         return # <--- ПРЕРЫВАЕМ. К регламенту (времени) перейдем только когда дата будет верной.
+                    
+                    
+                    if verified_date != "none":
+                        interview_date = verified_date
 
                 # --- ШАГ 2: ПОДСКАЗКА ДНЯ НЕДЕЛИ И РЕГЛАМЕНТА (HINT) ---
                 # Если мы дошли сюда, значит дата либо подтверждена аудитом, либо уже была в БД.
@@ -1541,8 +1557,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # [START] ШАГ 3: ЖЕСТКАЯ ВАЛИДАЦИЯ ВРЕМЕНИ (TIME ENFORCEMENT)
         # =====================================================================
         if new_state in DATE_CRITICAL_STATES:
-            interview_date = extracted_data.get("interview_date")
-            interview_time = extracted_data.get("interview_time")
+            
 
             # Проверяем время только если и дата, и время уже извлечены моделью
             if interview_date and interview_time:

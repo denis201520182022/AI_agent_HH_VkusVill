@@ -141,7 +141,20 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
                         f"Попытка обновить токен для {recruiter.name} отклонена: токен еще не истек. "
                         f"Возвращаем старый токен, так как он все еще действителен."
                     )
-                    recruiter.token_expires_at = now + datetime.timedelta(minutes=5)
+                    # Проверяем, существует ли recruiter.token_expires_at и является ли оно datetime объектом.
+                    # Если нет, или если оно в прошлом, то устанавливаем от текущего времени.
+                    # Иначе добавляем 5 минут к существующему значению.
+                    if recruiter.token_expires_at and isinstance(recruiter.token_expires_at, datetime.datetime):
+                        # Добавляем 5 минут к существующему времени истечения токена из БД
+                        recruiter.token_expires_at = recruiter.token_expires_at + datetime.timedelta(minutes=5)
+                    else:
+                        # Если token_expires_at не установлено или неверно, используем 'now' как базовое
+                        recruiter.token_expires_at = now + datetime.timedelta(minutes=5)
+                        logger.warning(
+                            f"recruiter.token_expires_at было некорректным для {recruiter.name}. "
+                            f"Установлено от 'now' + 5 минут."
+                        )
+                    
                     db.add(recruiter)
                     await db.commit()
                     return recruiter.access_token
