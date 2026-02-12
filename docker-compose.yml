@@ -1,5 +1,19 @@
 version: '3.8'
 
+x-limits-python: &python-limits
+  deploy:
+    resources:
+      limits:
+        cpus: '0.30'    # Максимум 30% от одного ядра процессора
+        memory: 350M    # Максимум 350 МБ оперативной памяти (этого хватит для воркера)
+
+x-monitoring-limits: &monitoring-limits
+  deploy:
+    resources:
+      limits:
+        cpus: '0.50'
+        memory: 512M
+
 services:
   # ---------------------------------------------------------------
   # PGBOUNCER (Порт 6433)
@@ -8,6 +22,11 @@ services:
     image: edoburu/pgbouncer
     container_name: vv_pgbouncer
     restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '0.20'
+          memory: 128M
     environment:
       - DB_USER=${DB_USER}
       - DB_PASSWORD=${DB_PASSWORD}
@@ -28,6 +47,7 @@ services:
   # SCANNER (Только 36, 49, 47)
   # ---------------------------------------------------------------
   vv_scanner_36_49_47:
+    <<: *python-limits
     build: .
     container_name: vv_scanner_36_49_47
     restart: always
@@ -51,6 +71,7 @@ services:
   # WORKER (Только 36, 49, 47)
   # ---------------------------------------------------------------
   vv_worker_36_49_47:
+    <<: *python-limits
     build: .
     container_name: vv_worker_36_49_47
     restart: always
@@ -76,6 +97,7 @@ services:
   # SCANNER 
   # ---------------------------------------------------------------
   vv_scanner_29_40_45:
+    <<: *python-limits
     build: .
     container_name: vv_scanner_29_40_45
     restart: always
@@ -99,6 +121,7 @@ services:
   # WORKER 
   # ---------------------------------------------------------------
   vv_worker_29_40_45:
+    <<: *python-limits
     build: .
     container_name: vv_worker_29_40_45
     restart: always
@@ -121,6 +144,7 @@ services:
   # SCANNER 
   # ---------------------------------------------------------------
   vv_scanner_32_39_44:
+    <<: *python-limits
     build: .
     container_name: vv_scanner_32_39_44
     restart: always
@@ -144,6 +168,7 @@ services:
   # WORKER 
   # ---------------------------------------------------------------
   vv_worker_32_39_44:
+    <<: *python-limits
     build: .
     container_name: vv_worker_32_39_44
     restart: always
@@ -168,6 +193,7 @@ services:
   # SCANNER 
   # ---------------------------------------------------------------
   vv_scanner_48_33_50:
+    <<: *python-limits
     build: .
     container_name: vv_scanner_48_33_50
     restart: always
@@ -191,6 +217,7 @@ services:
   # WORKER 
   # ---------------------------------------------------------------
   vv_worker_48_33_50:
+    <<: *python-limits
     build: .
     container_name: vv_worker_48_33_50
     restart: always
@@ -213,6 +240,7 @@ services:
   # SCANNER 
   # ---------------------------------------------------------------
   vv_scanner_46_7_42:
+    <<: *python-limits
     build: .
     container_name: vv_scanner_46_7_42
     restart: always
@@ -236,6 +264,7 @@ services:
   # WORKER 
   # ---------------------------------------------------------------
   vv_worker_46_7_42:
+    <<: *python-limits
     build: .
     container_name: vv_worker_46_7_42
     restart: always
@@ -259,6 +288,7 @@ services:
   # SCANNER 
   # ---------------------------------------------------------------
   vv_scanner_43_38_28:
+    <<: *python-limits
     build: .
     container_name: vv_scanner_43_38_28
     restart: always
@@ -282,6 +312,7 @@ services:
   # WORKER 
   # ---------------------------------------------------------------
   vv_worker_43_38_28:
+    <<: *python-limits
     build: .
     container_name: vv_worker_43_38_28
     restart: always
@@ -304,6 +335,7 @@ services:
   # SCANNER 
   # ---------------------------------------------------------------
   vv_scanner_41_52_37:
+    <<: *python-limits
     build: .
     container_name: vv_scanner_41_52_37
     restart: always
@@ -327,6 +359,7 @@ services:
   # WORKER 
   # ---------------------------------------------------------------
   vv_worker_41_52_37:
+    <<: *python-limits
     build: .
     container_name: vv_worker_41_52_37
     restart: always
@@ -348,6 +381,7 @@ services:
   # REMINDERS (Напоминатор для ВкусВилла)
   # ---------------------------------------------------------------
   vv_reminders:
+    <<: *python-limits
     build: .
     container_name: vv_reminders
     restart: always
@@ -370,6 +404,7 @@ services:
   # TELEGRAM BOT (Для ВкусВилла)
   # ---------------------------------------------------------------
   vv_tg_bot:
+    <<: *python-limits
     build: .
     container_name: vv_tg_bot
     restart: always
@@ -391,6 +426,7 @@ services:
   # МОНИТОРИНГ (Новые порты: Loki 3101, Grafana 3001)
   # ---------------------------------------------------------------
   vv_loki:
+    <<: *monitoring-limits
     image: grafana/loki:2.9.2
     container_name: vv_monitoring_loki
     restart: always
@@ -402,6 +438,7 @@ services:
       - vv_loki_data:/loki
 
   vv_promtail:
+    <<: *monitoring-limits
     image: grafana/promtail:latest
     container_name: vv_monitoring_promtail
     user: root
@@ -414,6 +451,7 @@ services:
       - vv_loki
 
   vv_grafana:
+    <<: *monitoring-limits
     image: grafana/grafana:latest
     container_name: vv_monitoring_grafana
     restart: always
@@ -429,6 +467,7 @@ services:
       - vv_loki
 
   vv_prometheus:
+    <<: *monitoring-limits
     image: prom/prometheus:latest
     container_name: vv_monitoring_prometheus
     restart: always
