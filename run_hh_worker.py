@@ -2728,7 +2728,7 @@ async def run_worker_cycle(target_recruiter_ids=None):
     """Главный цикл, который запускает независимые асинхронные задачи."""
     cycle_start_time = time.monotonic()
     try:
-        logger.debug("Начало нового цикла воркера.")
+        logger.info("Начало нового цикла воркера.")
         prompt_library = knowledge_base.get_prompt_library()
 
         all_recruiters_ids = []
