@@ -158,14 +158,11 @@ def signal_handler(sig, frame):
 async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usage_stats: dict = None, model_name: str = "gpt-4o-mini"):
     """
     Универсальная функция для подсчета токенов и стоимости.
-    ИСПРАВЛЕННАЯ ВЕРСИЯ: исключает Deadlock, разделяя транзакции лога и диалога.
+    Использует текущую сессию БД, чтобы избежать блокировок.
     """
     try:
-        # 1. Выбор тарифа и расчеты (делаем сразу, чтобы не нагружать транзакцию)
+        # 1. Выбор тарифа и расчеты
         pricing = MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
-        price_input = pricing["input"]
-        price_output = pricing["output"]
-
         stats = usage_stats or {}
         p_tokens = stats.get('prompt_tokens', 0)
         c_tokens = stats.get('completion_tokens', 0)
@@ -173,47 +170,32 @@ async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usa
         total_tokens = stats.get('total_tokens', 0)
 
         non_cached_input = max(0, p_tokens - cached_tokens)
-        cost_input_regular = (non_cached_input / 1_000_000) * price_input
-        cost_input_cached = (cached_tokens / 1_000_000) * (price_input / 2) 
-        cost_output = (c_tokens / 1_000_000) * price_output
-        
+        cost_input_regular = (non_cached_input / 1_000_000) * pricing["input"]
+        cost_input_cached = (cached_tokens / 1_000_000) * (pricing["input"] / 2) 
+        cost_output = (c_tokens / 1_000_000) * pricing["output"]
         total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
 
-        # --- ШАГ А: НЕЗАВИСИМАЯ ЗАПИСЬ ЛОГА ---
-        # Используем отдельную сессию ТОЛЬКО для таблицы LlmUsageLog. 
-        # Эту таблицу никто не блокировал, поэтому зависания не будет.
-        async with SessionLocal() as log_db:
-            try:
-                usage_log = LlmUsageLog(
-                    dialogue_id=dialogue.id, # Используем ID из объекта, не загружая сам объект заново
-                    dialogue_state_at_call=f"{context} ({model_name})",
-                    prompt_tokens=p_tokens,
-                    completion_tokens=c_tokens,
-                    cached_tokens=cached_tokens,
-                    total_tokens=total_tokens,
-                    cost=total_call_cost
-                )
-                log_db.add(usage_log)
-                await log_db.commit() # Лог сохранен в БД навсегда
-            except Exception as log_err:
-                logger.error(f"Критическая ошибка записи LlmUsageLog: {log_err}")
+        # 2. Создание записи лога в ТЕКУЩЕЙ сессии
+        usage_log = LlmUsageLog(
+            dialogue_id=dialogue.id,
+            dialogue_state_at_call=f"{context} ({model_name})",
+            prompt_tokens=p_tokens,
+            completion_tokens=c_tokens,
+            cached_tokens=cached_tokens,
+            total_tokens=total_tokens,
+            cost=total_call_cost
+        )
+        db.add(usage_log)
 
-        # --- ШАГ Б: ОБНОВЛЕНИЕ СЧЕТЧИКОВ ДИАЛОГА ---
-        # Обновляем объект dialogue в ОСНОВНОЙ сессии 'db'.
-        # Поскольку 'db' уже держит lock на эту строку, база позволит внести изменения мгновенно.
+        # 3. Обновление счетчиков объекта (в памяти текущей сессии)
         if total_tokens > 0:
             dialogue.total_prompt_tokens = (dialogue.total_prompt_tokens or 0) + p_tokens
             dialogue.total_completion_tokens = (dialogue.total_completion_tokens or 0) + c_tokens
             dialogue.total_cached_tokens = (dialogue.total_cached_tokens or 0) + cached_tokens
             dialogue.total_cost = (dialogue.total_cost or Decimal('0.0')) + total_call_cost
-            
-            # Мы НЕ вызываем здесь db.commit(). 
-            # Эти данные сохранятся вместе с основным прогрессом диалога в конце цикла.
-            # Если случится ошибка (hallucination), эти счетчики откатятся (rollback),
-            # что логично: диалог не сдвинулся. Но лог в LlmUsageLog при этом останется!
 
     except Exception as e:
-        logger.error(f"Ошибка при логировании токенов ({context}): {e}")
+        logger.error(f"Ошибка при подготовке лога LLM ({context}): {e}")
 
 async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_date: str, history_messages: list, calendar_context: str, log_extra: dict) -> str:
     """
