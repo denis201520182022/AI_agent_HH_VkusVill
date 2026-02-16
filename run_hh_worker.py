@@ -52,7 +52,7 @@ logger = logging.getLogger(__name__)
 DEBOUNCE_DELAY_SECONDS = 0
 CYCLE_PAUSE_SECONDS = 3
 TEST_NEGOTIATION_ID = None # Установите в None для боевого режима
-MAX_CONCURRENT_RECRUITERS = 10 #одновременно рекрутеров
+MAX_CONCURRENT_RECRUITERS = 5 #одновременно рекрутеров
 MAX_CONCURRENT_DIALOGUES = 10 #одновременно диалогов
 VACANCY_CACHE_DURATION_MINUTES = 2 # Время кэширования списка вакансий для рекрутера
 # Новые константы для окна доставки напоминаний (местное время сервера)
@@ -158,78 +158,62 @@ def signal_handler(sig, frame):
 async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usage_stats: dict = None, model_name: str = "gpt-4o-mini"):
     """
     Универсальная функция для подсчета токенов и стоимости.
-    :param model_name: 'gpt-4o-mini' или 'gpt-4o' (для выбора тарифа)
+    ИСПРАВЛЕННАЯ ВЕРСИЯ: исключает Deadlock, разделяя транзакции лога и диалога.
     """
-    async with SessionLocal() as log_db:
-        try:
-            local_dialogue = await log_db.get(Dialogue, dialogue.id)
-            if not local_dialogue:
-                logger.error(f"Не удалось найти диалог {dialogue.id} в сессии логирования. Обновление счетчиков пропущено.")
-                return
-            # 1. Выбор тарифа
+    try:
+        # 1. Выбор тарифа и расчеты (делаем сразу, чтобы не нагружать транзакцию)
+        pricing = MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
+        price_input = pricing["input"]
+        price_output = pricing["output"]
 
-            pricing = MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
-            price_input = pricing["input"]
-            price_output = pricing["output"]
+        stats = usage_stats or {}
+        p_tokens = stats.get('prompt_tokens', 0)
+        c_tokens = stats.get('completion_tokens', 0)
+        cached_tokens = stats.get('cached_tokens', 0)
+        total_tokens = stats.get('total_tokens', 0)
 
-            # 2. Извлечение данных (с защитой от None)
-            stats = usage_stats or {}
-            p_tokens = stats.get('prompt_tokens', 0)
-            c_tokens = stats.get('completion_tokens', 0)
-            cached_tokens = stats.get('cached_tokens', 0)
-            total_tokens = stats.get('total_tokens', 0)
+        non_cached_input = max(0, p_tokens - cached_tokens)
+        cost_input_regular = (non_cached_input / 1_000_000) * price_input
+        cost_input_cached = (cached_tokens / 1_000_000) * (price_input / 2) 
+        cost_output = (c_tokens / 1_000_000) * price_output
+        
+        total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
 
-            # 3. Расчет стоимости
-            # Обычные входные токены (минус кеш)
-            non_cached_input = max(0, p_tokens - cached_tokens)
+        # --- ШАГ А: НЕЗАВИСИМАЯ ЗАПИСЬ ЛОГА ---
+        # Используем отдельную сессию ТОЛЬКО для таблицы LlmUsageLog. 
+        # Эту таблицу никто не блокировал, поэтому зависания не будет.
+        async with SessionLocal() as log_db:
+            try:
+                usage_log = LlmUsageLog(
+                    dialogue_id=dialogue.id, # Используем ID из объекта, не загружая сам объект заново
+                    dialogue_state_at_call=f"{context} ({model_name})",
+                    prompt_tokens=p_tokens,
+                    completion_tokens=c_tokens,
+                    cached_tokens=cached_tokens,
+                    total_tokens=total_tokens,
+                    cost=total_call_cost
+                )
+                log_db.add(usage_log)
+                await log_db.commit() # Лог сохранен в БД навсегда
+            except Exception as log_err:
+                logger.error(f"Критическая ошибка записи LlmUsageLog: {log_err}")
+
+        # --- ШАГ Б: ОБНОВЛЕНИЕ СЧЕТЧИКОВ ДИАЛОГА ---
+        # Обновляем объект dialogue в ОСНОВНОЙ сессии 'db'.
+        # Поскольку 'db' уже держит lock на эту строку, база позволит внести изменения мгновенно.
+        if total_tokens > 0:
+            dialogue.total_prompt_tokens = (dialogue.total_prompt_tokens or 0) + p_tokens
+            dialogue.total_completion_tokens = (dialogue.total_completion_tokens or 0) + c_tokens
+            dialogue.total_cached_tokens = (dialogue.total_cached_tokens or 0) + cached_tokens
+            dialogue.total_cost = (dialogue.total_cost or Decimal('0.0')) + total_call_cost
             
-            # Расчет:
-            # Input (обычный) * цена
-            # Input (кеш) * (цена / 2) - обычно скидка 50% на кеш у OpenAI, либо измени логику под свой тариф
-            # Output * цена
-            
-            cost_input_regular = (non_cached_input / 1_000_000) * price_input
-            # Для gpt-4o-mini кеш стоит дешевле, для gpt-4o тоже. Обычно 50% от инпута.
-            cost_input_cached = (cached_tokens / 1_000_000) * (price_input / 2) 
-            cost_output = (c_tokens / 1_000_000) * price_output
-            
-            total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
+            # Мы НЕ вызываем здесь db.commit(). 
+            # Эти данные сохранятся вместе с основным прогрессом диалога в конце цикла.
+            # Если случится ошибка (hallucination), эти счетчики откатятся (rollback),
+            # что логично: диалог не сдвинулся. Но лог в LlmUsageLog при этом останется!
 
-            # 4. Создание записи лога
-            usage_log = LlmUsageLog(
-                dialogue_id=local_dialogue.id,
-                dialogue_state_at_call=f"{context} ({model_name})",
-                prompt_tokens=p_tokens,
-                completion_tokens=c_tokens,
-                cached_tokens=cached_tokens,
-                total_tokens=total_tokens,
-                cost=total_call_cost
-            )
-            log_db.add(usage_log)
-
-            # 4. Обновление счетчиков диалога (только если были токены)
-            # !!! ВАЖНО: Обновляем именно локальную копию (local_dialogue),
-            # которая "живет" в сессии log_db.
-            if total_tokens > 0:
-                local_dialogue.total_prompt_tokens = (local_dialogue.total_prompt_tokens or 0) + p_tokens
-                local_dialogue.total_completion_tokens = (local_dialogue.total_completion_tokens or 0) + c_tokens
-                local_dialogue.total_cached_tokens = (local_dialogue.total_cached_tokens or 0) + cached_tokens
-                local_dialogue.total_cost = (local_dialogue.total_cost or Decimal('0.0')) + total_call_cost
-
-            # 5. Сохраняем и лог, и изменения в диалоге ОДНОЙ ТРАНЗАКЦИЕЙ.
-            # Если здесь произойдет ошибка, откатятся и добавление лога, и обновление счетчиков.
-            await log_db.commit()
-
-            # 6. (Опционально, но рекомендуется) Обновляем "в памяти" оригинальный объект,
-            # чтобы основная функция работала с актуальными данными до своего коммита.
-            if total_tokens > 0:
-                dialogue.total_prompt_tokens = local_dialogue.total_prompt_tokens
-                dialogue.total_completion_tokens = local_dialogue.total_completion_tokens
-                dialogue.total_cached_tokens = local_dialogue.total_cached_tokens
-                dialogue.total_cost = local_dialogue.total_cost
-
-        except Exception as e:
-            logger.error(f"Ошибка при логировании токенов ({context}): {e}")
+    except Exception as e:
+        logger.error(f"Ошибка при логировании токенов ({context}): {e}")
 
 async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_date: str, history_messages: list, calendar_context: str, log_extra: dict) -> str:
     """
