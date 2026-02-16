@@ -31,7 +31,7 @@ def setup_logging(log_filename: str):
         os.makedirs(log_dir)
 
     # Уровни из ENV
-    project_log_level = get_log_level("LOG_LEVEL", "DEBUG")
+    project_log_level = get_log_level("LOG_LEVEL", "INFO")
 
     # --- НАСТРОЙКА JSON FORMATTER ---
     # Мы указываем, какие стандартные поля хотим видеть.
