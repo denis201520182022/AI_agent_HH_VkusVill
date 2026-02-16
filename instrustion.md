@@ -70,7 +70,7 @@ docker-compose up -d --remove-orphans --build
 http://212.193.26.118:3000
 
 
-
+{container=~"vv_(worker|scanner|reminders).*"} |= "5086389710"
 
 
 {container=~"vv_(worker|scanner|reminders).*"}

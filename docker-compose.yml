@@ -35,7 +35,9 @@ services:
       - DB_NAME=${DB_NAME}
       - POOL_MODE=transaction
       - MAX_CLIENT_CONN=1000
-      - DEFAULT_POOL_SIZE=20
+      - DEFAULT_POOL_SIZE=150  # Увеличь до 150
+      - RESERVE_POOL_SIZE=10   # Добавь резерв
+      - QUERY_WAIT_TIMEOUT=120
       - LISTEN_PORT=6432
       - AUTH_TYPE=scram-sha-256
     ports:
