@@ -65,6 +65,7 @@ docker compose up -d
 
 docker compose up -d --build
 
+docker-compose up -d --remove-orphans --build
 
 http://212.193.26.118:3000
 

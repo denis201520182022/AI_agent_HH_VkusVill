@@ -1,3 +1,5 @@
+#hr_bot\tg_bot\keyboards.py
+
 from aiogram.types import (
     ReplyKeyboardMarkup, 
     KeyboardButton, 

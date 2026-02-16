@@ -53,7 +53,7 @@ DEBOUNCE_DELAY_SECONDS = 0
 CYCLE_PAUSE_SECONDS = 1
 TEST_NEGOTIATION_ID = None # Установите в None для боевого режима
 MAX_CONCURRENT_RECRUITERS = 10 #одновременно рекрутеров
-MAX_CONCURRENT_DIALOGUES = 80 #одновременно диалогов
+MAX_CONCURRENT_DIALOGUES = 20 #одновременно диалогов
 VACANCY_CACHE_DURATION_MINUTES = 2 # Время кэширования списка вакансий для рекрутера
 # Новые константы для окна доставки напоминаний (местное время сервера)
 REMINDER_START_HOUR_LOCAL = 9  # Например, 9:00 утра
@@ -152,65 +152,84 @@ def signal_handler(sig, frame):
     global shutdown_requested
     logger.info("Получен сигнал остановки. Завершаем работу...")
     shutdown_requested = True
+
+
+    
 async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usage_stats: dict = None, model_name: str = "gpt-4o-mini"):
     """
     Универсальная функция для подсчета токенов и стоимости.
     :param model_name: 'gpt-4o-mini' или 'gpt-4o' (для выбора тарифа)
     """
-    try:
-        # 1. Выбор тарифа
-        pricing = MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
-        price_input = pricing["input"]
-        price_output = pricing["output"]
+    async with SessionLocal() as log_db:
+        try:
+            local_dialogue = await log_db.get(Dialogue, dialogue.id)
+            if not local_dialogue:
+                logger.error(f"Не удалось найти диалог {dialogue.id} в сессии логирования. Обновление счетчиков пропущено.")
+                return
+            # 1. Выбор тарифа
 
-        # 2. Извлечение данных (с защитой от None)
-        stats = usage_stats or {}
-        p_tokens = stats.get('prompt_tokens', 0)
-        c_tokens = stats.get('completion_tokens', 0)
-        cached_tokens = stats.get('cached_tokens', 0)
-        total_tokens = stats.get('total_tokens', 0)
+            pricing = MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
+            price_input = pricing["input"]
+            price_output = pricing["output"]
 
-        # 3. Расчет стоимости
-        # Обычные входные токены (минус кеш)
-        non_cached_input = max(0, p_tokens - cached_tokens)
-        
-        # Расчет:
-        # Input (обычный) * цена
-        # Input (кеш) * (цена / 2) - обычно скидка 50% на кеш у OpenAI, либо измени логику под свой тариф
-        # Output * цена
-        
-        cost_input_regular = (non_cached_input / 1_000_000) * price_input
-        # Для gpt-4o-mini кеш стоит дешевле, для gpt-4o тоже. Обычно 50% от инпута.
-        cost_input_cached = (cached_tokens / 1_000_000) * (price_input / 2) 
-        cost_output = (c_tokens / 1_000_000) * price_output
-        
-        total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
+            # 2. Извлечение данных (с защитой от None)
+            stats = usage_stats or {}
+            p_tokens = stats.get('prompt_tokens', 0)
+            c_tokens = stats.get('completion_tokens', 0)
+            cached_tokens = stats.get('cached_tokens', 0)
+            total_tokens = stats.get('total_tokens', 0)
 
-        # 4. Создание записи лога
-        usage_log = LlmUsageLog(
-            dialogue_id=dialogue.id,
-            dialogue_state_at_call=f"{context} ({model_name})", # Добавим модель в название стейта для наглядности в админке
-            prompt_tokens=p_tokens,
-            completion_tokens=c_tokens,
-            cached_tokens=cached_tokens,
-            total_tokens=total_tokens,
-            cost=total_call_cost
-        )
-        db.add(usage_log)
+            # 3. Расчет стоимости
+            # Обычные входные токены (минус кеш)
+            non_cached_input = max(0, p_tokens - cached_tokens)
+            
+            # Расчет:
+            # Input (обычный) * цена
+            # Input (кеш) * (цена / 2) - обычно скидка 50% на кеш у OpenAI, либо измени логику под свой тариф
+            # Output * цена
+            
+            cost_input_regular = (non_cached_input / 1_000_000) * price_input
+            # Для gpt-4o-mini кеш стоит дешевле, для gpt-4o тоже. Обычно 50% от инпута.
+            cost_input_cached = (cached_tokens / 1_000_000) * (price_input / 2) 
+            cost_output = (c_tokens / 1_000_000) * price_output
+            
+            total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
 
-        # 5. Обновление счетчиков диалога (только если были токены)
-        if total_tokens > 0:
-            dialogue.total_prompt_tokens += p_tokens
-            dialogue.total_completion_tokens += c_tokens
-            dialogue.total_cached_tokens += cached_tokens
-            dialogue.total_cost += total_call_cost
+            # 4. Создание записи лога
+            usage_log = LlmUsageLog(
+                dialogue_id=local_dialogue.id,
+                dialogue_state_at_call=f"{context} ({model_name})",
+                prompt_tokens=p_tokens,
+                completion_tokens=c_tokens,
+                cached_tokens=cached_tokens,
+                total_tokens=total_tokens,
+                cost=total_call_cost
+            )
+            log_db.add(usage_log)
 
-        # 6. Сохранение
-        #await db.commit()
-        #await db.refresh(dialogue)
+            # 4. Обновление счетчиков диалога (только если были токены)
+            # !!! ВАЖНО: Обновляем именно локальную копию (local_dialogue),
+            # которая "живет" в сессии log_db.
+            if total_tokens > 0:
+                local_dialogue.total_prompt_tokens = (local_dialogue.total_prompt_tokens or 0) + p_tokens
+                local_dialogue.total_completion_tokens = (local_dialogue.total_completion_tokens or 0) + c_tokens
+                local_dialogue.total_cached_tokens = (local_dialogue.total_cached_tokens or 0) + cached_tokens
+                local_dialogue.total_cost = (local_dialogue.total_cost or Decimal('0.0')) + total_call_cost
 
-    except Exception as e:
-        logger.error(f"Ошибка при логировании токенов ({context}): {e}")
+            # 5. Сохраняем и лог, и изменения в диалоге ОДНОЙ ТРАНЗАКЦИЕЙ.
+            # Если здесь произойдет ошибка, откатятся и добавление лога, и обновление счетчиков.
+            await log_db.commit()
+
+            # 6. (Опционально, но рекомендуется) Обновляем "в памяти" оригинальный объект,
+            # чтобы основная функция работала с актуальными данными до своего коммита.
+            if total_tokens > 0:
+                dialogue.total_prompt_tokens = local_dialogue.total_prompt_tokens
+                dialogue.total_completion_tokens = local_dialogue.total_completion_tokens
+                dialogue.total_cached_tokens = local_dialogue.total_cached_tokens
+                dialogue.total_cost = local_dialogue.total_cost
+
+        except Exception as e:
+            logger.error(f"Ошибка при логировании токенов ({context}): {e}")
 
 async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_date: str, history_messages: list, calendar_context: str, log_extra: dict) -> str:
     """
@@ -1335,14 +1354,38 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         extracted_data = llm_response.get("extracted_data")
 
         # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
+        # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
         if new_state not in ALLOWED_STATES:
             ctx_logger.error(
-                f"[{dialogue.hh_response_id}] CRITICAL: LLM hallucinated invalid state: '{new_state}'. "
-                f"Valid states are: {ALLOWED_STATES}",
+                f"[{dialogue.hh_response_id}] CRITICAL: LLM hallucinated invalid state: '{new_state}'.",
                 extra={"action": "invalid_state_detected", "invalid_state": new_state}
             )
-            # Вызываем ошибку, чтобы откатить транзакцию (db.rollback) и не сохранять мусор в БД
-            raise ValueError(f"Invalid state returned by LLM: {new_state}")
+            
+            # 1. Формируем текст замечания для модели
+            hallucination_corr_cmd = {
+                'message_id': f'sys_state_hallucination_{time.time()}',
+                'role': 'user',
+                'content': (
+                    f"[SYSTEM COMMAND] В твоем последнем ответе произошла техническая ошибка: "
+                    f"ты вернул недопустимое состояние (new_state) '{new_state}'. "
+                    f"Такого состояния НЕ СУЩЕСТВУЕТ в твоей инструкции. "
+                    f"Пожалуйста, будь внимательнее, проанализируй контекст заново и выбери "
+                    f"корректное состояние (new_state) СТРОГО по инструкциям"
+                )
+            }
+
+            # 2. Сохраняем историю (чтобы бот видел, на что он отвечал) 
+            # и добавляем системную команду в очередь (pending_messages)
+            dialogue.history = (dialogue.history or []) + user_entries_to_history
+            dialogue.pending_messages = [hallucination_corr_cmd]
+            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+
+            # 3. Фиксируем изменения в базе и выходим. 
+            # В следующем цикле воркер придет с этой командой к LLM.
+            await db.commit()
+            ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление галлюцинации стейта: {new_state}")
+            return 
+        # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
         # =====================================================================
         # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ (для Time Selection и Final Booking)

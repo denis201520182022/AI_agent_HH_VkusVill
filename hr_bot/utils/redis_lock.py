@@ -79,7 +79,7 @@ class DistributedSemaphore:
                 # --- ДОБАВЛЕНО ЛОГИРОВАНИЕ ОЖИДАНИЯ ---
                 current_time = time.time()
                 if current_time - last_log_time > log_interval:
-                    logger.warning(
+                    logger.debug(
                         f"⏳ Semaphore '{self.name}' is BUSY (Current: {result}/{self.limit}). "
                         f"Waiting for {int(current_time - start_wait_time)}s..."
                     )

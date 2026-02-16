@@ -1,3 +1,5 @@
+#hr_bot\tg_bot\filters.py
+
 from aiogram.filters import BaseFilter
 from aiogram.types import Message
 from sqlalchemy.orm import Session
