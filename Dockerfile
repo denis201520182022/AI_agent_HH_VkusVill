@@ -5,6 +5,9 @@ FROM python:3.11-bookworm
 WORKDIR /app
 
 # Устанавливаем часовой пояс (важно для логов и расписаний)
+RUN apt-get update && apt-get install -y \
+    postgresql-client \
+    && rm -rf /var/lib/apt/lists/*
 ENV TZ=Europe/Moscow
 RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 

@@ -97,7 +97,7 @@ async def limits_menu(message: Message, db_session: Session):
         Bold("📊 Управление балансом:"), "\n\n",
         "Текущий баланс: ", Bold(f"{settings.balance:.2f}"), " руб.\n\n",
         
-        Bold("📈 История затрат (всего c 25.12 13:35):"), "\n",
+        Bold("📈 История затрат:"), "\n",
         "- Потрачено на диалоги: ", Bold(f"{settings.total_spent_on_dialogues:.2f}"), " руб.\n",
         "- Потрачено на напоминания: ", Bold(f"{settings.total_spent_on_reminders:.2f}"), " руб.\n",
         "- Потрачено на follow-up: ", Bold(f"{settings.total_spent_on_followups:.2f}"), " руб.\n\n", # <-- ДОБАВЛЕНО

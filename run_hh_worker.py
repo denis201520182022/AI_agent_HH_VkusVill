@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
+from hr_bot.utils.data_verification_notifier import send_cost_alert
 import re
 from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
 from hr_bot.db.models import InterviewFollowup, RescheduledNotificationQueue, DeclinedInterviewNotificationQueue, RejectedNotificationQueue
@@ -84,6 +85,79 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
     except (ValueError, TypeError):
         return "время не определено"
 
+def _has_forbidden_restrictions(history: list) -> bool:
+    """
+    Проверяет историю сообщений кандидата на наличие стоп-слов.
+    Игнорирует системные команды и сообщения бота.
+    """
+    if not history:
+        return False
+
+    # Список строго по ТЗ (без правок, без удаления дублей)
+    forbidden_phrases = [
+        "Проблемы со слухом",
+        "плохо слышу",
+        "проблемы со слухом",
+        "нарушение слуха",
+        "тугоухость",
+        "глухота",
+        "слабослышащий",
+        "глухонемой",
+        "глухой",
+        "глухая",
+        "слуховой аппарат",
+        "инвалидность по слуху",
+        "группа по слуху",
+        "Проблемы со зрением",
+        "нарушение зрения",
+        "инвалид по зрению",
+        "слепой",
+        "слабовидящий",
+        "Нарушения речи",
+        "нарушение речи",
+        "проблемы с речью",
+        "Плохо владеет русским языком / не говорит по-русски",
+        "не говорю по-русски",
+        "не знаю русский",
+        "плохо знаю русский",
+        "русский плохо",
+        "русский слабый",
+        "не понимаю по-русски",
+        "не понимаю русский язык",
+        "можно на английском",
+        "можно на таджикском",
+        "можно на узбекском",
+        "нужен переводчик",
+        "плохо понимать",
+        "плохо говорить",
+        "русский маленький",
+        "говорить мало",
+        "есть ограничения по здоровью",
+        "есть инвалидность",
+        "есть группа",
+        "есть медицинские ограничения"
+    ]
+
+    user_text_parts = []
+    
+    for m in history:
+        if not isinstance(m, dict):
+            continue
+            
+        role = m.get('role')
+        content = str(m.get('content', ''))
+
+        # Фильтр: только сообщения пользователя, НЕ системные команды
+        if role == 'user' and not content.startswith('[SYSTEM COMMAND]'):
+            user_text_parts.append(content.lower())
+
+    full_user_text = " ".join(user_text_parts)
+
+    for phrase in forbidden_phrases:
+        if phrase.lower() in full_user_text:
+            return True
+            
+    return False
 
 def _validate_age_in_text(text: str, suggested_age: any) -> bool:
     """
@@ -665,19 +739,19 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     required_blocks = ['#ROLE_AND_STYLE#']
 
     state_specific_blocks = {
-        'initial_processing': ['#QUALIFICATION_RULES#'],
-        'awaiting_questions': ['#QUALIFICATION_RULES#'],
-        'awaiting_phone': ['#QUALIFICATION_RULES#'],
-        'awaiting_city': ['#QUALIFICATION_RULES#'],
-        'awaiting_readiness': ['#QUALIFICATION_RULES#'],
-        'awaiting_citizenship': ['#QUALIFICATION_RULES#'],
-        'clarifying_citizenship': ['#QUALIFICATION_RULES#','#CLARI#'],
-        'awaiting_age': ['#QUALIFICATION_RULES#'],
-        'clarifying_anything': ['#QUALIFICATION_RULES#'],
-        'clarifying_declined_vacancy': ['#QUALIFICATION_RULES#'],
+        'initial_processing': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'awaiting_questions': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'awaiting_phone': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'awaiting_city': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'awaiting_readiness': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'awaiting_citizenship': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'clarifying_citizenship': ['#QUALIFICATION_RULES#','#CLARI#', '#DECLINED_VAC#'],
+        'awaiting_age': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'clarifying_anything': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'clarifying_declined_vacancy': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
 
-        'qualification_complete': ['#QUALIFICATION_RULES#'],
-        'call_later': ['#QUALIFICATION_RULES#'],
+        'qualification_complete': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
+        'call_later': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
 
         'init_scheduling_spb': ['#SCHEDULING_ALGORITHM#'],
         #'post_qualification_chat': ['#SCHEDULING_ALGORITHM#'],
@@ -1486,6 +1560,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                     # 2. Вычисляем данные о выбранной дате
                     v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
+                    is_feb_23 = (v_date_obj.month == 2 and v_date_obj.day == 23)
                     weekday_idx = v_date_obj.weekday()  # 0 = Пн, 6 = Вс
                     weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
                     correct_weekday = weekdays_ru[weekday_idx]
@@ -1503,7 +1578,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     is_warehouse = any(word in current_title_low for word in warehouse_keywords)
 
                     # 3. Определяем базовые слоты по регламенту
-                    if weekday_idx == 6:  # Воскресенье
+                    if weekday_idx == 6 or is_feb_23:  # Добавили проверку на 23 февраля
                         slots = []
                     elif weekday_idx == 5:  # Суббота
                         slots = ["14:00"]
@@ -1521,7 +1596,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # ---------------------------------------
 
                     # 4. Формируем текст инструкции
-                    if weekday_idx == 6:
+                    if is_feb_23:
+                        hint_content = (
+                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} — это ПРАЗДНИК (23 февраля)!!! "
+                            f"В праздничные дни собеседования не проводятся. Запись невозможна. Предложи другой день."
+                        )
+
+                    elif weekday_idx == 6:
+                    
                         hint_content = (
                             f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
                             f"По воскресеньям собеседования не проводятся, запись невозможна. Предложи другой день."
@@ -1585,8 +1667,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
                     ]
                     is_warehouse = any(word in (dialogue.vacancy.title or "").lower() for word in warehouse_keywords)
-                    
-                    if weekday_idx == 6: # Вс
+                    is_feb_23 = (v_date_obj.month == 2 and v_date_obj.day == 23) # <--- НОВАЯ СТРОКА
+                    if weekday_idx == 6 or is_feb_23: # Добавили проверку
                         allowed_slots = []
                     elif weekday_idx == 5: # Сб
                         allowed_slots = ["14:00"]
@@ -1609,7 +1691,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                         # Формируем текст ошибки
                         if not allowed_slots:
-                            if weekday_idx == 6:
+                            
+                            if is_feb_23:
+                                error_msg = f"23 февраля ({interview_date}) — праздничный день, офисы закрыты, собеседования не проводятся."
+                            elif weekday_idx == 6:
                                 error_msg = f"По воскресеньям ({interview_date}) собеседования не проводятся."
                             else:
                                 error_msg = f"На сегодня ({interview_date}) запись уже окончена."
@@ -1924,6 +2009,19 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             is_eligible = check_candidate_eligibility(dialogue.candidate)
 
+            # --- НОВАЯ ПРОВЕРКА НА ОГРАНИЧЕНИЯ ---
+            # Собираем полную историю (из БД + то что пришло сейчас)
+            full_history_for_filter = (dialogue.history or []) + user_entries_to_history
+            has_restrictions = _has_forbidden_restrictions(full_history_for_filter)
+            
+            if has_restrictions:
+                ctx_logger.info(
+                    f"[{dialogue.hh_response_id}] ОТКАЗ: В диалоге найдены стоп-слова (здоровье/язык).",
+                    extra={"action": "qualification_failed_by_restrictions"}
+                )
+                is_eligible = False # Принудительно ставим False, чтобы сработал блок отказа ниже
+            # -------------------------------------
+
             if not is_eligible:
                 # --- СЦЕНАРИЙ 1: ОТКАЗ ---
                 ctx_logger.info(
@@ -2133,6 +2231,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                             dialogue.need_follow_up_resheduled_sent = False
                             dialogue.dialogue_state = 'post_qualification_chat'
+                            new_state = 'post_qualification_chat'
                             ctx_logger.info(f"[{dialogue.hh_response_id}] Счетчик переносов увеличен: {dialogue.reschedule_count}")
                             dialogue.reschedule_count = (dialogue.reschedule_count or 0) + 1
                     
@@ -2158,6 +2257,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                                 
                                 db.add(reschedule_alert)
                             dialogue.dialogue_state = 'post_qualification_chat'
+                            new_state = 'post_qualification_chat'
 
                         # --- !!! ВАЖНОЕ ДОБАВЛЕНИЕ !!! ---
                         # Перезаписываем напоминания на новое время
@@ -2172,6 +2272,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         # ---------------------------------
 
                         dialogue.dialogue_state = 'post_qualification_chat'
+                        new_state = 'post_qualification_chat'
 
                     else:
                         # Дата НЕ изменилась (кандидат просто подтвердил то же самое или задал вопрос)
@@ -2181,7 +2282,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         )
                     
                         # Всегда переводим в чат поддержки после обработки (даже если дата не менялась)
-                        dialogue.dialogue_state = 'post_qualification_chat'    
+                        dialogue.dialogue_state = 'post_qualification_chat'
+                        new_state = 'post_qualification_chat'    
                         # [END] ОБРАБОТКА ПЕРЕНОСА
                 
                 
@@ -2197,13 +2299,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             interview_time_str=interview_time,
                             db_session=db
                         )
-                        dialogue.dialogue_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                        dialogue.dialogue_state = 'post_qualification_chat' 
+                        new_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
                         
                     else:
                         ctx_logger.error(
                             f"LLM установил 'interview_scheduled_spb', но не предоставил "
                             f"interview_date или interview_time для диалога {dialogue.id}. Напоминания не будут запланированы."
                         )
+
         # --- КОНЕЦ ДОБАВЛЕНИЯ ---
 
         if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status != 'qualified':
@@ -2248,7 +2352,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         interview_time_str=interview_time,
                         db_session=db
                     )
-                    dialogue.dialogue_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                    dialogue.dialogue_state = 'post_qualification_chat'
+                    new_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
                     
                 else:
                     ctx_logger.error(
@@ -2492,12 +2597,35 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Если стейт подразумевает диалог (awaiting_age, awaiting_phone, scheduling и т.д.),
             # а бот молчит — это ошибка генерации.
             else:
-                ctx_logger.error(
-                    f"[{dialogue.hh_response_id}] ОШИБКА: LLM вернула пустоту для разговорного стейта '{new_state}'. Вызываю RETRY.",
-                    extra={"action": "empty_response_error_retry", "state": new_state}
+                
+                ctx_logger.warning(
+                    f"[{dialogue.hh_response_id}] LLM вернула пустоту для стейта '{new_state}'. Отправляю системную команду на перегенерацию.",
+                    extra={"action": "empty_response_fix_injected", "state": new_state}
                 )
-                # Мы специально кидаем ошибку, чтобы сработал rollback и бот попробовал снова в следующем цикле
-                raise ValueError(f"Empty response text forbidden for conversational state: {new_state}")
+                
+                # 1. Сначала сохраняем то, что пользователь написал в этом цикле, 
+                # чтобы эти сообщения не пропали и бот их "увидел" в истории.
+                dialogue.history = (dialogue.history or []) + user_entries_to_history
+
+                # 2. Формируем корректирующую команду
+                correction_cmd = {
+                    'message_id': f'sys_empty_corr_{time.time()}',
+                    'role': 'user',
+                    'content': (
+                        f"[SYSTEM COMMAND] В своем последнем ответе ты хотел оставить пустым поле 'response_text', "
+                        f"Для состояния {new_state} ТЕКСТ ОТВЕТА ОБЯЗАТЕЛЕН."
+                    )
+                }
+
+                # 3. Передаем команду в pending_messages
+                dialogue.pending_messages = [correction_cmd]
+                
+                # 4. Обновляем время, чтобы воркер сразу подхватил диалог снова
+                dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+
+                # 5. Фиксируем изменения. Теперь входные данные для LLM изменятся!
+                await db.commit()
+                return 
 
         # Отправка сообщения
         message_sent = await hh_api.send_message(recruiter, db, dialogue.hh_response_id, bot_response_text)
@@ -2522,7 +2650,34 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             dialogue.dialogue_state = new_state
             dialogue.pending_messages = None
             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+            # === ПРОВЕРКА АНОМАЛЬНОЙ СТОИМОСТИ (С ЗАЩИТОЙ ОТ СПАМА ЧЕРЕЗ REDIS) ===
+            try:
+                total_rub = float(dialogue.total_cost or 0) * 85.0
+                if total_rub > 10.0:
+                    # Ключ в редисе, который скажет нам, что мы УЖЕ слали алерт по этому диалогу
+                    # Ставим время жизни 3 дня (259200 сек), чтобы ключ сам удалился
+                    alert_key = f"cost_alert_sent:{dialogue.id}"
+                    
+                    # acquire_lock вернет True, если ключа нет (и создаст его), 
+                    # или False, если ключ уже есть.
+                    # Мы используем это как "флаг однократности"
+                    already_sent = not await acquire_lock(alert_key, timeout=259200)
 
+                    if not already_sent:
+                        ctx_logger.warning(f"💸 Стоимость диалога {total_rub:.2f} руб. Отправляю алерт.")
+                        await send_cost_alert(
+                            dialogue_id=dialogue.id,
+                            hh_response_id=dialogue.hh_response_id,
+                            total_cost_rub=total_rub,
+                            history=dialogue.history or [],
+                            recruiter_name=recruiter.name if recruiter else "Неизвестен",
+                            vacancy_title=dialogue.vacancy.title if dialogue.vacancy else "Неизвестна"
+                        )
+                    else:
+                        ctx_logger.debug("Алерт стоимости уже отправлялся ранее, пропускаем.")
+            except Exception as cost_alert_err:
+                ctx_logger.error(f"Ошибка в блоке алерта стоимости: {cost_alert_err}")
+        
             # Flush для проверки constraint violations перед commit
             await db.flush()
             await db.commit()

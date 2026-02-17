@@ -421,6 +421,7 @@ services:
     command: python run_telegram_bot.py
     volumes:
       - ./logs:/app/logs
+      - ./backups:/app/backups
     depends_on:
       - vv_pgbouncer
     extra_hosts:

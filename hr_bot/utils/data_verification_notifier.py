@@ -1,3 +1,5 @@
+#hr_bot\utils\data_verification_notifier.py
+
 import os
 import logging
 from aiogram import Bot
@@ -113,3 +115,72 @@ async def send_date_conflict_alert(
 
     except Exception as e:
         logger.error(f"Ошибка при отправке алерта даты: {e}", exc_info=True)
+
+
+
+async def send_cost_alert(
+    dialogue_id: int,
+    hh_response_id: str,
+    total_cost_usd: float,
+    total_cost_rub: float,
+    history: list,
+    recruiter_name: str,
+    vacancy_title: str
+):
+    """
+    Отправляет уведомление об аномально дорогом диалоге.
+    """
+    admin_id = "1975808643"
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+
+    if not token or not admin_id:
+        logger.error("Не настроен TELEGRAM_BOT_TOKEN или ADMIN_TG_ID.")
+        return
+
+    try:
+        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)) as bot:
+            
+            # Ссылка на диалог в HH (для быстрого перехода)
+            hh_link = f"https://spb.hh.ru/negotiations/{hh_response_id}"
+            
+            alert_text = (
+                f"💰 **ALARM: Аномально дорогой диалог**\n\n"
+                f"ID диалога: `{esc(dialogue_id)}`\n"
+                f"Рекрутер: *{esc(recruiter_name)}*\n"
+                f"Вакансия: *{esc(vacancy_title)}*\n\n"
+                f"💵 **Затраты:**\n"
+                f"Итого в RUB: `{esc(round(total_cost_rub, 2))} руб.`\n"
+                f"Итого в USD: `${esc(round(total_cost_usd, 4))}`\n\n"
+                f"🔗 [Открыть переписку на HH]({hh_link})\n\n"
+                f"⚠️ *Рекомендуется проверить историю на предмет зацикливания или слишком длинных промптов.*"
+            )
+
+            # Формируем текстовый дамп истории
+            history_lines = []
+            for m in history:
+                role = m.get('role', 'unknown')
+                content = m.get('content', '')
+                timestamp = m.get('timestamp_msk', 'no-time')
+                history_lines.append(f"[{timestamp}] {role.upper()}: {content}")
+            
+            full_history_dump = "\n".join(history_lines)
+
+            # Отправляем сообщение
+            await bot.send_message(chat_id=admin_id, text=alert_text, disable_web_page_preview=True)
+
+            # Отправляем файл с дампом
+            if full_history_dump:
+                file = BufferedInputFile(
+                    full_history_dump.encode('utf-8'), 
+                    filename=f"cost_dump_{hh_response_id}.txt"
+                )
+                await bot.send_document(
+                    chat_id=admin_id, 
+                    document=file, 
+                    caption=f"📄 Полный дамп диалога {hh_response_id}"
+                )
+
+            logger.info(f"Алерт стоимости отправлен для диалога {dialogue_id} ({total_cost_rub} руб).")
+
+    except Exception as e:
+        logger.error(f"Ошибка при отправке алерта стоимости: {e}", exc_info=True)

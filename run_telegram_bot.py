@@ -9,10 +9,13 @@ from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
+from aiogram.types import FSInputFile
 from sqlalchemy import select, update
 from zoneinfo import ZoneInfo
 # --- ДОБАВЛЕН НОВЫЙ ИМПОРТ ДЛЯ РАБОТЫ С ФАЙЛАМИ В ПАМЯТИ ---
 from aiogram.types import BufferedInputFile
+import shutil
+import subprocess
 # --- КОНЕЦ НОВОГО ИМПОРТА ---
 from hr_bot.utils.sentry_config import init_sentry
 
@@ -23,6 +26,11 @@ from hr_bot.tg_bot.middlewares import DbSessionMiddleware
 from hr_bot.tg_bot.handlers import main_router
 from hr_bot.utils.formatters import mask_fio
 
+
+# --- КОНСТАНТЫ ДЛЯ БЕКАПА ---
+BACKUP_RUN_HOUR_UTC = 2  # Запускать в 2 часа ночи по UTC
+BACKUP_DIR = "backups"   # Папка для бекапов
+# ----------------------------
 # Создаем константу для часового пояса
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
@@ -56,7 +64,7 @@ class TaskHealthMonitor:
         while not self.shutdown:
             try:
                 now = datetime.datetime.now()
-                for name in ['qualified', 'inactive', 'rejected', 'declined_interview', 'cleanup', 'rescheduled']:
+                for name in ['qualified', 'inactive', 'rejected', 'declined_interview', 'cleanup', 'rescheduled', 'backup']:
                     last = self.last_heartbeat.get(name)
                     # Если задача завершена или зависла (нет пульса)
                     if not last or (now - last).total_seconds() > MAX_STUCK_TIME or (name in self.tasks and self.tasks[name].done()):
@@ -75,6 +83,8 @@ class TaskHealthMonitor:
                             self.tasks[name] = asyncio.create_task(check_and_send_rescheduled_alerts(self.bot, self))
                         elif name == 'cleanup':
                             self.tasks[name] = asyncio.create_task(run_history_cleanup_task(self))
+                        elif name == 'backup':
+                            self.tasks[name] = asyncio.create_task(run_db_backup_task(self))
                         
                         self.last_heartbeat[name] = now
                 await asyncio.sleep(HEALTH_CHECK_INTERVAL)
@@ -1005,6 +1015,66 @@ async def run_history_cleanup_task(health_monitor: TaskHealthMonitor):
 
 # --- КОНЕЦ ФУНКЦИИ ОЧИСТКИ ---
 
+
+
+
+async def run_db_backup_task(health_monitor: TaskHealthMonitor):
+    logger.info("Задача бекапа БД запущена.")
+    last_run_date = None
+    
+    if not os.path.exists(BACKUP_DIR):
+        os.makedirs(BACKUP_DIR)
+
+    while not health_monitor.shutdown:
+        health_monitor.heartbeat('backup')
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+
+        if now_utc.hour == BACKUP_RUN_HOUR_UTC and (last_run_date is None or last_run_date.date() < now_utc.date()):
+            backup_file = os.path.join(BACKUP_DIR, "db_backup_actual.sql")
+            
+            user = os.getenv("DB_USER")
+            password = os.getenv("DB_PASSWORD")
+            db_name = os.getenv("DB_NAME")
+            host = "host.docker.internal"
+            port = os.getenv("DB_PORT", "5432")
+            
+            db_url = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+            
+            try:
+                logger.info(f"Создание актуального бекапа в {backup_file}...")
+                
+                process = await asyncio.create_subprocess_exec(
+                    'pg_dump', db_url, '-f', backup_file,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await process.communicate()
+
+                if process.returncode == 0:
+                    logger.info(f"✅ Бекап успешно обновлен: {backup_file}")
+                    last_run_date = now_utc
+                    
+                    # --- ОТПРАВКА В ТЕЛЕГРАМ ---
+                    try:
+                        admin_id = "1975808643"
+                        if admin_id:
+                            # ОБРАЩАЕМСЯ ЧЕРЕЗ health_monitor.bot
+                            await health_monitor.bot.send_document(
+                                chat_id=admin_id,
+                                document=FSInputFile(backup_file),
+                                caption=f"📦 Ежедневный бекап БД\n📅 {now_utc.strftime('%d.%m.%Y %H:%M')} UTC"
+                            )
+                            logger.info("Бекап успешно отправлен в Telegram.")
+                    except Exception as tg_e:
+                        logger.error(f"Не удалось отправить бекап в TG: {tg_e}")
+                else:
+                    logger.error(f"❌ Ошибка pg_dump: {stderr.decode()}")
+            
+            except Exception as e:
+                logger.error(f"Критическая ошибка бекапа: {e}", exc_info=True)
+
+        await asyncio.sleep(60)
+
 async def main():
     """Главная функция запуска бота."""
     setup_logging(log_filename="telegram_bot.log")
@@ -1033,6 +1103,7 @@ async def main():
     health_monitor.tasks['declined_interview'] = asyncio.create_task(check_and_send_declined_interview_alerts(bot, health_monitor))
     health_monitor.tasks['rescheduled'] = asyncio.create_task(check_and_send_rescheduled_alerts(bot, health_monitor))
     health_monitor.tasks['cleanup'] = asyncio.create_task(run_history_cleanup_task(health_monitor))
+    health_monitor.tasks['backup'] = asyncio.create_task(run_db_backup_task(health_monitor))
     
     # Запуск самого монитора
     monitor_task = asyncio.create_task(health_monitor.check_and_restart())
