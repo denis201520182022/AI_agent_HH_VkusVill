@@ -156,7 +156,7 @@ services:
     image: hh_bot_core:latest
     container_name: zz_scanner_0
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids
+    command: python run_hh_scanner.py
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -180,7 +180,7 @@ services:
     image: hh_bot_core:latest
     container_name: zz_worker_0
     restart: always
-    command: python run_hh_worker.py --recruiter_ids
+    command: python run_hh_worker.py
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
