@@ -25,8 +25,8 @@ async def user_balance_status(message: Message, db_session: Session):
         Bold("💰 Текущий баланс системы:"), "\n\n",
         "Доступно: ", Bold(f"{settings.balance:.2f}"), " руб.\n\n",
         
-        Bold("📈 Статистика расходов (всего c 25.12 13:35):"), "\n",
-        "- На новые диалоги: ", Bold(f"{settings.total_spent_on_dialogues:.2f}"), " руб.\n",
+        Bold("📈 Статистика расходов:"), "\n",
+        #"- На новые диалоги: ", Bold(f"{settings.total_spent_on_dialogues:.2f}"), " руб.\n",
         "- На напоминания: ", Bold(f"{settings.total_spent_on_reminders:.2f}"), " руб.\n",
         "- На follow-up: ", Bold(f"{settings.total_spent_on_followups:.2f}"), " руб.\n\n", # <-- Добавлено
         
