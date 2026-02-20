@@ -28,7 +28,7 @@ from hr_bot.utils.formatters import mask_fio
 
 
 # --- КОНСТАНТЫ ДЛЯ БЕКАПА ---
-BACKUP_RUN_HOUR_UTC = 2  # Запускать в 2 часа ночи по UTC
+BACKUP_RUN_HOUR_UTC = 12  # Запускать в 2 часа ночи по UTC
 BACKUP_DIR = "backups"   # Папка для бекапов
 # ----------------------------
 # Создаем константу для часового пояса
@@ -1032,19 +1032,33 @@ async def run_db_backup_task(health_monitor: TaskHealthMonitor):
         if now_utc.hour == BACKUP_RUN_HOUR_UTC and (last_run_date is None or last_run_date.date() < now_utc.date()):
             backup_file = os.path.join(BACKUP_DIR, "db_backup_actual.sql")
             
+            # Берем данные из окружения
             user = os.getenv("DB_USER")
             password = os.getenv("DB_PASSWORD")
             db_name = os.getenv("DB_NAME")
+            # Для бекапа идем НАПРЯМУЮ к хосту, а не к контейнеру pgbouncer
             host = "host.docker.internal"
-            port = os.getenv("DB_PORT", "5432")
+            # ВАЖНО: укажи порт РЕАЛЬНОЙ базы (обычно 5432). 
+            # Если в .env DB_PORT=6432 (это пуллер), то здесь лучше жестко 5432 или завести отдельную переменную
+            port = "5432" 
             
-            db_url = f"postgresql://{user}:{password}@{host}:{port}/{db_name}"
+            # Подготовка окружения для пароля (самый надежный способ для pg_dump)
+            env_vars = os.environ.copy()
+            env_vars["PGPASSWORD"] = password
             
             try:
-                logger.info(f"Создание актуального бекапа в {backup_file}...")
+                logger.info(f"Создание актуального бекапа напрямую из {host}:{port}...")
                 
+                # Запускаем pg_dump с явными флагами
                 process = await asyncio.create_subprocess_exec(
-                    'pg_dump', db_url, '-f', backup_file,
+                    'pg_dump',
+                    '-h', host,
+                    '-p', port,
+                    '-U', user,
+                    '-d', db_name,
+                    '-f', backup_file,
+                    '-w', # Не запрашивать пароль (возьмет из PGPASSWORD)
+                    env=env_vars,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE
                 )
@@ -1054,21 +1068,19 @@ async def run_db_backup_task(health_monitor: TaskHealthMonitor):
                     logger.info(f"✅ Бекап успешно обновлен: {backup_file}")
                     last_run_date = now_utc
                     
-                    # --- ОТПРАВКА В ТЕЛЕГРАМ ---
+                    # Отправка в телеграм
                     try:
                         admin_id = "1975808643"
-                        if admin_id:
-                            # ОБРАЩАЕМСЯ ЧЕРЕЗ health_monitor.bot
-                            await health_monitor.bot.send_document(
-                                chat_id=admin_id,
-                                document=FSInputFile(backup_file),
-                                caption=f"📦 Ежедневный бекап БД\n📅 {now_utc.strftime('%d.%m.%Y %H:%M')} UTC"
-                            )
-                            logger.info("Бекап успешно отправлен в Telegram.")
+                        await health_monitor.bot.send_document(
+                            chat_id=admin_id,
+                            document=FSInputFile(backup_file),
+                            caption=f"📦 Ежедневный бекап БД\n📅 {now_utc.strftime('%d.%m.%Y %H:%M')} UTC"
+                        )
+                        logger.info("Бекап успешно отправлен в Telegram.")
                     except Exception as tg_e:
                         logger.error(f"Не удалось отправить бекап в TG: {tg_e}")
                 else:
-                    logger.error(f"❌ Ошибка pg_dump: {stderr.decode()}")
+                    logger.error(f"❌ Ошибка pg_dump (код {process.returncode}): {stderr.decode()}")
             
             except Exception as e:
                 logger.error(f"Критическая ошибка бекапа: {e}", exc_info=True)

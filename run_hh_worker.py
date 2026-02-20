@@ -2771,7 +2771,7 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
                 f"DB query finished. Found {len(dialogues_to_process_info)} dialogues",
                 extra={"query_duration": time.monotonic() - db_query_start}
             )
-        rec_logger.info(f"SQL found {len(dialogues_to_process_info)} potential dialogues to process")
+        rec_logger.debug(f"SQL found {len(dialogues_to_process_info)} potential dialogues to process")
         if not dialogues_to_process_info:
             rec_logger.debug(f"Starting parallel processing for {len(dialogues_to_process_info)} dialogues")
             return
