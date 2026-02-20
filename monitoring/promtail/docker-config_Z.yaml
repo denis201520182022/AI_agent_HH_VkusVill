@@ -6,15 +6,16 @@ positions:
   filename: /tmp/positions.yaml
 
 clients:
-  - url: http://loki:3100/loki/api/v1/push  # Адрес Loki
+  - url: http://zz_loki:3100/loki/api/v1/push
 scrape_configs:
-  - job_name: test_docker
+  - job_name: zabota_docker
     docker_sd_configs:
       - host: unix:///var/run/docker.sock
         refresh_interval: 5s
     relabel_configs:
       - source_labels: ['__meta_docker_container_name']
-        regex: '/(hh_.*|hh_reminders|hh_tg_bot|pgbouncer|monitoring_.*)' # Подключаем логи pgbouncer, promtail, grafana, loki и prometheus
+        regex: '/(zz_.*)'
         target_label: 'container'
       - source_labels: ['container']
         action: keep
+

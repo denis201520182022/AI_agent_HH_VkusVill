@@ -4,6 +4,7 @@ import os
 import sys
 # Импортируем JSON форматер
 from pythonjsonlogger import jsonlogger
+from logging.handlers import RotatingFileHandler
 
 def get_log_level(env_var_name: str, default: str) -> int:
     """
@@ -61,11 +62,10 @@ def setup_logging(log_filename: str):
     console_handler.setFormatter(formatter)
     
     # Хендлер файла (на всякий случай храним и в файлах)
-    file_handler = TimedRotatingFileHandler(
+    file_handler = RotatingFileHandler(
         os.path.join(log_dir, log_filename),
-        when='midnight',
-        interval=1,
-        backupCount=7,
+        maxBytes=20 * 1024 * 1024,  # 20 МБ в байтах
+        backupCount=5,               # Хранить 5 старых файлов (итого ~100-120 МБ)
         encoding='utf-8'
     )
     file_handler.setFormatter(formatter)

@@ -8,24 +8,28 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # 2. Мониторинг всех воркеров и сканеров
-  - job_name: 'hh_bots' # Переименовано для лучшей идентификации, чтобы не путать с ВкусВиллом
-    metrics_path: '/metrics' # Стандартный путь для большинства библиотек прометеуса
+  # 2. Мониторинг твоих ботов (HH Core)
+  - job_name: 'hh_bots'
+    metrics_path: '/metrics'
     static_configs:
       - targets:
-          # Рекрутер 1
-          - 'scanner_r1:8000' # Укажите порт, на котором ваши сервисы экспортируют метрики
-          - 'worker_r1:8000'
-          # Рекрутер 2
-          - 'scanner_r2:8000'
-          - 'worker_r2:8000'
+          # РЕКРУТЕР 1 (ID: 6 - Долгополова Марина)
+          - 'zz_scanner_r6:8000'
+          - 'zz_worker_6:8000'
+          
+          # РЕКРУТЕР 2 (ID: 21 - Измайлова Анастасия)
+          - 'zz_scanner_21:8000'
+          - 'zz_worker_21:8000'
+          
+          # ОБЩИЕ (ID: 0 / Резерв)
+          - 'zz_scanner_0:8000'
+          - 'zz_worker_0:8000'
+          
+          # ВСПОМОГАТЕЛЬНЫЕ СЕРВИСЫ
+          - 'zz_reminders:8000'
+          - 'zz_tg_bot:8000'
 
-          # Общие сервисы
-          - 'hh_scanner:8000'
-          - 'hh_worker:8000'
-          - 'hh_reminders:8000'
-          - 'tg_bot:8000'
-    # Переименовываем метку instance, чтобы в Графане было удобно фильтровать
+    # Переименовываем метку instance, чтобы вместо "zz_worker_6:8000" было просто "zz_worker_6"
     relabel_configs:
       - source_labels: [__address__]
         target_label: instance
