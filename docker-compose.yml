@@ -50,7 +50,7 @@ services:
       - LISTEN_PORT=6432
       - AUTH_TYPE=scram-sha-256
     ports:
-      - "6433:6432"
+      - "6432:6432"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
