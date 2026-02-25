@@ -296,10 +296,9 @@ async def reactivation_export_manual(message: Message, state: FSMContext, db_ses
         await message.answer("❌ Формат: 01.01.2024 - 10.01.2024")
 
 async def generate_reactivation_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
-    msg_wait = await message.answer("⏳ Собираю события Реактивации и строю воронку...")
+    msg_wait = await message.answer("⏳ Собираю события Реактивации и формирую воронку...")
 
-    # 1. ЗАПРОС К БД (AnalyticsEvents + Join справочников для имен)
-    # Нам нужны: Дата, Имя Рекрутера, Город, Вакансия, Тип события
+    # 1. ЗАПРОС К БД
     results = db.query(
         AnalyticsEvent.created_at,
         AnalyticsEvent.event_type,
@@ -321,7 +320,7 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
         await state.clear()
         return
 
-    # 2. ОБРАБОТКА ДАННЫХ В PYTHON
+    # 2. ПОДГОТОВКА СЫРЫХ ДАННЫХ
     rows = []
     for r in results:
         rows.append({
@@ -334,9 +333,9 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
     
     df_raw = pd.DataFrame(rows)
 
-    # 3. ФУНКЦИЯ ДЛЯ СВОДНЫХ ТАБЛИЦ (PIVOT)
+    # 3. ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ СВОДНЫХ ТАБЛИЦ
     def create_reactivation_summary(groupby_col):
-        # Pivot table: строки - группа, столбцы - типы событий, значения - количество
+        # Агрегируем типы событий в колонки
         pivot = pd.pivot_table(
             df_raw, 
             index=groupby_col, 
@@ -345,58 +344,45 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
             fill_value=0
         ).reset_index()
 
-        # Гарантируем наличие всех колонок (даже если событий не было)
-        required_cols = [
-            'reactivation_sent', 'user_reply', 'interview_assigned', 
-            'rejected_by_bot', 'refusal_by_user', 'timed_out'
-        ]
-        for col in required_cols:
+        # Гарантируем наличие всех типов событий для расчетов
+        for col in ['reactivation_sent', 'user_reply', 'interview_assigned', 'refusal_by_user', 'rejected_by_bot', 'timed_out']:
             if col not in pivot.columns:
                 pivot[col] = 0
 
-        # Переименовываем для красоты
-        pivot = pivot.rename(columns={
-            'reactivation_sent': 'Разослано',
-            'user_reply': 'Вступили (Проснулись)',
-            'interview_assigned': 'Собеседование (Успех)',
-            'rejected_by_bot': 'Отказ Ботом',
-            'refusal_by_user': 'Отказ Кандидатом',
-            'timed_out': 'Снова замолчали'
-        })
-        
-        # Считаем ВСЕГО ОТКАЗОВ
-        pivot['Отказы Всего'] = pivot['Отказ Ботом'] + pivot['Отказ Кандидатом']
+        # ВЫЧИСЛЕНИЯ ПО ТВОИМ ПРАВИЛАМ
+        s = pivot
+        s['Инициировано'] = s['reactivation_sent']
+        s['Вступили'] = s['user_reply']
+        s['Не вступили'] = s['Инициировано'] - s['Вступили']
+        s['Собес'] = s['interview_assigned']
+        s['Отказался КД'] = s['refusal_by_user']
+        s['Отказали мы'] = s['rejected_by_bot']
+        s['Молчуны'] = s['timed_out'] # Которые начали, но снова уснули
+        s['Отказы всего'] = s['Отказался КД'] + s['Отказали мы']
 
-        # Расчет конверсий
-        # 1. Проснулись % = Вступили / Разослано
-        pivot['Проснулись %'] = (pivot['Вступили (Проснулись)'] / pivot['Разослано']).fillna(0)
-        
-        # 2. Собес % = Собеседование / Вступили
-        pivot['Конверсия в Собес %'] = (pivot['Собеседование (Успех)'] / pivot['Вступили (Проснулись)']).fillna(0)
-        
-        # 3. Отвал % = Снова замолчали / Вступили
-        pivot['Отвал (Снова сон) %'] = (pivot['Снова замолчали'] / pivot['Вступили (Проснулись)']).fillna(0)
+        # КОНВЕРСИИ (от Инициировано)
+        s['Собес/Инициировано %'] = (s['Собес'] / s['Инициировано']).fillna(0)
+        s['Молчуны (молчуны + не вступили)/Инициировано %'] = ((s['Молчуны'] + s['Не вступили']) / s['Инициировано']).fillna(0)
+        s['Отказы всего / инициировано %'] = (s['Отказы всего'] / s['Инициировано']).fillna(0)
 
-        # Формируем итоговый порядок столбцов
+        # Финальный список и порядок столбцов
         final_cols = [
-            groupby_col, 'Разослано', 'Вступили (Проснулись)', 'Проснулись %',
-            'Собеседование (Успех)', 'Конверсия в Собес %',
-            'Отказы Всего', 'Снова замолчали', 'Отвал (Снова сон) %'
+            groupby_col, 'Инициировано', 'Вступили', 'Не вступили', 'Собес', 
+            'Отказался КД', 'Отказали мы', 'Молчуны', 'Отказы всего',
+            'Собес/Инициировано %', 'Молчуны (молчуны + не вступили)/Инициировано %', 'Отказы всего / инициировано %'
         ]
         
-        res = pivot[final_cols]
+        res = s[final_cols]
 
         # ИТОГОВАЯ СТРОКА
         total = res.sum(numeric_only=True)
         total[groupby_col] = 'ИТОГО'
         
-        # Пересчет % для ИТОГО
-        t_sent = total['Разослано'] if total['Разослано'] > 0 else 1
-        t_reply = total['Вступили (Проснулись)'] if total['Вступили (Проснулись)'] > 0 else 1
-        
-        total['Проснулись %'] = total['Вступили (Проснулись)'] / t_sent
-        total['Конверсия в Собес %'] = total['Собеседование (Успех)'] / t_reply
-        total['Отвал (Снова сон) %'] = total['Снова замолчали'] / t_reply
+        # Пересчет % для ИТОГО (чтобы не суммировать проценты)
+        t_init = total['Инициировано'] if total['Инициировано'] > 0 else 1
+        total['Собес/Инициировано %'] = total['Собес'] / t_init
+        total['Молчуны (молчуны + не вступили)/Инициировано %'] = (total['Молчуны'] + total['Не вступили']) / t_init
+        total['Отказы всего / инициировано %'] = total['Отказы всего'] / t_init
         
         return pd.concat([res, pd.DataFrame([total])], ignore_index=True)
 
@@ -406,7 +392,7 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
     df_city = create_reactivation_summary('Город')
     df_vac = create_reactivation_summary('Вакансия')
 
-    # 4. СОХРАНЕНИЕ В EXCEL
+    # 4. СОХРАНЕНИЕ
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
@@ -414,36 +400,32 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
         df_city.to_excel(writer, index=False, sheet_name='Свод по городам')
         df_vac.to_excel(writer, index=False, sheet_name='Свод по вакансиям')
         
-        # Лист с сырыми данными (опционально, но полезно)
-        df_raw.rename(columns={
-            'reactivation_sent': 'Разослано', 'user_reply': 'Проснулся',
-            'interview_assigned': 'Собес', 'rejected_by_bot': 'Отказ Бот',
-            'refusal_by_user': 'Отказ Юзер', 'timed_out': 'Таймаут'
-        }).to_excel(writer, index=False, sheet_name='Сырые данные')
+        # Лист с общим отчетом (сырые данные переименованные)
+        df_raw.to_excel(writer, index=False, sheet_name='Общий отчет')
 
         workbook = writer.book
-        perc_fmt = workbook.add_format({'num_format': '0.0%', 'border': 1, 'align': 'center'})
+        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1, 'align': 'center'})
         num_fmt = workbook.add_format({'border': 1, 'align': 'center'})
-        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#E6B8AF', 'border': 1}) # Красноватый оттенок для Молчунов
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1}) # Розоватый заголовок
 
         for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
             ws.freeze_panes(1, 0)
             
-            # Получаем DataFrame, соответствующий текущему листу
+            # Определяем какой DF использовать для расчёта ширины
             if sheet_name == 'Свод по датам': curr_df = df_date
             elif sheet_name == 'Свод по рекрутерам': curr_df = df_rec
             elif sheet_name == 'Свод по городам': curr_df = df_city
             elif sheet_name == 'Свод по вакансиям': curr_df = df_vac
-            else: curr_df = df_raw # Для 'Общий отчет'
+            else: curr_df = df_raw
 
             for i, col in enumerate(curr_df.columns):
-                # Авто-ширина
-                column_len = max(curr_df[col].astype(str).str.len().max(), len(str(col))) + 3
-                # Если в названии есть %, ставим процентный формат, иначе числовой
-                ws.set_column(i, i, column_len, perc_fmt if '%' in str(col) else num_fmt)
+                # Авто-ширина: по длине контента или заголовка
+                column_len = max(curr_df[col].astype(str).str.len().max(), len(str(col))) + 4
+                is_perc = '%' in str(col)
+                ws.set_column(i, i, column_len, perc_fmt if is_perc else num_fmt)
             
-            # Применяем стиль заголовка (первая строка)
+            # Применяем формат шапки
             ws.set_row(0, None, header_fmt)
 
     output.seek(0)
@@ -453,6 +435,7 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
     )
     await msg_wait.delete()
     await state.clear()
+    
 
 
 
