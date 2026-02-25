@@ -14,6 +14,7 @@ import datetime
 from sqlalchemy.orm import selectinload
 from sqlalchemy.orm import selectinload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from hr_bot.utils.analytics import log_analytics_event
 from decimal import Decimal
 import difflib
 from hr_bot.utils.data_verification_notifier import send_cost_alert
@@ -1127,6 +1128,41 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             f"Processing dialogue {dialogue.hh_response_id}...",
             extra={"action": "start_processing"}
         )
+
+        # --- [START] ОЖИВЛЕНИЕ МОЛЧУНОВ ---
+        # Если диалог был в статусе "timed_out" (молчание), но пришли новые сообщения,
+        # возвращаем его в работу, сбрасываем уровень напоминаний и отменяем алерт админу.
+        if dialogue.status == 'timed_out':
+            ctx_logger.info(
+                f"[{dialogue.hh_response_id}] 🔔 Кандидат ответил! Снимаем статус 'timed_out' и сбрасываем напоминания.",
+                extra={"action": "revive_timed_out_dialogue"}
+            )
+            dialogue.status = 'in_progress'
+            dialogue.reminder_level = 0
+            
+            # Если висит неотправленное уведомление о молчании в очереди - отменяем его
+            # (мы подгрузили inactive_alerts через selectinload выше, так что доступ быстрый)
+            if dialogue.inactive_alerts and dialogue.inactive_alerts.status == 'pending':
+                dialogue.inactive_alerts.status = 'cancelled'
+                dialogue.inactive_alerts.processed_at = datetime.datetime.now(datetime.timezone.utc)
+                ctx_logger.info(f"[{dialogue.hh_response_id}] Отменено уведомление InactiveNotificationQueue.")
+        # --- [END] ОЖИВЛЕНИЕ МОЛЧУНОВ ---
+
+
+        # --- [ANALYTICS] ОТВЕТ ПОЛЬЗОВАТЕЛЯ ---
+        # Если диалог в режиме реактивации и есть новые сообщения от юзера,
+        # проверяем, был ли это первый ответ, и логируем.
+        if dialogue.current_mode == 'reactivation' and dialogue.pending_messages:
+            # Проверяем, есть ли там реальные сообщения от юзера, а не наши system commands
+            has_user_msg = any(
+                (isinstance(m, dict) and m.get('role') == 'user' and not m.get('content', '').startswith('[SYSTEM COMMAND]'))
+                for m in dialogue.pending_messages
+            )
+            if has_user_msg:
+                # check_duplicates=True гарантирует, что мы запишем только ПЕРВЫЙ ответ в этой рассылке
+                await log_analytics_event(db, dialogue, 'user_reply', check_duplicates=True)
+        # --------------------------------------
+
 
         pending_messages = dialogue.pending_messages or []
         if not pending_messages:
@@ -2398,7 +2434,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status != 'qualified':
             dialogue.status = 'qualified'
-
+            # --- [ANALYTICS] НАЗНАЧЕН СОБЕС / ПЕРЕДАН РЕСЕРЧЕРУ ---
+            if dialogue.current_mode == 'reactivation':
+                 await log_analytics_event(db, dialogue, 'interview_assigned')
+            # ------------------------------------------------------
             await statistics_manager.update_stats(db, dialogue.vacancy_id, qualified=1)
 
             # Проверка существования уведомления (оптимизированная)
@@ -2569,6 +2608,16 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     )
                 # --- КОНЕЦ ДОПОЛНИТЕЛЬНОЙ ПРОВЕРКИ ---
 
+            # Определяем тип отказа
+            event_type = 'rejected_by_bot' # По умолчанию (qualification_failed)
+            # Добавил declined_interview в условие
+            if new_state in ['declined_vacancy', 'declined_interview']:
+                event_type = 'refusal_by_user'
+        
+            # --- [ANALYTICS] ОТКАЗ ---
+            if dialogue.current_mode == 'reactivation':
+                await log_analytics_event(db, dialogue, event_type)
+            # -------------------------
 
             dialogue.status = 'rejected'
             # --- ДОБАВЛЕННЫЙ БЛОК: Отмена напоминаний при отказе ---

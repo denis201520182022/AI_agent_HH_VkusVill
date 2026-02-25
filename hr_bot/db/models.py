@@ -159,6 +159,15 @@ class Dialogue(Base):
     total_completion_tokens = Column(Integer, nullable=False, default=0, server_default='0')
     total_cached_tokens = Column(Integer, nullable=False, default=0, server_default='0')
     total_cost = Column(Numeric(12, 6), nullable=False, default=0.0, server_default='0.0')
+
+
+    # --- НОВЫЕ ПОЛЯ ДЛЯ АНАЛИТИКИ И РЕЖИМОВ ---
+    # Текущий режим диалога: 'standard', 'reactivation', 'followup'
+    current_mode = Column(String(50), default='standard', server_default='standard', nullable=False)
+    
+    # Ссылка на задачу рассылки, если диалог сейчас в режиме 'reactivation'
+    # (чтобы понимать, какая именно рассылка его оживила)
+    active_mailing_task_id = Column(Integer, ForeignKey('mailing_tasks.id'), nullable=True)
     # --- КОНЕЦ ДОБАВЛЕНИЯ ---
 
 
@@ -348,3 +357,71 @@ class RescheduledNotificationQueue(Base):
     
     dialogue = relationship("Dialogue", back_populates="rescheduled_alerts")
 # ---------------------------------------------------------------------------
+
+
+
+
+class MailingTask(Base):
+    """
+    Таблица для задач массовых рассылок по 'молчунам'.
+    Заполняется админом/интерфейсом, обрабатывается воркером.
+    """
+    __tablename__ = 'mailing_tasks'
+
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # Критерии фильтрации
+    vacancy_pattern = Column(String(255), nullable=True)  # Например: "%Сборщик%"
+    city_pattern = Column(String(255), nullable=True)     # Например: "%Санкт-Петербург%"
+    days_silent_min = Column(Integer, nullable=False, default=7)  # От скольких дней молчит
+    days_silent_max = Column(Integer, nullable=False, default=30) # До скольких дней молчит
+    
+    # Контент
+    message_text = Column(Text, nullable=False) # Текст сообщения
+    
+    # Статус выполнения
+    status = Column(String(50), default='pending', index=True) # pending, in_progress, completed, failed, cancelled
+    
+    # Статистика
+    candidates_found = Column(Integer, default=0) # Сколько диалогов попало в выборку
+    messages_sent = Column(Integer, default=0)    # Сколько реально отправлено (успешно)
+    total_cost = Column(Numeric(12, 2), default=0.00) # Сколько денег списано за эту рассылку
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    processed_at = Column(DateTime(timezone=True), nullable=True) # Когда закончили
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+
+
+
+class AnalyticsEvent(Base):
+    """
+    Таблица событийной аналитики (Event Sourcing).
+    Хранит историю ключевых действий с диалогом для построения воронок.
+    """
+    __tablename__ = 'analytics_events'
+
+    id = Column(Integer, primary_key=True, index=True)
+    
+    # СВЯЗИ
+    dialogue_id = Column(Integer, ForeignKey('dialogues.id'), nullable=False, index=True)
+    mailing_task_id = Column(Integer, ForeignKey('mailing_tasks.id'), nullable=True, index=True) # Ссылка на задачу (если есть)
+    
+    # СРЕЗЫ (Денормализация: копируем данные в момент события для скорости)
+    recruiter_id = Column(Integer, nullable=False, index=True) 
+    vacancy_id = Column(Integer, nullable=True, index=True)    
+    city = Column(String(100), nullable=True)                  
+    
+    # СУТЬ СОБЫТИЯ
+    # Типы: 'response_created', 'user_reply', 'interview_assigned', 
+    # 'rejected_by_bot', 'refusal_by_user', 'timed_out', 'reactivation_sent', 'followup_sent'
+    event_type = Column(String(50), nullable=False, index=True) 
+    
+    # РЕЖИМ (В каком контексте произошло событие)
+    # 'standard', 'reactivation', 'followup'
+    mode = Column(String(50), nullable=False, index=True, default='standard') 
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+
+    # Опционально: связи для удобства ORM
+    dialogue = relationship("Dialogue")
+    mailing_task = relationship("MailingTask")
