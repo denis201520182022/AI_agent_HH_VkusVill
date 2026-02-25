@@ -305,7 +305,7 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
         clean_history_lines.append(f"{role_label}: {content}")
 
     # 2. Берем последние 10 сообщений для анализа даты
-    recent_text = "\n".join(clean_history_lines[-10:])
+    recent_text = "\n".join(clean_history_lines[-5:])
     
     verify_prompt = (
         f"Ты — строгий технический аудитор системы записи. Твоя задача — проверить, соответствует ли дата, предложенная первой моделью, ЖЕЛАНИЮ КАНДИДАТА.\n\n"
@@ -691,7 +691,7 @@ def _generate_calendar_context_2() -> str:
         f"\n\n[CRITICAL CALENDAR CONTEXT]\n"
         f"ТЕКУЩАЯ ДАТА И ВРЕМЯ (МСК): {current_datetime_utc.strftime('%Y-%m-%d %H:%M')}\n"
         f"СЕГОДНЯ: {current_weekday}, {current_date_str}\n\n"
-        f"СЕЙЧАС: {current_time_str} (МСК)\n"
+        #f"СЕЙЧАС: {current_time_str} (МСК)\n"
         f"⚠️ ВАЖНО: Ты ОЧЕНЬ ПЛОХО считаешь даты в уме. НИКОГДА НЕ ВЫЧИСЛЯЙ ДАТЫ САМОСТОЯТЕЛЬНО!\n"
         f"Используй ТОЛЬКО эту таблицу (таблица начинается с СЕГОДНЯ и идет на 21 дней вперед):\n\n"
         f"{calendar_string}\n\n"
@@ -779,7 +779,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     }
     required_blocks.extend(state_specific_blocks.get(dialogue_state, []))
 
-    if dialogue_state in ['forwarded_to_researcher','interview_scheduled_spb', 'post_qualification_chat', 'awaiting_questions', 'initial_processing', 'call_later']:
+    if dialogue_state in ['forwarded_to_researcher', 'post_qualification_chat', 'awaiting_questions', 'initial_processing', 'call_later']:
         required_blocks.append('#FAQ#')
 
     final_block_keys = list(dict.fromkeys(required_blocks))
@@ -992,7 +992,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
             
             # Соединяем: Старая история + Новые сообщения юзера + Ответ бота
             final_history = current_history + user_entries_to_history + [new_bot_hist]
-            dialogue.history = final_history[-150:]
+            dialogue.history = final_history[-350:]
             
             # Чистим очередь
             dialogue.pending_messages = None
@@ -1013,7 +1013,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         ctx_logger.info("LLM не вернула текст ответа. Сохраняем только сообщения пользователя.")
         
         final_history = current_history + user_entries_to_history
-        dialogue.history = final_history[-150:]
+        dialogue.history = final_history[-350:]
         dialogue.pending_messages = None
         dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
         
@@ -1410,6 +1410,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         new_state = llm_response.get("new_state", "error_state")
         extracted_data = llm_response.get("extracted_data")
 
+
+
+
         # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
         # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
         if new_state not in ALLOWED_STATES:
@@ -1442,8 +1445,43 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             await db.commit()
             ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление галлюцинации стейта: {new_state}")
             return 
+        
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
-        # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
+
+
+
+        # [RESCHEDULE PROTECTION] Отмена напоминаний при начале переноса
+        # =====================================================================
+        if new_state == 'init_scheduling_spb' and dialogue.interview_datetime_utc is not None:
+            ctx_logger.info(
+                f"[{dialogue.hh_response_id}] Обнаружено начало процесса переноса. "
+                f"Отменяю все активные напоминания и фоллоу-апы (старое время: {dialogue.interview_datetime_utc}).",
+                extra={"action": "reschedule_cleanup_started"}
+            )
+            
+            # 1. Отменяем обычные напоминания (ДО собеса)
+            await db.execute(
+                update(InterviewReminder)
+                .where(InterviewReminder.dialogue_id == dialogue.id)
+                .where(InterviewReminder.status == 'pending')
+                .values(
+                    status='cancelled', 
+                    processed_at=datetime.datetime.now(datetime.timezone.utc)
+                )
+            )
+
+            # 2. Отменяем фоллоу-апы (ПОСЛЕ собеса)
+            await db.execute(
+                update(InterviewFollowup)
+                .where(InterviewFollowup.dialogue_id == dialogue.id)
+                .where(InterviewFollowup.status == 'pending')
+                .values(
+                    status='cancelled', 
+                    processed_at=datetime.datetime.now(datetime.timezone.utc)
+                )
+            )
+
+        
         # =====================================================================
         # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ (для Time Selection и Final Booking)
         # =====================================================================
@@ -1521,9 +1559,17 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         try:
                             v_date_obj = datetime.datetime.strptime(verified_date, '%Y-%m-%d')
                             weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-                            v_weekday = weekdays_ru[v_date_obj.weekday()]
+                            weekday_idx = v_date_obj.weekday()
+                            v_weekday = weekdays_ru[weekday_idx]
+                            
+                            # Проверка на праздники (Feb 23 и т.д.) и Воскресенье ПРЯМО ЗДЕСЬ
+                            is_feb_23 = (v_date_obj.month == 2 and v_date_obj.day == 23)
+                            is_sunday = (weekday_idx == 6)
+                            
                         except Exception:
                             v_weekday = "указанный день"
+                            is_feb_23 = False
+                            is_sunday = False
 
                         # Отправляем алерт в ТГ
                         user_text_now = " ".join(all_masked_content)
@@ -1539,16 +1585,38 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             reasoning=audit_reason
                         )
 
-                        # ФОРМИРУЕМ СИСТЕМНУЮ КОМАНДУ ДЛЯ ПОВТОРНОЙ ГЕНЕРАЦИИ
-                        correction_cmd = {
-                            'message_id': f'sys_date_corr_{time.time()}',
-                            'role': 'user',
-                            'content': (
+                        # ФОРМИРУЕМ ТЕКСТ КОМАНДЫ (Разрешение конфликта)
+                        correction_content = "" # Инициализация
+                        
+                        if is_sunday or is_feb_23:
+                            # СЦЕНАРИЙ: Аудитор нашел дату, но она ЗАПРЕЩЕНА.
+                            # Мы говорим модели: "Юзер хочет эту дату, но она плохая. СБРОСЬ дату в JSON".
+                            reason_msg = "это воскресенье" if is_sunday else "это праздничный день (23 февраля)"
+                            
+                            correction_content = (
+                                f"[SYSTEM COMMAND] Ты ошибся в интерпретации. Пользователь имел в виду {verified_date} ({v_weekday}), но {reason_msg}, когда собеседования НЕ проводятся. "
+                                f"1. ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на null (убери дату совсем). "
+                                f"2. В ответе вежливо объясни кандидату, что {reason_msg}, и предложи выбрать другой день."
+                            )
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Аудит: Пользователь выбрал запрещенный день ({v_weekday}). Требую сброс даты.")
+                            
+                        else:
+                            # СЦЕНАРИЙ: Аудитор нашел дату, она РАЗРЕШЕНА.
+                            # Мы говорим модели: "Исправь JSON на правильную дату".
+                            correction_content = (
                                 f"[SYSTEM COMMAND] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
-                                f"На самом деле пользователь хотел выбрал {v_weekday} ({verified_date}) согласно календарю. "
+                                f"На самом деле пользователь выбрал {v_weekday} ({verified_date}) согласно календарю. "
                                 f"Сгенерируй ответ заново, подтвердив ПРАВИЛЬНУЮ дату ({v_weekday}, {verified_date}). "
                                 f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
                             )
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление даты ({v_weekday}).")
+
+                        # --- !!! ВОТ ЭТОГО КУСКА НЕ ХВАТАЛО !!! ---
+                        # Создаем объект команды с правильным текстом
+                        correction_cmd = {
+                            'message_id': f'sys_date_corr_{time.time()}',
+                            'role': 'user',
+                            'content': correction_content
                         }
 
                         # Кладем в очередь и сохраняем историю
@@ -2107,7 +2175,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         # Если этого не сделать, бот "забудет", что кандидат только что ответил про возраст/гражданство.
                         current_history = list(dialogue.history) if dialogue.history else []
                         # user_entries_to_history мы сформировали в начале функции
-                        dialogue.history = (current_history + user_entries_to_history)[-150:]
+                        dialogue.history = (current_history + user_entries_to_history)[-350:]
 
                         # 3. Формируем скрытую команду для LLM
                         # Используем role='system' или 'user' с пометкой, чтобы направить LLM.
@@ -2603,7 +2671,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 
                 # Сохраняем историю и стейт, но не отправляем сообщение
                 new_history = (dialogue.history or []) + user_entries_to_history
-                dialogue.history = new_history[-150:]
+                dialogue.history = new_history[-350:]
                 dialogue.dialogue_state = new_state
                 dialogue.pending_messages = None
                 dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
@@ -2686,6 +2754,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         await send_cost_alert(
                             dialogue_id=dialogue.id,
                             hh_response_id=dialogue.hh_response_id,
+                            total_cost_usd=total_usd,
                             total_cost_rub=total_rub,
                             history=dialogue.history or [],
                             recruiter_name=recruiter.name if recruiter else "Неизвестен",

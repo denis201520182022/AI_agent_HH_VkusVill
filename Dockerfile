@@ -1,31 +1,32 @@
-# Используем полную версию Python 3.11 на базе Debian Bookworm
-FROM python:3.11-bookworm
+# Используем облегченную версию Debian. Она на 600-700МБ меньше обычной.
+FROM python:3.11-slim-bookworm
 
-# Устанавливаем рабочую директорию
+# Устанавливаем переменные окружения
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PYTHONUNBUFFERED=1
+ENV TZ=Europe/Moscow
+
 WORKDIR /app
 
-# Устанавливаем часовой пояс (важно для логов и расписаний)
-RUN apt-get update && apt-get install -y \
+# Устанавливаем системные зависимости
+# Мы объединяем установку и очистку кэша в один слой для уменьшения веса
+RUN apt-get update && apt-get install -y --no-install-recommends \
     postgresql-client \
-    && rm -rf /var/lib/apt/lists/*
-ENV TZ=Europe/Moscow
-RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 
-# Сначала копируем зависимости (для кэширования слоев Docker)
+# Копируем только файл зависимостей
 COPY requirements.txt .
 
-# Обновляем pip и устанавливаем зависимости
-RUN pip install --upgrade pip
-RUN pip install --no-cache-dir -r requirements.txt
+# Устанавливаем библиотеки
+# --no-cache-dir не сохраняет скачанные .whl файлы внутри образа
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Копируем весь остальной код проекта
+# Копируем проект (ВАЖНО: наличие .dockerignore исключит мусор)
 COPY . .
 
-# Создаем папку для логов, чтобы не было ошибок прав доступа
+# Создаем папку для логов
 RUN mkdir -p logs
 
-# Переменная окружения для корректного вывода логов в Docker
-ENV PYTHONUNBUFFERED=1
-
-# Команда по умолчанию (будет переопределена в docker-compose)
 CMD ["python", "run_hh_worker.py"]
