@@ -14,6 +14,7 @@ from typing import List, Any
 user_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Баланс")],
+        [KeyboardButton(text="🚀 Реактивация")], # <--- Добавили
         [KeyboardButton(text="❓ Помощь")]
     ],
     resize_keyboard=True
@@ -22,6 +23,7 @@ user_keyboard = ReplyKeyboardMarkup(
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Баланс и Тариф")],
+        [KeyboardButton(text="🚀 Реактивация")], # <--- Добавили
         [KeyboardButton(text="👤 Управление пользователями")],
         [KeyboardButton(text="👨‍💼 Управление рекрутерами")],
         [KeyboardButton(text="❓ Помощь")]

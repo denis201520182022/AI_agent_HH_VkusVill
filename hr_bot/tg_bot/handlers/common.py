@@ -10,6 +10,14 @@ from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import func, cast, Date
 from sqlalchemy.orm import Session
 from aiogram.utils.formatting import Text, Bold, Italic
+from aiogram.utils.keyboard import InlineKeyboardBuilder # <-- Добавить
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton # <-- Добавить
+from hr_bot.db.models import MailingTask # <--- Добавь в импорты сверху
+from hr_bot.db.models import (
+    TelegramUser, Statistic, Vacancy, TrackedRecruiter,
+    InactiveNotificationQueue, RejectedNotificationQueue, NotificationQueue, Dialogue,
+    AnalyticsEvent # <--- ОБЯЗАТЕЛЬНО ДОБАВИТЬ ЭТО
+)
 
 from hr_bot.tg_bot.keyboards import (
     user_keyboard, admin_keyboard, 
@@ -52,6 +60,400 @@ class ExportStates(StatesGroup):
 
 class FollowupExportStates(StatesGroup):
     waiting_for_range = State()
+
+
+# --- FSM для экспорта молчунов ---
+class ReactivationExportStates(StatesGroup):
+    waiting_for_range = State()
+
+# 1. Определяем состояния FSM
+class MailingTaskStates(StatesGroup):
+    waiting_for_vacancy = State()
+    waiting_for_city = State()
+    waiting_for_days = State()
+    waiting_for_message = State()
+    waiting_for_confirmation = State()
+
+# 2. Вход в режим создания рассылки
+@router.message(F.text == "🚀 Реактивация")
+async def start_mailing_task_creation(message: Message, state: FSMContext):
+    await state.set_state(MailingTaskStates.waiting_for_vacancy)
+    await message.answer(
+        "🚀 <b>Создание задачи на реактивацию</b>\n\n"
+        "Шаг 1/4: Введите название вакансии (или часть названия).\n"
+        "<i>Например: Сборщик</i>\n"
+        "Если хотите запустить по ВСЕМ вакансиям, введите: <code>%</code>",
+        reply_markup=cancel_fsm_keyboard,
+        parse_mode="HTML"
+    )
+
+# 3. Собираем Вакансию
+@router.message(MailingTaskStates.waiting_for_vacancy)
+async def process_mailing_vacancy(message: Message, state: FSMContext):
+    await state.update_data(vacancy_pattern=message.text.strip())
+    await state.set_state(MailingTaskStates.waiting_for_city)
+    await message.answer(
+        "Шаг 2/4: Введите город.\n"
+        "<i>Например: Санкт-Петербург</i>\n"
+        "По всем городам — введите: <code>%</code>",
+        reply_markup=cancel_fsm_keyboard,
+        parse_mode="HTML"
+    )
+
+# 4. Собираем Город
+@router.message(MailingTaskStates.waiting_for_city)
+async def process_mailing_city(message: Message, state: FSMContext):
+    await state.update_data(city_pattern=message.text.strip())
+    await state.set_state(MailingTaskStates.waiting_for_days)
+    await message.answer(
+        "Шаг 3/4: Введите диапазон молчания в днях (от и до).\n"
+        "<i>Например: 10-20</i>\n\n"
+        "Бот найдет тех, кто не отвечал в этом промежутке.",
+        reply_markup=cancel_fsm_keyboard,
+        parse_mode="HTML"
+    )
+
+# 5. Собираем Дни (с валидацией)
+@router.message(MailingTaskStates.waiting_for_days)
+async def process_mailing_days(message: Message, state: FSMContext):
+    text = message.text.replace(" ", "")
+    try:
+        if "-" not in text:
+            raise ValueError
+        parts = text.split("-")
+        d_min = int(parts[0])
+        d_max = int(parts[1])
+        if d_min > d_max:
+            d_min, d_max = d_max, d_min # На случай если перепутали местами
+            
+        await state.update_data(days_min=d_min, days_max=d_max)
+        await state.set_state(MailingTaskStates.waiting_for_message)
+        await message.answer(
+            "Шаг 4/4: Введите ТЕКСТ сообщения, который получит кандидат.",
+            reply_markup=cancel_fsm_keyboard
+        )
+    except:
+        await message.answer("❌ Неверный формат. Введите два числа через дефис, например: <code>7-30</code>", parse_mode="HTML")
+
+# 6. Собираем Текст и показываем Превью
+@router.message(MailingTaskStates.waiting_for_message)
+async def process_mailing_text(message: Message, state: FSMContext):
+    await state.update_data(message_text=message.text)
+    data = await state.get_data()
+    
+    preview = (
+        f"📋 <b>Проверка параметров рассылки:</b>\n\n"
+        f"🔹 Вакансия: <code>{data['vacancy_pattern']}</code>\n"
+        f"🔹 Город: <code>{data['city_pattern']}</code>\n"
+        f"🔹 Молчание: от <b>{data['days_min']}</b> до <b>{data['days_max']}</b> дней\n\n"
+        f"📝 <b>Текст сообщения:</b>\n"
+        f"<i>{data['message_text']}</i>\n\n"
+        f"⚠️ После запуска бот найдет подходящих кандидатов и начнет отправку. "
+        f"Списание средств произойдет по тарифу Реактивации за каждое успешное сообщение."
+    )
+    
+    # Создаем кнопку подтверждения
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ ЗАПУСТИТЬ", callback_data="confirm_mailing_start")
+    kb.button(text="❌ ОТМЕНА", callback_data="cancel_fsm")
+    kb.adjust(1)
+    
+    await state.set_state(MailingTaskStates.waiting_for_confirmation)
+    await message.answer(preview, reply_markup=kb.as_markup(), parse_mode="HTML")
+
+# 7. Финал: Сохранение в БД
+@router.callback_query(MailingTaskStates.waiting_for_confirmation, F.data == "confirm_mailing_start")
+async def confirm_mailing_task(callback: CallbackQuery, state: FSMContext, db_session: Session):
+    data = await state.get_data()
+    
+    # 1. Сначала найдем ID пользователя в нашей БД (не telegram_id, а внутренний id)
+    user = db_session.query(TelegramUser).filter_by(telegram_id=str(callback.from_user.id)).first()
+    user_db_id = user.id if user else None
+
+    # 2. Создаем запись с привязкой к создателю
+    new_task = MailingTask(
+        vacancy_pattern=data['vacancy_pattern'],
+        city_pattern=data['city_pattern'],
+        days_silent_min=data['days_min'],
+        days_silent_max=data['days_max'],
+        message_text=data['message_text'],
+        status='pending',
+        creator_id=user_db_id  # <--- ТЕПЕРЬ СОХРАНЯЕМ КТО ЗАПУСТИЛ
+    )
+    
+    db_session.add(new_task)
+    db_session.commit()
+    
+    await state.clear()
+    await callback.message.edit_text(
+        "✅ <b>Задача успешно создана и добавлена в очередь!</b>\n\n"
+        "Воркер приступит к выполнению в ближайшее время. "
+        "Результаты можно будет увидеть в разделе статистики (Молчуны).",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# --- Локальная клавиатура (чтобы не менять keyboards.py) ---
+reactivation_stats_menu = InlineKeyboardMarkup(
+    inline_keyboard=[
+        [InlineKeyboardButton(text="👁️ Посмотреть за 7 дней (текст)", callback_data="reactivation_7days_stats")],
+        [InlineKeyboardButton(text="📥 Выгрузить в Excel", callback_data="reactivation_excel_start")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="stats_back_to_main")]
+    ]
+)
+
+# 1. ВХОД В МЕНЮ "МОЛЧУНЫ"
+@router.callback_query(F.data == "stats_silent")
+async def stats_silent_handler(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🤐 <b>Статистика Реактивации (Молчуны)</b>\n"
+        "Здесь отображаются результаты массовых рассылок и буста старых кандидатов.",
+        reply_markup=reactivation_stats_menu,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# 2. ТЕКСТОВАЯ СВОДКА ЗА 7 ДНЕЙ
+def _build_reactivation_7day_stats_content(db_session: Session) -> Text:
+    content_parts = [Bold("🤐 Воронка Реактивации (7 дней):"), "\n\n"]
+    days = [date.today() - timedelta(days=i) for i in range(7)]
+    has_data = False
+
+    for day in days:
+        # Запрашиваем события только режима 'reactivation' за конкретный день
+        events = db_session.query(AnalyticsEvent.event_type, func.count(AnalyticsEvent.id)).filter(
+            AnalyticsEvent.mode == 'reactivation',
+            cast(AnalyticsEvent.created_at, Date) == day
+        ).group_by(AnalyticsEvent.event_type).all()
+
+        # Преобразуем список кортежей в словарь для удобства
+        stats = {e[0]: e[1] for e in events}
+
+        sent = stats.get('reactivation_sent', 0)
+        
+        # Если были отправки или какая-то активность
+        if sent > 0 or stats:
+            has_data = True
+            
+            awakened = stats.get('user_reply', 0)
+            success = stats.get('interview_assigned', 0)
+            rejected_bot = stats.get('rejected_by_bot', 0)
+            refusal_user = stats.get('refusal_by_user', 0)
+            timeout = stats.get('timed_out', 0)
+            
+            # Конверсия в ответ (если отправляли)
+            conv_reply = round((awakened / sent * 100), 1) if sent > 0 else 0
+
+            day_str = day.strftime('%d.%m (%a)')
+            content_parts.extend([
+                Bold(f"📅 {day_str}"), "\n",
+                f"   📤 Разослано: {sent}\n",
+                f"   💬 Проснулись: {awakened} ", Italic(f"({conv_reply}%)"), "\n",
+                f"   ✅ Записаны: {success}\n",
+                f"   🤖 Отказ (бот): {rejected_bot}\n",
+                f"   🙅‍♂️ Отказ (сам): {refusal_user}\n",
+                f"   💤 Снова уснули: {timeout}\n",
+                "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+            ])
+
+    if not has_data:
+        return Text("📊 Данных по Реактивации за 7 дней не найдено.")
+    return Text(*content_parts)
+
+@router.callback_query(F.data == "reactivation_7days_stats")
+async def view_reactivation_text_stats(callback: CallbackQuery, db_session: Session):
+    content = _build_reactivation_7day_stats_content(db_session)
+    await callback.message.edit_text(**content.as_kwargs(), reply_markup=back_to_stats_main_keyboard)
+    await callback.answer()
+
+# 3. ЭКСПОРТ В EXCEL
+@router.callback_query(F.data == "reactivation_excel_start")
+async def reactivation_export_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ReactivationExportStates.waiting_for_range)
+    await callback.message.answer(
+        "🤐 [РЕАКТИВАЦИЯ] За какой период выгрузить Excel?\n\n"
+        "Выберите кнопку или пришлите диапазон:\n<code>01.12.2025 - 15.12.2025</code>",
+        reply_markup=export_date_options_keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@router.callback_query(ReactivationExportStates.waiting_for_range, F.data.startswith("export_range_"))
+async def reactivation_export_quick(callback: CallbackQuery, state: FSMContext, db_session: Session):
+    days_count = int(callback.data.split("_")[-1])
+    start_date = date.today() - timedelta(days=days_count-1)
+    await generate_reactivation_excel(callback.message, start_date, date.today(), db_session, state)
+    await callback.answer()
+
+@router.message(ReactivationExportStates.waiting_for_range)
+async def reactivation_export_manual(message: Message, state: FSMContext, db_session: Session):
+    try:
+        parts = message.text.split("-")
+        start_date = datetime.strptime(parts[0].strip(), "%d.%m.%Y").date()
+        end_date = datetime.strptime(parts[1].strip(), "%d.%m.%Y").date()
+        await generate_reactivation_excel(message, start_date, end_date, db_session, state)
+    except Exception:
+        await message.answer("❌ Формат: 01.01.2024 - 10.01.2024")
+
+async def generate_reactivation_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
+    msg_wait = await message.answer("⏳ Собираю события Реактивации и строю воронку...")
+
+    # 1. ЗАПРОС К БД (AnalyticsEvents + Join справочников для имен)
+    # Нам нужны: Дата, Имя Рекрутера, Город, Вакансия, Тип события
+    results = db.query(
+        AnalyticsEvent.created_at,
+        AnalyticsEvent.event_type,
+        AnalyticsEvent.city,
+        TrackedRecruiter.name,
+        Vacancy.title
+    ).outerjoin(
+        TrackedRecruiter, AnalyticsEvent.recruiter_id == TrackedRecruiter.id
+    ).outerjoin(
+        Vacancy, AnalyticsEvent.vacancy_id == Vacancy.id
+    ).filter(
+        AnalyticsEvent.mode == 'reactivation',
+        cast(AnalyticsEvent.created_at, Date) >= start_date,
+        cast(AnalyticsEvent.created_at, Date) <= end_date
+    ).all()
+
+    if not results:
+        await msg_wait.edit_text("🤷 За этот период событий по Реактивации не найдено.")
+        await state.clear()
+        return
+
+    # 2. ОБРАБОТКА ДАННЫХ В PYTHON
+    rows = []
+    for r in results:
+        rows.append({
+            "Дата": r[0].strftime("%d.%m.%Y"),
+            "Тип события": r[1],
+            "Город": r[2] if r[2] else "Не указан",
+            "Рекрутер": r[3] if r[3] else "Не указан",
+            "Вакансия": r[4] if r[4] else "Не указана"
+        })
+    
+    df_raw = pd.DataFrame(rows)
+
+    # 3. ФУНКЦИЯ ДЛЯ СВОДНЫХ ТАБЛИЦ (PIVOT)
+    def create_reactivation_summary(groupby_col):
+        # Pivot table: строки - группа, столбцы - типы событий, значения - количество
+        pivot = pd.pivot_table(
+            df_raw, 
+            index=groupby_col, 
+            columns='Тип события', 
+            aggfunc='size', 
+            fill_value=0
+        ).reset_index()
+
+        # Гарантируем наличие всех колонок (даже если событий не было)
+        required_cols = [
+            'reactivation_sent', 'user_reply', 'interview_assigned', 
+            'rejected_by_bot', 'refusal_by_user', 'timed_out'
+        ]
+        for col in required_cols:
+            if col not in pivot.columns:
+                pivot[col] = 0
+
+        # Переименовываем для красоты
+        pivot = pivot.rename(columns={
+            'reactivation_sent': 'Разослано',
+            'user_reply': 'Вступили (Проснулись)',
+            'interview_assigned': 'Собеседование (Успех)',
+            'rejected_by_bot': 'Отказ Ботом',
+            'refusal_by_user': 'Отказ Кандидатом',
+            'timed_out': 'Снова замолчали'
+        })
+        
+        # Считаем ВСЕГО ОТКАЗОВ
+        pivot['Отказы Всего'] = pivot['Отказ Ботом'] + pivot['Отказ Кандидатом']
+
+        # Расчет конверсий
+        # 1. Проснулись % = Вступили / Разослано
+        pivot['Проснулись %'] = (pivot['Вступили (Проснулись)'] / pivot['Разослано']).fillna(0)
+        
+        # 2. Собес % = Собеседование / Вступили
+        pivot['Конверсия в Собес %'] = (pivot['Собеседование (Успех)'] / pivot['Вступили (Проснулись)']).fillna(0)
+        
+        # 3. Отвал % = Снова замолчали / Вступили
+        pivot['Отвал (Снова сон) %'] = (pivot['Снова замолчали'] / pivot['Вступили (Проснулись)']).fillna(0)
+
+        # Формируем итоговый порядок столбцов
+        final_cols = [
+            groupby_col, 'Разослано', 'Вступили (Проснулись)', 'Проснулись %',
+            'Собеседование (Успех)', 'Конверсия в Собес %',
+            'Отказы Всего', 'Снова замолчали', 'Отвал (Снова сон) %'
+        ]
+        
+        res = pivot[final_cols]
+
+        # ИТОГОВАЯ СТРОКА
+        total = res.sum(numeric_only=True)
+        total[groupby_col] = 'ИТОГО'
+        
+        # Пересчет % для ИТОГО
+        t_sent = total['Разослано'] if total['Разослано'] > 0 else 1
+        t_reply = total['Вступили (Проснулись)'] if total['Вступили (Проснулись)'] > 0 else 1
+        
+        total['Проснулись %'] = total['Вступили (Проснулись)'] / t_sent
+        total['Конверсия в Собес %'] = total['Собеседование (Успех)'] / t_reply
+        total['Отвал (Снова сон) %'] = total['Снова замолчали'] / t_reply
+        
+        return pd.concat([res, pd.DataFrame([total])], ignore_index=True)
+
+    # Генерируем листы
+    df_date = create_reactivation_summary('Дата')
+    df_rec = create_reactivation_summary('Рекрутер')
+    df_city = create_reactivation_summary('Город')
+    df_vac = create_reactivation_summary('Вакансия')
+
+    # 4. СОХРАНЕНИЕ В EXCEL
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
+        df_rec.to_excel(writer, index=False, sheet_name='Свод по рекрутерам')
+        df_city.to_excel(writer, index=False, sheet_name='Свод по городам')
+        df_vac.to_excel(writer, index=False, sheet_name='Свод по вакансиям')
+        
+        # Лист с сырыми данными (опционально, но полезно)
+        df_raw.rename(columns={
+            'reactivation_sent': 'Разослано', 'user_reply': 'Проснулся',
+            'interview_assigned': 'Собес', 'rejected_by_bot': 'Отказ Бот',
+            'refusal_by_user': 'Отказ Юзер', 'timed_out': 'Таймаут'
+        }).to_excel(writer, index=False, sheet_name='Сырые данные')
+
+        workbook = writer.book
+        perc_fmt = workbook.add_format({'num_format': '0.0%', 'border': 1, 'align': 'center'})
+        num_fmt = workbook.add_format({'border': 1, 'align': 'center'})
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#E6B8AF', 'border': 1}) # Красноватый оттенок для Молчунов
+
+        for sheet_name in writer.sheets:
+            ws = writer.sheets[sheet_name]
+            ws.freeze_panes(1, 0)
+            
+            # Получаем DataFrame, соответствующий текущему листу
+            if sheet_name == 'Свод по датам': curr_df = df_date
+            elif sheet_name == 'Свод по рекрутерам': curr_df = df_rec
+            elif sheet_name == 'Свод по городам': curr_df = df_city
+            elif sheet_name == 'Свод по вакансиям': curr_df = df_vac
+            else: curr_df = df_raw # Для 'Общий отчет'
+
+            for i, col in enumerate(curr_df.columns):
+                # Авто-ширина
+                column_len = max(curr_df[col].astype(str).str.len().max(), len(str(col))) + 3
+                # Если в названии есть %, ставим процентный формат, иначе числовой
+                ws.set_column(i, i, column_len, perc_fmt if '%' in str(col) else num_fmt)
+            
+            # Применяем стиль заголовка (первая строка)
+            ws.set_row(0, None, header_fmt)
+
+    output.seek(0)
+    await message.answer_document(
+        BufferedInputFile(output.read(), filename=f"Reactivation_Report_{start_date}_{end_date}.xlsx"),
+        caption=f"🤐 Аналитика Реактивации ({start_date} - {end_date})"
+    )
+    await msg_wait.delete()
+    await state.clear()
+
 
 
 def _build_followup_7day_stats_content(db_session: Session) -> Text:
@@ -589,6 +991,4 @@ async def stats_back_to_main(callback: CallbackQuery):
     await callback.answer()
 
 
-@router.callback_query(F.data == "stats_silent")
-async def stats_silent_handler(callback: CallbackQuery):
-    await callback.answer("Раздел 'Молчуны' в разработке", show_alert=True)
+

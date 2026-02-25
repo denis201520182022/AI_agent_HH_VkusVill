@@ -378,7 +378,11 @@ class MailingTask(Base):
     
     # Контент
     message_text = Column(Text, nullable=False) # Текст сообщения
+    # ДОБАВИТЬ ЭТО:
+    creator_id = Column(Integer, ForeignKey('telegram_users.id'), nullable=True)
     
+    # Опционально: связь для удобства
+    creator = relationship("TelegramUser")
     # Статус выполнения
     status = Column(String(50), default='pending', index=True) # pending, in_progress, completed, failed, cancelled
     
