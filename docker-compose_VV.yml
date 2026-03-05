@@ -56,13 +56,13 @@ services:
   # ---------------------------------------------------------------
   # SCANNER (Только 36, 49, 47)
   # ---------------------------------------------------------------
-  vv_scanner_36_49_47:
+  vv_scanner_36_55_58:
     <<: [*default-logging, *python-limits]
     build: .
     image: hh_bot_core:latest
-    container_name: vv_scanner_36_49_47
+    container_name: vv_scanner_36_55_58
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 36 49 47
+    command: python run_hh_scanner.py --recruiter_ids 36 55 58
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -81,12 +81,12 @@ services:
   # ---------------------------------------------------------------
   # WORKER (Только 36, 49, 47)
   # ---------------------------------------------------------------
-  vv_worker_36_49_47:
+  vv_worker_36_55_58:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_worker_36_49_47
+    container_name: vv_worker_36_55_58
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 36 49 47
+    command: python run_hh_worker.py --recruiter_ids 36 55 58
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -105,7 +105,7 @@ services:
 
   #---------------------------------------------------------------------------------------------
   # ---------------------------------------------------------------
-  # SCANNER 
+  # SCANNER
   # ---------------------------------------------------------------
   vv_scanner_29_40_45:
     <<: [*default-logging, *python-limits]
@@ -129,7 +129,7 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER 
+  # WORKER
   # ---------------------------------------------------------------
   vv_worker_29_40_45:
     <<: [*default-logging, *python-limits]
@@ -152,14 +152,14 @@ services:
       - REDIS_HOST=host.docker.internal
   #---------------------------------------------------------------------------------------------
   # ---------------------------------------------------------------
-  # SCANNER 
+  # SCANNER
   # ---------------------------------------------------------------
-  vv_scanner_32_39_44:
+  vv_scanner_32_56_44:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_scanner_32_39_44
+    container_name: vv_scanner_32_56_44
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 32 39 44
+    command: python run_hh_scanner.py --recruiter_ids 32 56 44
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -176,14 +176,14 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER 
+  # WORKER
   # ---------------------------------------------------------------
-  vv_worker_32_39_44:
+  vv_worker_32_56_44:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_worker_32_39_44
+    container_name: vv_worker_32_56_44
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 32 39 44
+    command: python run_hh_worker.py --recruiter_ids 32 56 44
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -201,14 +201,14 @@ services:
 
 
   # ---------------------------------------------------------------
-  # SCANNER 
+  # SCANNER
   # ---------------------------------------------------------------
-  vv_scanner_48_33_50:
+  vv_scanner_57_33_50:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_scanner_48_33_50
+    container_name: vv_scanner_57_33_50
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 48 33 50
+    command: python run_hh_scanner.py --recruiter_ids 57 33 50
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -225,14 +225,14 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER 
+  # WORKER
   # ---------------------------------------------------------------
-  vv_worker_48_33_50:
+  vv_worker_57_33_50:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_worker_48_33_50
+    container_name: vv_worker_57_33_50
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 48 33 50
+    command: python run_hh_worker.py --recruiter_ids 57 33 50
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -248,7 +248,7 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # SCANNER 
+  # SCANNER
   # ---------------------------------------------------------------
   vv_scanner_46_7_42:
     <<: [*default-logging, *python-limits]
@@ -272,7 +272,7 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER 
+  # WORKER
   # ---------------------------------------------------------------
   vv_worker_46_7_42:
     <<: [*default-logging, *python-limits]
@@ -296,14 +296,14 @@ services:
 
 
   # ---------------------------------------------------------------
-  # SCANNER 
+  # SCANNER
   # ---------------------------------------------------------------
-  vv_scanner_43_38_28:
+  vv_scanner_43_54_28:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_scanner_43_38_28
+    container_name: vv_scanner_43_54_28
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 43 38 28
+    command: python run_hh_scanner.py --recruiter_ids 43 54 28
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -320,14 +320,14 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER 
+  # WORKER
   # ---------------------------------------------------------------
-  vv_worker_43_38_28:
+  vv_worker_43_54_28:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_worker_43_38_28
+    container_name: vv_worker_43_54_28
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 43 38 28
+    command: python run_hh_worker.py --recruiter_ids 43 54 28
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -343,14 +343,14 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # SCANNER 
+  # SCANNER
   # ---------------------------------------------------------------
-  vv_scanner_41_52_37:
+  vv_scanner_41_52_37_53:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_scanner_41_52_37
+    container_name: vv_scanner_41_52_37_53
     restart: always
-    command: python run_hh_scanner.py --recruiter_ids 41 52 37
+    command: python run_hh_scanner.py --recruiter_ids 41 52 37 53
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -367,14 +367,14 @@ services:
       - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
-  # WORKER 
+  # WORKER
   # ---------------------------------------------------------------
-  vv_worker_41_52_37:
+  vv_worker_41_52_37_53:
     <<: [*default-logging, *python-limits]
     image: hh_bot_core:latest
-    container_name: vv_worker_41_52_37
+    container_name: vv_worker_41_52_37_53
     restart: always
-    command: python run_hh_worker.py --recruiter_ids 41 52 37
+    command: python run_hh_worker.py --recruiter_ids 41 52 37 53
     volumes:
       - ./logs:/app/logs
       - ./credentials.json:/app/credentials.json
@@ -487,7 +487,7 @@ services:
       - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
-    
+
 
 volumes:
   vv_grafana_data:

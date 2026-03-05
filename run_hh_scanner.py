@@ -198,7 +198,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                     stmt = (
                         update(Dialogue)
                         .where(Dialogue.vacancy_id == vacancy_in_db.id)
-                        .where(Dialogue.status.in_(['new', 'in_progress', 'qualified']))
+                        .where(Dialogue.status.in_(['new', 'in_progress', 'qualified', 'timed_out']))
                         .values(recruiter_id=current_recruiter.id)
                     )
                     await db.execute(stmt)

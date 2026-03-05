@@ -86,96 +86,71 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
     except (ValueError, TypeError):
         return "время не определено"
 
-def _has_forbidden_restrictions(history: list) -> bool:
+async def _check_restrictions_via_llm(db: AsyncSession, dialogue: Dialogue, history_messages: list, log_extra: dict) -> bool:
     """
-    Проверяет историю сообщений кандидата на наличие стоп-слов, используя регулярные выражения
-    для поиска разных форм слов (проблема/проблемы, инвалид/инвалидность и т.д.).
+    Проверяет историю диалога на наличие критических ограничений (здоровье, язык) через LLM.
+    Возвращает True, если найдены ограничения (нужен отказ), иначе False.
     """
-    if not history:
-        return False
-
-    # Список регулярных выражений
-    # \b - граница слова (начало или конец)
-    # [а-я]* - любые окончания (например, проблемА, проблемЫ, проблемОЙ)
-    # \s+ - один или несколько пробелов
-    # (вариант1|вариант2) - выбор из вариантов
-    
-    forbidden_patterns = [
-        # --- СЛУХ ---
-        # Ловит: "проблема со слухом", "проблемы со слухом", "проблемой со слухом"
-        r"проблем[а-я]*\s+с[о]?\s+слухом", 
-        # Ловит: "нарушение слуха", "нарушения слуха"
-        r"нарушени[ея][а-я]*\s+слуха",
-        # Ловит: "плохо слышу", "плохо слышать", "не слышу"
-        r"(плохо|не)\s+слыш[уа-я]*",
-        # Ловит: "тугоухость", "глухота", "глухонемой", "глухой", "глухая", "слабослышащий"
-        r"\b(тугоухость|глухота|глухонем[а-я]*|слабослышащ[а-я]*)\b",
-        r"\bглух(ой|ая|ие|им)\b",
-        r"слуховой\s+аппарат",
-        r"инвалид[а-я]*\s+по\s+слуху",
-        r"групп[а-я]*\s+по\s+слуху",
-
-        # --- ЗРЕНИЕ ---
-        r"проблем[а-я]*\s+с[о]?\s+зрением",
-        r"нарушени[ея][а-я]*\s+зрения",
-        r"инвалид[а-я]*\s+по\s+зрению",
-        # Ловит: "слепой", "слепая" (но не "слепить")
-        r"\bслеп(ой|ая|ые|ым)\b", 
-        r"слабовидящ[а-я]*",
-
-        # --- РЕЧЬ ---
-        r"нарушени[ея][а-я]*\s+речи",
-        r"проблем[а-я]*\s+с\s+речью",
-        
-        # --- ЯЗЫК (РУССКИЙ) ---
-        # Ловит: "не говорю по-русски", "не знаю русский", "не понимаю по-русски"
-        # "русский плохо", "русский слабый"
-        r"не\s+(говор[юя][а-я]*|знаю|понима[юе][а-я]*)\s+(по-)?русски[а-я]*",
-        r"русски[а-я]*\s+(язык\s+)?(плох[о]?|слабый|маленький)",
-        r"плохо\s+(знаю|владею|говор[юя]|понима[юе])\s+(по-)?русски[а-я]*",
-        # Ловит: "нужен переводчик", "можно на узбекском" и т.д.
-        r"(нужен|требуется)\s+переводчик",
-        r"можно\s+(на\s+)?(английск|таджикск|узбекск)[а-я]*",
-        r"плохо\s+понима[т]?[ь]?\b", # Осторожно, короткая фраза
-        r"плохо\s+говорит[ь]?\b",
-
-        # --- ОБЩИЕ ОГРАНИЧЕНИЯ ---
-        # Ловит: "инвалид", "инвалидность"
-        r"\bинвалид(ность)?[а-я]*\b",
-        r"ограничени[ея][а-я]*\s+по\s+здоровью",
-        r"медицински[ех]\s+ограничени[ея]",
-        # Фраза "есть группа" опасна (может быть "группа в телеграм"), 
-        # поэтому уточняем контекст или ищем точную фразу, если она критична
-        r"есть\s+(инвалидность|группа\s+инвалидности)",
-        # Если кандидат пишет просто "есть группа" в контексте здоровья, это сложно поймать без контекста,
-        # но для безопасности оставим конкретику:
-        r"есть\s+группа\s+по\s+здоровью"
-    ]
-
-    user_text_parts = []
-    
-    for m in history:
-        if not isinstance(m, dict):
+    # 1. Формируем чистый текст диалога
+    clean_history_lines = []
+    for m in history_messages:
+        content = m.get('content', '')
+        if isinstance(content, str) and content.startswith('[SYSTEM COMMAND]'):
             continue
-            
-        role = m.get('role')
-        content = str(m.get('content', ''))
+        role_label = "Кандидат" if m.get('role') == 'user' else "Бот"
+        clean_history_lines.append(f"{role_label}: {content}")
 
-        # Фильтр: только сообщения пользователя, НЕ системные команды
-        if role == 'user' and not content.startswith('[SYSTEM COMMAND]'):
-            user_text_parts.append(content.lower())
+    full_text = "\n".join(clean_history_lines)
 
-    full_user_text = " ".join(user_text_parts)
+    restriction_prompt = (
+        "Ты — эксперт службы безопасности и охраны труда. Твоя задача — проанализировать диалог и определить, "
+        "сообщил ли КАНДИДАТ о наличии серьезных ограничений, которые делают невозможной работу на складе или в магазине.\n\n"
+        "КРИТЕРИИ ОТКАЗА (ОГРАНИЧЕНИЯ):\n"
+        "1. СЛУХ: Полная глухота, сильная тугоухость, использование слухового аппарата.\n"
+        "2. ЗРЕНИЕ: Слепота, критически плохое зрение (слабовидящий).\n"
+        "3. РЕЧЬ: Полное отсутствие речи или тяжелые нарушения.\n"
+        "4. ЯЗЫК: Кандидат прямо говорит, что не понимает русский язык, не говорит на нем или требует переводчика.\n"
+        "5. ЗДОРОВЬЕ: Наличие инвалидности или медицинских противопоказаний к физическому труду.\n\n"
 
-    # Проверка регулярными выражениями
-    for pattern in forbidden_patterns:
-        # re.search ищет паттерн во всем тексте
-        if re.search(pattern, full_user_text):
-            # Для отладки можно раскомментировать лог:
-            # logger.info(f"Сработало ограничение (Regex): {pattern} на тексте: {full_user_text}")
-            return True
-            
-    return False
+        "ПРАВИЛА АНАЛИЗА:\n"
+        "- Игнорируй мелкие жалобы (например, 'устал' или 'болит голова сегодня').\n"
+        "- Верни 'has_restrictions': true только если есть ПРЯМОЕ упоминание одного из критериев выше.\n"
+        "- Если кандидат говорит 'у меня нет проблем со здоровьем' — это 'has_restrictions': false.\n\n"
+        "Ответ строго в формате JSON:\n"
+        "{\n"
+        "  \"reasoning\": \"краткое обоснование на русском языке\",\n"
+        "  \"has_restrictions\": true/false\n"
+        "}"
+    )
+
+    attempt_tracker = []
+    try:
+        response = await llm_handler.get_bot_response(
+            system_prompt=restriction_prompt,
+            dialogue_history=[],
+            user_message=f"ИСТОРИЯ ДИАЛОГА:\n{full_text}",
+            current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
+            attempt_tracker=attempt_tracker,
+            skip_instructions=True,
+            extra_context=log_extra
+        )
+
+        # Логируем использование (включая ретраи, как в твоем коде)
+        if response:
+            await _log_llm_usage(db, dialogue, "Restriction_Check", response.get("usage_stats"))
+            if len(attempt_tracker) > 1:
+                for i in range(len(attempt_tracker) - 1):
+                    await _log_llm_usage(db, dialogue, f"Restriction_Check (RETRY #{i+1})")
+
+        parsed = response.get('parsed_response', {})
+        return parsed.get("has_restrictions", False)
+
+    except Exception as e:
+        # Логируем провальные попытки в БД перед вылетом
+        for i in range(len(attempt_tracker)):
+            await _log_llm_usage(db, dialogue, f"Restriction_Check (FAILED #{i+1}: {type(e).__name__})")
+        logger.error(f"[{dialogue.hh_response_id}] Ошибка проверки ограничений LLM: {e}", extra=log_extra)
+        return False # Fallback: если LLM упала, считаем что ограничений нет, чтобы не заблокировать нормального кандидата
 
 def _validate_age_in_text(text: str, suggested_age: any) -> bool:
     """
@@ -2133,16 +2108,27 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             # --- НОВАЯ ПРОВЕРКА НА ОГРАНИЧЕНИЯ ---
             # Собираем полную историю (из БД + то что пришло сейчас)
+            # --- ЗАМЕНА СТАРОЙ ПРОВЕРКИ (Regex) НА НОВУЮ (LLM) ---
+            
+            # Собираем полную историю для анализа
             full_history_for_filter = (dialogue.history or []) + user_entries_to_history
-            has_restrictions = _has_forbidden_restrictions(full_history_for_filter)
+            
+            # Вместо: has_restrictions = _has_forbidden_restrictions(full_history_for_filter)
+            # Используем LLM:
+            has_restrictions = await _check_restrictions_via_llm(
+                db=db, 
+                dialogue=dialogue, 
+                history_messages=full_history_for_filter, 
+                log_extra=log_context
+            )
             
             if has_restrictions:
                 ctx_logger.info(
-                    f"[{dialogue.hh_response_id}] ОТКАЗ: В диалоге найдены стоп-слова (здоровье/язык).",
-                    extra={"action": "qualification_failed_by_restrictions"}
+                    f"[{dialogue.hh_response_id}] ОТКАЗ: LLM подтвердила наличие ограничений (здоровье/язык).",
+                    extra={"action": "qualification_failed_by_llm_restrictions"}
                 )
                 is_eligible = False # Принудительно ставим False, чтобы сработал блок отказа ниже
-            # -------------------------------------
+            # ---------------------------------------------------
 
             if not is_eligible:
                 # --- СЦЕНАРИЙ 1: ОТКАЗ ---
