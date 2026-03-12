@@ -121,11 +121,11 @@ async def send_date_conflict_alert(
 async def send_cost_alert(
     dialogue_id: int,
     hh_response_id: str,
-    total_cost_usd: float,
-    total_cost_rub: float,
-    history: list,
-    recruiter_name: str,
-    vacancy_title: str
+    total_cost_rub: float,         # Поменял местами и сделал главными
+    total_cost_usd: float = 0.0,   # Сделал значение по умолчанию
+    history: list = None,
+    recruiter_name: str = "Неизвестен",
+    vacancy_title: str = "Неизвестна"
 ):
     """
     Отправляет уведомление об аномально дорогом диалоге.
@@ -150,9 +150,10 @@ async def send_cost_alert(
                 f"Вакансия: *{esc(vacancy_title)}*\n\n"
                 f"💵 **Затраты:**\n"
                 f"Итого в RUB: `{esc(round(total_cost_rub, 2))} руб.`\n"
-                f"Итого в USD: `${esc(round(total_cost_usd, 4))}`\n\n"
+                # Добавим проверку USD
+                + (f"Итого в USD: `${esc(round(total_cost_usd, 4))}`\n\n" if total_cost_usd else "\n") +
                 f"🔗 [Открыть переписку на HH]({hh_link})\n\n"
-                f"⚠️ *Рекомендуется проверить историю на предмет зацикливания или слишком длинных промптов.*"
+                f"⚠️ *Рекомендуется проверить историю на предмет зацикливания.*"
             )
 
             # Формируем текстовый дамп истории

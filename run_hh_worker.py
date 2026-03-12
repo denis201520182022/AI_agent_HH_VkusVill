@@ -1076,6 +1076,38 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         })
         # Пересоздаем адаптер с полным набором данных
         ctx_logger = logging.LoggerAdapter(logger, log_context)
+        
+        # === НОВЫЙ БЛОК: КОНТРОЛЬ СТОИМОСТИ И АЛЕРТОВ ===
+        try:
+            total_cost_usd = float(dialogue.total_cost or 0)
+            total_cost_rub = total_cost_usd * 85.0
+
+            # 1. АЛЕРТ (если больше 10 руб)
+            if total_cost_rub > 8.0:
+                alert_key = f"cost_alert_sent:{dialogue.id}"
+                # acquire_lock вернет True, если ключа нет (шлем алерт первый раз за 3 дня)
+                if await acquire_lock(alert_key, timeout=259200): 
+                    ctx_logger.warning(f"💸 Превышен лимит 10 руб ({total_cost_rub:.2f} руб). Отправляю алерт.")
+                    await send_cost_alert(
+                        dialogue_id=dialogue.id,
+                        hh_response_id=dialogue.hh_response_id,
+                        total_cost_rub=total_cost_rub,
+                        history=dialogue.history or [],
+                        recruiter_name=recruiter.name if recruiter else "Неизвестен",
+                        vacancy_title=dialogue.vacancy.title if dialogue.vacancy else "Неизвестна"
+                    )
+
+            # 2. СТОП-КРАН (если больше 100 руб) - Защита от бесконечных циклов
+            if total_cost_rub > 20.0:
+                ctx_logger.critical(f"🛑 КРИТИЧЕСКИЙ РАСХОД: {total_cost_rub:.2f} руб. Блокирую диалог!")
+                dialogue.pending_messages = None  # Останавливаем цикл
+                dialogue.dialogue_state = 'error_loop_blocked' # Помечаем для админа
+                await db.commit()
+                return # Выходим из обработки этого диалога
+
+        except Exception as cost_err:
+            ctx_logger.error(f"Ошибка в блоке контроля стоимости: {cost_err}")
+        # === КОНЕЦ БЛОКА ===
 
         if dialogue.is_followup:
             await _process_followup_logic(db, dialogue, recruiter, prompt_library, ctx_logger)
@@ -2778,8 +2810,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # Ключ в редисе, который скажет нам, что мы УЖЕ слали алерт по этому диалогу
                     # Ставим время жизни 3 дня (259200 сек), чтобы ключ сам удалился
                     alert_key = f"cost_alert_sent:{dialogue.id}"
-                    
-                    # acquire_lock вернет True, если ключа нет (и создаст его), 
+
+                    # acquire_lock вернет True, если ключа нет (и создаст его),
                     # или False, если ключ уже есть.
                     # Мы используем это как "флаг однократности"
                     already_sent = not await acquire_lock(alert_key, timeout=259200)
@@ -2789,7 +2821,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         await send_cost_alert(
                             dialogue_id=dialogue.id,
                             hh_response_id=dialogue.hh_response_id,
-                            total_cost_usd=total_usd,
                             total_cost_rub=total_rub,
                             history=dialogue.history or [],
                             recruiter_name=recruiter.name if recruiter else "Неизвестен",
@@ -2799,7 +2830,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         ctx_logger.debug("Алерт стоимости уже отправлялся ранее, пропускаем.")
             except Exception as cost_alert_err:
                 ctx_logger.error(f"Ошибка в блоке алерта стоимости: {cost_alert_err}")
-        
+
             # Flush для проверки constraint violations перед commit
             await db.flush()
             await db.commit()
