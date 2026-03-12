@@ -18,6 +18,7 @@ from hr_bot.db.models import (
     InactiveNotificationQueue, RejectedNotificationQueue, NotificationQueue, Dialogue,
     AnalyticsEvent # <--- ОБЯЗАТЕЛЬНО ДОБАВИТЬ ЭТО
 )
+from sqlalchemy import func, cast, Date, Integer, and_
 
 from hr_bot.tg_bot.keyboards import (
     user_keyboard, admin_keyboard, 
