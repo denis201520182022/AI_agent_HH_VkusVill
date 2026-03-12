@@ -23,6 +23,7 @@ from hr_bot.utils.metrics import start_metrics_server
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog
 from hr_bot.services import hh_api_real as hh_api
+from hr_bot.services.description_vac import sync_vacancy_details
 from hr_bot.services import knowledge_base
 from hr_bot.services import llm_handler
 from hr_bot.db import statistics_manager
@@ -38,6 +39,14 @@ from sqlalchemy import func, select, delete, update
 from hr_bot.services import interview_reminder_manager
 from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
 from hr_bot.utils.metrics import start_metrics_server
+# Найти строку с импортами моделей и добавить AnalyticsEvent
+from hr_bot.db.models import (
+    SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, 
+    TrackedRecruiter, AppSettings, InactiveNotificationQueue, 
+    RejectedNotificationQueue, InterviewReminder, LlmUsageLog,
+    AnalyticsEvent  # <--- ДОБАВИТЬ ЭТО
+)
+from hr_bot.utils.analytics import log_analytics_event
 # Если в metrics.py еще нет этих метрик, их лучше добавить туда.
 # Но для простоты предположим, что мы добавляем их или используем универсальные.
 # Давай добавим специфичные метрики для сканера:
@@ -98,10 +107,6 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
         return "время не определено"
     
 async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSession) -> list:
-    """
-    Асинхронно получает список вакансий и синхронизирует их владельца.
-    Если вакансия перешла к текущему рекрутеру, переносит на него и активные диалоги.
-    """
     function_start_time = time.monotonic()
     current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
     rec_logger = logging.LoggerAdapter(logger, {
@@ -112,29 +117,25 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
     try:
         now = datetime.datetime.now(datetime.timezone.utc)
         cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
-
-        
+        # Интервал обновления деталей вакансии (1 час)
+        details_sync_interval = datetime.timedelta(hours=1)
 
         if not current_recruiter:
             rec_logger.error(f"Рекрутер с ID {recruiter_id} не найден.")
             return []
             
-        rec_logger.debug(f"Получение и синхронизация списка активных вакансий для рекрутера {current_recruiter.name}...")
-        
-        # 1. Проверка кэша (если недавно обновляли, просто берем из БД)
+        # 1. Проверка кэша списка вакансий
         if current_recruiter.vacancies_last_synced_at:
             time_since_sync = now - current_recruiter.vacancies_last_synced_at
             if time_since_sync < cache_expiry_time:
-                rec_logger.debug(f"Используем кэш. Последняя синхронизация: {time_since_sync.total_seconds() / 60:.1f} мин. назад.")
+                rec_logger.debug(f"Используем кэш списка. Синхронизация: {time_since_sync.total_seconds() / 60:.1f} мин. назад.")
                 result = await db.execute(select(Vacancy).filter(Vacancy.recruiter_id == current_recruiter.id))
                 cached_vacancies = result.scalars().all()
                 return [{"id": v.hh_vacancy_id, "name": v.title, "area": {"name": v.city} if v.city else {}} for v in cached_vacancies]
 
-        rec_logger.debug(f"Кэш устарел. Запрос к API...")
-        
-        # 2. Запрос к API HH
+        # 2. Запрос к API HH за списком вакансий
         me_data = await hh_api._make_request(current_recruiter, db, "GET", "me")
-        if not me_data or not me_data.get('employer') or not me_data['employer'].get('id'):
+        if not me_data or not me_data.get('employer', {}).get('id'):
             rec_logger.error(f"Не удалось получить employer_id.")
             return []
         employer_id = me_data['employer']['id']
@@ -153,48 +154,31 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 break
             page += 1
 
-        vac_count = len(all_vacancies_from_api)
-        VACANCIES_ACTIVE_GAUGE.labels(recruiter_id=str(recruiter_id)).set(vac_count)
-        
-        rec_logger.debug(
-            f"Найдено {len(all_vacancies_from_api)} активных вакансий. Синхронизация с БД...[recruiter_id: {recruiter_id}, active_vacancies_count: {vac_count}]"
-        )
         active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
 
-        # 3. Синхронизация вакансий и диалогов
+        # 3. Синхронизация каждой вакансии
         for vacancy_data in all_vacancies_from_api:
             hh_vacancy_id = str(vacancy_data.get("id"))
             result = await db.execute(select(Vacancy).filter_by(hh_vacancy_id=hh_vacancy_id))
             vacancy_in_db = result.scalar_one_or_none()
 
-            # Если вакансии нет - создаем
             if not vacancy_in_db:
-                new_vacancy = Vacancy(
+                # ВАЖНО: создаем и присваиваем в vacancy_in_db, чтобы использовать ниже
+                vacancy_in_db = Vacancy(
                     hh_vacancy_id=hh_vacancy_id,
                     title=vacancy_data.get("name", "Без названия"),
                     city=vacancy_data.get("area", {}).get("name"),
                     recruiter_id=current_recruiter.id
                 )
-                db.add(new_vacancy)
+                db.add(vacancy_in_db)
+                await db.flush() # Получаем ID для vacancy_in_db
             else:
-                # Вакансия есть. Обновляем поля (название, город)
                 vacancy_in_db.title = vacancy_data.get("name", "Без названия")
                 vacancy_in_db.city = vacancy_data.get("area", {}).get("name")
 
-                # === [ГЛАВНАЯ ЛОГИКА ПЕРЕНОСА] ===
-                # Если у вакансии в БД другой рекрутер (или None), а HH говорит, что она теперь наша
                 if vacancy_in_db.recruiter_id != current_recruiter.id:
-                    rec_logger.info(
-                        f"Вакансия {hh_vacancy_id} перешла к рекрутеру {recruiter_id}. "
-                        f"Переносим активные диалоги..."
-                    )
-                    
-                    # 1. Меняем владельца вакансии
+                    rec_logger.info(f"Вакансия {hh_vacancy_id} перешла к {recruiter_id}. Перенос диалогов...")
                     vacancy_in_db.recruiter_id = current_recruiter.id
-                    
-                    # 2. МАССОВЫЙ UPDATE ДИАЛОГОВ
-                    # Одним запросом меняем recruiter_id во всех диалогах этой вакансии,
-                    # которые находятся в активных статусах.
                     stmt = (
                         update(Dialogue)
                         .where(Dialogue.vacancy_id == vacancy_in_db.id)
@@ -202,10 +186,23 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                         .values(recruiter_id=current_recruiter.id)
                     )
                     await db.execute(stmt)
-                    # =================================
 
-        # 4. Отвязываем вакансии, которые больше не активны у этого рекрутера
-        # (Например, рекрутер закрыл вакансию или передал другому, и её нет в current active list)
+            # --- ЛОГИКА ОБНОВЛЕНИЯ ДЕТАЛЕЙ РАЗ В ЧАС ---
+            need_details_sync = False
+            if not vacancy_in_db.hh_data_raw or not vacancy_in_db.details_last_synced_at:
+                need_details_sync = True # Данных нет вообще
+            else:
+                time_since_details_sync = now - vacancy_in_db.details_last_synced_at
+                if time_since_details_sync > details_sync_interval:
+                    need_details_sync = True # Данные устарели (прошло > 1 часа)
+
+            if need_details_sync:
+                rec_logger.info(f"Обновляем полные данные для вакансии {hh_vacancy_id} (раз в час)...")
+                full_vacancy_data = await hh_api.get_vacancy_details(current_recruiter, db, hh_vacancy_id)
+                if full_vacancy_data:
+                    await sync_vacancy_details(db, vacancy_in_db, full_vacancy_data)
+
+        # 4. Обработка неактивных вакансий
         stale_result = await db.execute(select(Vacancy).filter(
             Vacancy.recruiter_id == current_recruiter.id,
             Vacancy.hh_vacancy_id.notin_(active_hh_ids)
@@ -214,15 +211,13 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
             stale_vac.recruiter_id = None
 
         current_recruiter.vacancies_last_synced_at = now
+        await db.commit() 
         
-        # Flush применяет изменения в транзакции (в т.ч. наш update), но не комитит окончательно
-        await db.flush() 
-        
-        rec_logger.debug(f"Синхронизация завершена.")
         return all_vacancies_from_api
 
     except Exception as e:
         rec_logger.error(f"Ошибка при синхронизации вакансий: {e}", exc_info=True)
+        await db.rollback()
         raise 
     finally:
         rec_logger.debug(f"Время выполнения: {time.monotonic() - function_start_time:.2f} sec.")
@@ -379,10 +374,16 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     recruiter_id=recruiter_id,
                     status='new',
                     dialogue_state='initial_processing',
-                    response_created_at=response_created_at_dt # <<< ИСПОЛЬЗУЕМ ОБЪЕКТ DATETIME
+                    response_created_at=response_created_at_dt,
+                    current_mode='standard'
                 )
                 db.add(dialogue)
-
+                
+                
+                await db.flush() # Важно, чтобы у диалога появился ID
+                from hr_bot.utils.analytics import log_analytics_event # Если нет в импортах сверху
+                await log_analytics_event(db, dialogue, 'response_created')
+                
                 # --- КРИТИЧЕСКИЙ МОМЕНТ: ПЕРЕМЕЩЕНИЕ ---
                 # Сначала перемещаем, чтобы зафиксировать намерение
                 await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')
@@ -420,7 +421,12 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
 
                 dialogue.pending_messages = messages
                 dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-
+                # Проверяем, есть ли в сообщениях хоть одно не системное
+                has_real_message = any(not m.get('content', '').startswith('[SYSTEM COMMAND]') for m in messages)
+                if has_real_message:
+                    # При создании отклика режим всегда 'standard'
+                    await log_analytics_event(db, dialogue, 'user_reply', check_duplicates=True)
+                # --------------------------
                 await statistics_manager.update_stats(db, vacancy_in_db.id, responses=1, started_dialogs=1)
 
                 # --- ВАЖНО: КОММИТИМ СРАЗУ ДЛЯ КАЖДОГО КАНДИДАТА ---
@@ -599,6 +605,24 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
                     f"Добавлено {msg_count} новых сообщений в диалог {response_id} 📩📩📩.",
                     extra={"new_messages_count": msg_count, "action": "messages_received"}
                 )
+                
+                # --- ОБНОВЛЕННЫЙ БЛОК АНАЛИТИКИ ---
+                # Проверяем, есть ли среди НОВЫХ сообщений реальные (не системные)
+                has_real_msg = any(not m.get('content', '').startswith('[SYSTEM COMMAND]') for m in new_msgs)
+                
+                if has_real_msg:
+                    # Логика именования событий:
+                    # 1. Если режим 'followup' -> пишем 'followup_reply'
+                    # 2. Если режим 'reactivation' -> пишем 'user_reply' (как ты просил в таблице)
+                    # 3. Если режим 'standard' -> пишем 'user_reply'
+                    event_type = 'followup_reply' if dialogue.current_mode == 'followup' else 'user_reply'
+                    
+                    # ВАЖНО: Благодаря тому, что мы в Mailing Worker поставили 
+                    # dialogue.active_mailing_task_id, эта функция сама привяжет ответ 
+                    # к конкретной рассылке в таблице аналитики.
+                    await log_analytics_event(db, dialogue, event_type, check_duplicates=True)
+                # ----------------------------------
+                # ----------------------------------
 
         await db.flush()
         await db.commit()

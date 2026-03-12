@@ -70,6 +70,9 @@ class Vacancy(Base):
     hh_vacancy_id = Column(String(50), unique=True)
     title = Column(String(255), nullable=False)
     city = Column(String(100))
+    hh_data_raw = Column(JSONB, nullable=True)
+    extracted_info = Column(JSONB, nullable=True) # Сюда пишем чистые данные
+    details_last_synced_at = Column(DateTime(timezone=True), nullable=True)
     # --- ДОБАВИТЬ ЭТО ПОЛЕ ---
     recruiter_id = Column(Integer, ForeignKey('tracked_recruiters.id'), nullable=True)
     # --- КОНЕЦ ---
@@ -419,7 +422,7 @@ class AnalyticsEvent(Base):
     # Типы: 'response_created', 'user_reply', 'interview_assigned', 
     # 'rejected_by_bot', 'refusal_by_user', 'timed_out', 'reactivation_sent', 'followup_sent'
     event_type = Column(String(50), nullable=False, index=True) 
-    
+    interview_date = Column(Date, nullable=True, index=True)
     # РЕЖИМ (В каком контексте произошло событие)
     # 'standard', 'reactivation', 'followup'
     mode = Column(String(50), nullable=False, index=True, default='standard') 

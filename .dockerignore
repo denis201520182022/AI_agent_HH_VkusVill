@@ -14,3 +14,5 @@ temp/
 monitoring/data/
 *.sql
 *.log
+api_vac.json
+api_res.json    

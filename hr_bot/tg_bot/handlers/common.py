@@ -51,6 +51,11 @@ from aiogram.types import Message, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 
 from hr_bot.db.models import Dialogue, InactiveNotificationQueue
+from sqlalchemy import func, cast, Date, and_ # <--- Добавь and_
+from zoneinfo import ZoneInfo # <--- Добавь это
+
+# И добавь саму переменную часового пояса в начало файла (после логгера)
+SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -213,27 +218,42 @@ async def stats_silent_handler(callback: CallbackQuery):
     )
     await callback.answer()
 
-# 2. ТЕКСТОВАЯ СВОДКА ЗА 7 ДНЕЙ
 def _build_reactivation_7day_stats_content(db_session: Session) -> Text:
-    content_parts = [Bold("🤐 Воронка Реактивации (7 дней):"), "\n\n"]
+    content_parts = [Bold("🤐 Воронка Реактивации за 7 дней:"), "\n", Italic("(по дате запуска рассылки)"), "\n\n"]
     days = [date.today() - timedelta(days=i) for i in range(7)]
-    has_data = False
+    has_any_data = False
 
     for day in days:
-        # Запрашиваем события только режима 'reactivation' за конкретный день
-        events = db_session.query(AnalyticsEvent.event_type, func.count(AnalyticsEvent.id)).filter(
-            AnalyticsEvent.mode == 'reactivation',
+        # 1. Сначала находим "базу": все пары (dialogue_id, mailing_task_id), 
+        # которым была отправлена рассылка именно в этот день.
+        base_candidates = db_session.query(
+            AnalyticsEvent.dialogue_id, 
+            AnalyticsEvent.mailing_task_id
+        ).filter(
+            AnalyticsEvent.event_type == 'reactivation_sent',
             cast(AnalyticsEvent.created_at, Date) == day
+        ).subquery()
+
+        # 2. Теперь для этих же кандидатов и тех же задач собираем все последующие события
+        # (ответы, собесы, отказы), которые могли произойти когда угодно позже.
+        funnel_events = db_session.query(
+            AnalyticsEvent.event_type,
+            func.count(func.distinct(AnalyticsEvent.dialogue_id))
+        ).join(
+            base_candidates, 
+            and_(
+                AnalyticsEvent.dialogue_id == base_candidates.c.dialogue_id,
+                AnalyticsEvent.mailing_task_id == base_candidates.c.mailing_task_id
+            )
         ).group_by(AnalyticsEvent.event_type).all()
 
-        # Преобразуем список кортежей в словарь для удобства
-        stats = {e[0]: e[1] for e in events}
+        stats = {e[0]: e[1] for e in funnel_events}
 
+        # База рассылки за этот день
         sent = stats.get('reactivation_sent', 0)
         
-        # Если были отправки или какая-то активность
-        if sent > 0 or stats:
-            has_data = True
+        if sent > 0:
+            has_any_data = True
             
             awakened = stats.get('user_reply', 0)
             success = stats.get('interview_assigned', 0)
@@ -241,14 +261,14 @@ def _build_reactivation_7day_stats_content(db_session: Session) -> Text:
             refusal_user = stats.get('refusal_by_user', 0)
             timeout = stats.get('timed_out', 0)
             
-            # Конверсия в ответ (если отправляли)
+            # Конверсия из "Отправлено" в "Ответ"
             conv_reply = round((awakened / sent * 100), 1) if sent > 0 else 0
 
             day_str = day.strftime('%d.%m (%a)')
             content_parts.extend([
-                Bold(f"📅 {day_str}"), "\n",
-                f"   📤 Разослано: {sent}\n",
-                f"   💬 Проснулись: {awakened} ", Italic(f"({conv_reply}%)"), "\n",
+                Bold(f"📅 Рассылка от {day_str}"), "\n",
+                f"   📤 Отправлено: {sent}\n",
+                f"   💬 Ответило: {awakened} ", Italic(f"({conv_reply}%)"), "\n",
                 f"   ✅ Записаны: {success}\n",
                 f"   🤖 Отказ (бот): {rejected_bot}\n",
                 f"   🙅‍♂️ Отказ (сам): {refusal_user}\n",
@@ -256,8 +276,9 @@ def _build_reactivation_7day_stats_content(db_session: Session) -> Text:
                 "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
             ])
 
-    if not has_data:
-        return Text("📊 Данных по Реактивации за 7 дней не найдено.")
+    if not has_any_data:
+        return Text("📊 Данных по запуску рассылок за 7 дней не найдено.")
+    
     return Text(*content_parts)
 
 @router.callback_query(F.data == "reactivation_7days_stats")
@@ -296,331 +317,398 @@ async def reactivation_export_manual(message: Message, state: FSMContext, db_ses
         await message.answer("❌ Формат: 01.01.2024 - 10.01.2024")
 
 async def generate_reactivation_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
-    msg_wait = await message.answer("⏳ Собираю события Реактивации и формирую воронку...")
+    msg_wait = await message.answer("⏳ Собираю данные по рассылкам и формирую прозрачную воронку...")
 
-    # 1. ЗАПРОС К БД
-    results = db.query(
-        AnalyticsEvent.created_at,
-        AnalyticsEvent.event_type,
-        AnalyticsEvent.city,
-        TrackedRecruiter.name,
-        Vacancy.title
+    # 1. ГЛОБАЛЬНЫЙ ЗАПРОС: Находим всех кандидатов из рассылок за период
+    # и собираем флаги всех их достижений в рамках этой рассылки
+    query = db.query(
+        AnalyticsEvent.dialogue_id,
+        AnalyticsEvent.mailing_task_id,
+        cast(AnalyticsEvent.created_at, Date).label('task_date'),
+        TrackedRecruiter.name.label('recruiter_name'),
+        Vacancy.city.label('city'),
+        Vacancy.title.label('vacancy_title'),
+        # Собираем флаги (1 если событие было, 0 если нет)
+        func.max(cast(AnalyticsEvent.event_type == 'reactivation_sent', Integer)).label('is_sent'),
+        func.max(cast(AnalyticsEvent.event_type == 'user_reply', Integer)).label('is_reply'),
+        func.max(cast(AnalyticsEvent.event_type == 'interview_assigned', Integer)).label('is_interview'),
+        func.max(cast(AnalyticsEvent.event_type == 'rejected_by_bot', Integer)).label('is_bot_rej'),
+        func.max(cast(AnalyticsEvent.event_type == 'refusal_by_user', Integer)).label('is_user_ref'),
+        func.max(cast(AnalyticsEvent.event_type == 'timed_out', Integer)).label('is_timeout')
     ).outerjoin(
         TrackedRecruiter, AnalyticsEvent.recruiter_id == TrackedRecruiter.id
     ).outerjoin(
         Vacancy, AnalyticsEvent.vacancy_id == Vacancy.id
     ).filter(
-        AnalyticsEvent.mode == 'reactivation',
-        cast(AnalyticsEvent.created_at, Date) >= start_date,
-        cast(AnalyticsEvent.created_at, Date) <= end_date
+        AnalyticsEvent.mode == 'reactivation'
+    ).group_by(
+        AnalyticsEvent.dialogue_id, 
+        AnalyticsEvent.mailing_task_id,
+        'task_date',
+        TrackedRecruiter.name, 
+        Vacancy.city, 
+        Vacancy.title
+    ).having(
+        # ОЧЕНЬ ВАЖНО: берем только те группы, где ОТПРАВКА была в наш период
+        and_(
+            func.max(cast(AnalyticsEvent.event_type == 'reactivation_sent', Integer)) == 1,
+            cast(func.min(AnalyticsEvent.created_at), Date) >= start_date,
+            cast(func.min(AnalyticsEvent.created_at), Date) <= end_date
+        )
     ).all()
 
-    if not results:
-        await msg_wait.edit_text("🤷 За этот период событий по Реактивации не найдено.")
+    if not query:
+        await msg_wait.edit_text("🤷 За этот период запусков Реактивации не найдено.")
         await state.clear()
         return
 
-    # 2. ПОДГОТОВКА СЫРЫХ ДАННЫХ
+    # 2. ПЕРВИЧНАЯ ГРУППИРОВКА (Сырые данные -> Сводная мапа)
+    report_map = {}
+    for d in query:
+        dt_str = d.task_date.strftime("%d.%m.%Y")
+        rec = d.recruiter_name or "Не указан"
+        cit = d.city or "Не указан"
+        vac = d.vacancy_title or "Не указана"
+        key = (dt_str, rec, cit, vac)
+
+        if key not in report_map:
+            report_map[key] = {
+                "инициировано": 0, "вступили": 0, "собес": 0, 
+                "отказали_мы": 0, "отказался_кд": 0, "молчуны": 0
+            }
+        
+        m = report_map[key]
+        m["инициировано"] += 1
+        
+        if d.is_reply: 
+            m["вступили"] += 1
+        
+        # ЛОГИКА ПРИОРИТЕТОВ (один КД = одна категория)
+        if d.is_interview:
+            m["собес"] += 1
+        elif d.is_bot_rej:
+            m["отказали_мы"] += 1
+        elif d.is_user_ref:
+            m["отказался_кд"] += 1
+        elif d.is_timeout and d.is_reply:
+            # Только если вступил в диалог, но замолчал (не имея финала)
+            m["молчуны"] += 1
+
+    # 3. ПОДГОТОВКА СТРОК ДЛЯ DATAFRAME
     rows = []
-    for r in results:
+    for (dt, rec, cit, vac), m in report_map.items():
         rows.append({
-            "Дата": r[0].strftime("%d.%m.%Y"),
-            "Тип события": r[1],
-            "Город": r[2] if r[2] else "Не указан",
-            "Рекрутер": r[3] if r[3] else "Не указан",
-            "Вакансия": r[4] if r[4] else "Не указана"
-        })
-    
-    df_raw = pd.DataFrame(rows)
-
-    # 3. ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ СВОДНЫХ ТАБЛИЦ
-    def create_reactivation_summary(groupby_col):
-        # Агрегируем типы событий в колонки
-        pivot = pd.pivot_table(
-            df_raw, 
-            index=groupby_col, 
-            columns='Тип события', 
-            aggfunc='size', 
-            fill_value=0
-        ).reset_index()
-
-        # Гарантируем наличие всех типов событий для расчетов
-        for col in ['reactivation_sent', 'user_reply', 'interview_assigned', 'refusal_by_user', 'rejected_by_bot', 'timed_out']:
-            if col not in pivot.columns:
-                pivot[col] = 0
-
-        # ВЫЧИСЛЕНИЯ ПО ТВОИМ ПРАВИЛАМ
-        s = pivot
-        s['Инициировано'] = s['reactivation_sent']
-        s['Вступили'] = s['user_reply']
-        s['Не вступили'] = s['Инициировано'] - s['Вступили']
-        s['Собес'] = s['interview_assigned']
-        s['Отказался КД'] = s['refusal_by_user']
-        s['Отказали мы'] = s['rejected_by_bot']
-        s['Молчуны'] = s['timed_out'] # Которые начали, но снова уснули
-        s['Отказы всего'] = s['Отказался КД'] + s['Отказали мы']
-
-        # КОНВЕРСИИ (от Инициировано)
-        s['Собес/Инициировано %'] = (s['Собес'] / s['Инициировано']).fillna(0)
-        s['Молчуны (молчуны + не вступили)/Инициировано %'] = ((s['Молчуны'] + s['Не вступили']) / s['Инициировано']).fillna(0)
-        s['Отказы всего / инициировано %'] = (s['Отказы всего'] / s['Инициировано']).fillna(0)
-
-        # Финальный список и порядок столбцов
-        final_cols = [
-            groupby_col, 'Инициировано', 'Вступили', 'Не вступили', 'Собес', 
-            'Отказался КД', 'Отказали мы', 'Молчуны', 'Отказы всего',
-            'Собес/Инициировано %', 'Молчуны (молчуны + не вступили)/Инициировано %', 'Отказы всего / инициировано %'
-        ]
-        
-        res = s[final_cols]
-
-        # ИТОГОВАЯ СТРОКА
-        total = res.sum(numeric_only=True)
-        total[groupby_col] = 'ИТОГО'
-        
-        # Пересчет % для ИТОГО (чтобы не суммировать проценты)
-        t_init = total['Инициировано'] if total['Инициировано'] > 0 else 1
-        total['Собес/Инициировано %'] = total['Собес'] / t_init
-        total['Молчуны (молчуны + не вступили)/Инициировано %'] = (total['Молчуны'] + total['Не вступили']) / t_init
-        total['Отказы всего / инициировано %'] = total['Отказы всего'] / t_init
-        
-        return pd.concat([res, pd.DataFrame([total])], ignore_index=True)
-
-    # Генерируем листы
-    df_date = create_reactivation_summary('Дата')
-    df_rec = create_reactivation_summary('Рекрутер')
-    df_city = create_reactivation_summary('Город')
-    df_vac = create_reactivation_summary('Вакансия')
-
-    # 4. СОХРАНЕНИЕ
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
-        df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
-        df_rec.to_excel(writer, index=False, sheet_name='Свод по рекрутерам')
-        df_city.to_excel(writer, index=False, sheet_name='Свод по городам')
-        df_vac.to_excel(writer, index=False, sheet_name='Свод по вакансиям')
-        
-        # Лист с общим отчетом (сырые данные переименованные)
-        df_raw.to_excel(writer, index=False, sheet_name='Общий отчет')
-
-        workbook = writer.book
-        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1, 'align': 'center'})
-        num_fmt = workbook.add_format({'border': 1, 'align': 'center'})
-        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1}) # Розоватый заголовок
-
-        for sheet_name in writer.sheets:
-            ws = writer.sheets[sheet_name]
-            ws.freeze_panes(1, 0)
-            
-            # Определяем какой DF использовать для расчёта ширины
-            if sheet_name == 'Свод по датам': curr_df = df_date
-            elif sheet_name == 'Свод по рекрутерам': curr_df = df_rec
-            elif sheet_name == 'Свод по городам': curr_df = df_city
-            elif sheet_name == 'Свод по вакансиям': curr_df = df_vac
-            else: curr_df = df_raw
-
-            for i, col in enumerate(curr_df.columns):
-                # Авто-ширина: по длине контента или заголовка
-                column_len = max(curr_df[col].astype(str).str.len().max(), len(str(col))) + 4
-                is_perc = '%' in str(col)
-                ws.set_column(i, i, column_len, perc_fmt if is_perc else num_fmt)
-            
-            # Применяем формат шапки
-            ws.set_row(0, None, header_fmt)
-
-    output.seek(0)
-    await message.answer_document(
-        BufferedInputFile(output.read(), filename=f"Reactivation_Report_{start_date}_{end_date}.xlsx"),
-        caption=f"🤐 Аналитика Реактивации ({start_date} - {end_date})"
-    )
-    await msg_wait.delete()
-    await state.clear()
-    
-
-
-
-def _build_followup_7day_stats_content(db_session: Session) -> Text:
-    content_parts = [Bold("🤖 Статистика Follow-up (7 дней):"), "\n\n"]
-    days = [date.today() - timedelta(days=i) for i in range(7)]
-    has_data = False
-
-    for day in days:
-        # Назначено (любые диалоги, где есть дата собеса на этот день создания)
-        base_query = db_session.query(Dialogue).filter(cast(Dialogue.created_at, Date) == day, Dialogue.interview_datetime_utc.is_not(None))
-        total_sched = base_query.count()
-
-        if total_sched > 0:
-            has_data = True
-            # Вступили в дожим
-            fu_entered = base_query.filter(Dialogue.was_in_followup == True).count()
-            # Переназначено (был в FU и есть переносы)
-            resched = base_query.filter(Dialogue.was_in_followup == True, Dialogue.reschedule_count > 0).count()
-            # Пришли (успех или отказ)
-            visited = base_query.filter(Dialogue.interview_result.in_(['success', 'refusal', 'self_refusal'])).count()
-            # Не пришли (есть категория причины)
-            no_shows = base_query.filter(Dialogue.no_show_reason.is_not(None)).count()
-
-            day_str = day.strftime('%d.%m (%a)')
-            content_parts.extend([
-                Bold(f"📅 {day_str}"), "\n",
-                f"   Назначено: {total_sched}\n",
-                f"   - Вступили в дожим: {fu_entered}\n",
-                f"   - Переназначено: {resched}\n",
-                f"   - ✅ Пришли: {visited}\n",
-                f"   - ❌ Не пришли: {no_shows}\n",
-                "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
-            ])
-
-    if not has_data:
-        return Text("📊 Данных по Follow-up за 7 дней не найдено.")
-    return Text(*content_parts)
-
-
-async def generate_followup_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
-    msg_wait = await message.answer("⏳ Формирую детальную аналитику по Follow-up...")
-    
-    # 1. СБОР ДАННЫХ
-    query = db.query(Dialogue).filter(
-        cast(Dialogue.created_at, Date) >= start_date,
-        cast(Dialogue.created_at, Date) <= end_date,
-        Dialogue.interview_datetime_utc.is_not(None)
-    )
-    dialogues = query.all()
-
-    if not dialogues:
-        await msg_wait.edit_text("🤷 За этот период назначенных собеседований не найдено.")
-        await state.clear()
-        return
-
-    rows = []
-    for d in dialogues:
-        # Логика определения "Вступил в диалог" (кандидат ответил на дожим)
-        # Считаем ответившим, если был дожим И бот смог записать результат или причину неявки
-        has_reply = 1 if (d.was_in_followup and (d.interview_result or d.no_show_reason)) else 0
-        
-        rows.append({
-            "Дата": d.created_at.strftime("%d.%m.%Y"),
-            "Рекрутер": d.recruiter.name if d.recruiter else "Не указан",
-            "Город": d.vacancy.city if d.vacancy else "Не указан",
-            "Вакансия": d.vacancy.title if d.vacancy else "Не указана",
-            "Назначено": 1,
-            "Инициировано follow up": 1 if d.was_in_followup else 0,
-            "Прошли follow up": has_reply,
-            "Пришло": 1 if d.interview_result in ['success', 'refusal', 'self_refusal'] else 0,
-            "Взяли_число": 1 if d.interview_result == 'success' else 0,
-            "Отказали_число": 1 if d.interview_result == 'refusal' else 0,
-            "Сами отказались_число": 1 if d.interview_result == 'self_refusal' else 0,
-            "Не пришло": 1 if (d.no_show_reason or d.no_show_reason) else 0,
-            "Причина неявки": d.no_show_reason or "-"
+            "Дата запуска": dt, "Рекрутер": rec, "Город": cit, "Вакансия": vac,
+            "Инициировано": m["инициировано"],
+            "Не вступили": m["инициировано"] - m["вступили"],
+            "Вступили": m["вступили"],
+            "Собес": m["собес"],
+            "Отказался КД": m["отказался_кд"],
+            "Отказали мы": m["отказали_мы"],
+            "Молчуны": m["молчуны"],
+            "Отказы всего": m["отказали_мы"] + m["отказался_кд"]
         })
 
     df_base = pd.DataFrame(rows)
 
-    # 2. ФУНКЦИЯ ДЛЯ СВОДНЫХ ТАБЛИЦ
-    def create_fu_summary(groupby_col):
-        # Группируем и суммируем все показатели
+    # 4. ФУНКЦИЯ ДЛЯ СВОДНЫХ ТАБЛИЦ (Группировка + Конверсии)
+    def create_reactivation_summary(groupby_col):
         summary = df_base.groupby(groupby_col).agg({
-            'Назначено': 'sum',
-            'Инициировано follow up': 'sum',
-            'Прошли follow up': 'sum',
-            'Пришло': 'sum',
-            'Взяли_число': 'sum',
-            'Отказали_число': 'sum',
-            'Сами отказались_число': 'sum',
-            'Не пришло': 'sum'
+            'Инициировано': 'sum', 'Вступили': 'sum', 'Не вступили': 'sum',
+            'Собес': 'sum', 'Отказался КД': 'sum', 'Отказали мы': 'sum', 
+            'Молчуны': 'sum', 'Отказы всего': 'sum'
         }).reset_index()
 
-        # Расчет процентов
-        # Взяли/Отказали/Сами — это % от тех, кто ПРИШЕЛ
-        # Используем .div с fillna, чтобы не было ошибок при делении на 0
-        summary['Взяли'] = (summary['Взяли_count' if False else 'Взяли_число'] / summary['Пришло']).fillna(0)
-        summary['Отказали'] = (summary['Отказали_число'] / summary['Пришло']).fillna(0)
-        summary['Сами отказались'] = (summary['Сами отказались_число'] / summary['Пришло']).fillna(0)
-        
-        # Доходимость — это % Пришедших от Назначенных
-        summary['Доходимость'] = (summary['Пришло'] / summary['Назначено']).fillna(0)
-
-        # Переименовываем для красоты (согласно ТЗ)
-        summary = summary.rename(columns={
-            'Взяли': 'Взяли (% от пришло)',
-            'Отказали': 'Отказали (% от пришло)',
-            'Сами отказались': 'Сами отказались (% от пришло)',
-            'Доходимость': 'Доходимость % (пришли от назначено)'
-        })
-
-        # Финальный порядок столбцов
-        final_cols = [
-            groupby_col, 'Назначено', 'Инициировано follow up', 'Прошли follow up', 
-            'Пришло', 'Взяли (% от пришло)', 'Отказали (% от пришло)', 
-            'Сами отказались (% от пришло)', 'Не пришло', 'Доходимость % (пришли от назначено)'
-        ]
-        
-        res = summary[final_cols]
+        # Расчет конверсий от Инициировано
+        summary['Собес/Инициировано %'] = (summary['Собес'] / summary['Инициировано']).fillna(0)
+        summary['Молчуны+Не вступили %'] = ((summary['Молчуны'] + summary['Не вступили']) / summary['Инициировано']).fillna(0)
+        summary['Отказы всего %'] = (summary['Отказы всего'] / summary['Инициировано']).fillna(0)
 
         # Итоговая строка
-        total = res.sum(numeric_only=True)
+        total = summary.sum(numeric_only=True)
         total[groupby_col] = 'ИТОГО'
         
-        # Пересчет процентов для ИТОГО (чтобы не суммировались проценты)
-        t_pri = total['Пришло'] if total['Пришло'] > 0 else 1
-        t_naz = total['Назначено'] if total['Назначено'] > 0 else 1
+        # Пересчет % для ИТОГО
+        t_init = total['Инициировано'] if total['Инициировано'] > 0 else 1
+        total['Собес/Инициировано %'] = total['Собес'] / t_init
+        total['Молчуны+Не вступили %'] = (total['Молчуны'] + total['Не вступили']) / t_init
+        total['Отказы всего %'] = total['Отказы всего'] / t_init
         
-        total['Взяли (% от пришло)'] = df_base['Взяли_число'].sum() / t_pri
-        total['Отказали (% от пришло)'] = df_base['Отказали_число'].sum() / t_pri
-        total['Сами отказались (% от пришло)'] = df_base['Сами отказались_число'].sum() / t_pri
-        total['Доходимость % (пришли от назначено)'] = total['Пришло'] / t_naz
+        return pd.concat([summary, pd.DataFrame([total])], ignore_index=True)
 
-        return pd.concat([res, pd.DataFrame([total])], ignore_index=True)
+    # Генерируем срезы
+    df_date = create_reactivation_summary('Дата запуска')
+    df_rec = create_reactivation_summary('Рекрутер')
+    df_city = create_reactivation_summary('Город')
+    df_vac = create_reactivation_summary('Вакансия')
 
-    # Листы
-    df_date = create_fu_summary('Дата')
-    df_rec = create_fu_summary('Рекрутер')
-    df_city = create_fu_summary('Город')
-    df_vac = create_fu_summary('Вакансия')
-
-    # 3. СОХРАНЕНИЕ
+    # 5. СОХРАНЕНИЕ В EXCEL
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
         df_rec.to_excel(writer, index=False, sheet_name='Свод по рекрутерам')
         df_city.to_excel(writer, index=False, sheet_name='Свод по городам')
         df_vac.to_excel(writer, index=False, sheet_name='Свод по вакансиям')
-        
-        # Для общего списка просто выведем сырые данные (без расчетов процентов на каждой строке)
-        df_base.to_excel(writer, index=False, sheet_name='Сырые данные')
+        df_base.to_excel(writer, index=False, sheet_name='Общий отчет')
 
         workbook = writer.book
+        # Стили (Розовый для Реактивации)
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1, 'align': 'center'})
+        total_fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1, 'align': 'center'})
         perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1, 'align': 'center'})
         num_fmt = workbook.add_format({'border': 1, 'align': 'center'})
-        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#CFE2F3', 'border': 1})
 
         for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
-            
-            # А) ЗАКРЕПЛЯЕМ ШАПКУ (первая строка всегда видна при прокрутке)
             ws.freeze_panes(1, 0)
             
-            # Б) АВТОМАТИЧЕСКАЯ ШИРИНА СТОЛБЦОВ
-            # Берем данные из соответствующего DataFrame для этого листа
-            if sheet_name == 'Свод по датам': current_df = df_date
-            elif sheet_name == 'Свод по рекрутерам': current_df = df_rec
-            elif sheet_name == 'Свод по городам': current_df = df_city
-            elif sheet_name == 'Свод по вакансиям': current_df = df_vac
-            else: current_df = df_base # 'Общий список'
+            # Выбор текущего DF для настройки ширины
+            if sheet_name == 'Свод по датам': curr_df = df_date
+            elif sheet_name == 'Свод по рекрутерам': curr_df = df_rec
+            elif sheet_name == 'Свод по городам': curr_df = df_city
+            elif sheet_name == 'Свод по вакансиям': curr_df = df_vac
+            else: curr_df = df_base
 
-            for i, col in enumerate(current_df.columns):
-                # Вычисляем максимальную длину: либо название колонки, либо самое длинное значение в ней
-                column_len = max(
-                    current_df[col].astype(str).str.len().max(), # Самое длинное значение
-                    len(str(col))                                # Длина заголовка
-                ) + 3 # Добавляем небольшой запас
-                
-                # Устанавливаем ширину (если заголовок с процентами, делаем чуть шире)
-                ws.set_column(i, i, column_len, num_fmt if '%' not in col else perc_fmt)
+            for i, col in enumerate(curr_df.columns):
+                column_len = max(curr_df[col].astype(str).str.len().max(), len(str(col))) + 3
+                if '%' in str(col):
+                    ws.set_column(i, i, 20, perc_fmt)
+                else:
+                    ws.set_column(i, i, column_len, num_fmt)
+                ws.write(0, i, col, header_fmt)
+
+            # Форматирование строки ИТОГО
+            if sheet_name != 'Общий отчет':
+                last_row = len(curr_df) - 1
+                for i in range(len(curr_df.columns)):
+                    val = curr_df.iloc[last_row, i]
+                    fmt = total_fmt if '%' not in curr_df.columns[i] else workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1, 'num_format': '0%', 'align': 'center'})
+                    ws.write(last_row + 1, i, val, fmt)
 
     output.seek(0)
     await message.answer_document(
-        BufferedInputFile(output.read(), filename=f"FU_Report_{start_date}_{end_date}.xlsx"),
+        BufferedInputFile(output.read(), filename=f"Reactivation_Funnel_{start_date}_{end_date}.xlsx"),
+        caption=f"🤐 Прозрачная воронка реактивации ({start_date} - {end_date})"
+    )
+    await msg_wait.delete()
+    await state.clear()
+
+
+
+def _build_followup_7day_stats_content(db_session: Session) -> Text:
+    content_parts = [Bold("🤖 Статистика по дням собеседований (7 дней):"), "\n\n"]
+    # Берем вчерашний день и 6 дней до него (так как за сегодня данных по исходам еще мало)
+    days = [date.today() - timedelta(days=i) for i in range(7)]
+    has_any_data = False
+
+    for day in days:
+        # Получаем все события, привязанные к этой дате собеседования
+        # Считаем уникальные диалоги для каждого события, чтобы избежать дублей
+        events_query = db_session.query(
+            AnalyticsEvent.event_type,
+            func.count(func.distinct(AnalyticsEvent.dialogue_id))
+        ).filter(
+            AnalyticsEvent.interview_date == day
+        ).group_by(AnalyticsEvent.event_type).all()
+
+        stats = {e[0]: e[1] for e in events_query}
+
+        # БАЗА: Сколько всего человек было записано на этот день
+        # (событие interview_assigned могло быть создано когда угодно, но поле interview_date указывает на 'day')
+        assigned = stats.get('interview_assigned', 0)
+
+        if assigned > 0:
+            has_any_data = True
+            
+            # 1. Вступили в дожим (ответили на FU)
+            replied = stats.get('followup_reply', 0)
+            
+            # 2. Переназначено (из режима дожима)
+            rescheduled = stats.get('followup_rescheduled', 0)
+            
+            # 3. Финалы: Устроились и Отказали
+            success = stats.get('followup_success', 0)
+            refusal = stats.get('followup_refusal', 0)
+            
+            # 4. Пришли (сумма успехов и отказов после встречи)
+            visited = success + refusal
+            
+            # 5. Не пришли (подтвержденная неявка или Шаг 3 дожима)
+            no_show = stats.get('followup_no_show', 0)
+
+            # Расчет доходимости
+            conv_visited = round((visited / assigned * 100), 1) if assigned > 0 else 0
+
+            day_str = day.strftime('%d.%m (%a)')
+            content_parts.extend([
+                Bold(f"📅 Собеседования на {day_str}"), "\n",
+                f"   Записано было: {assigned}\n",
+                f"   - ✅ Пришли: {visited} ", Italic(f"({conv_visited}%)"), "\n",
+                f"      └ 💼 Устроились: {success}\n",
+                f"      └ ❌ Не подошли: {refusal}\n",
+                f"   - 🤷‍♂️ Не пришли: {no_show}\n",
+                f"   - 🔄 Перенесли: {rescheduled}\n",
+                f"   - 💬 Ответили на follow up: {replied}\n",
+                "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+            ])
+
+    if not has_any_data:
+        return Text("📊 Данных по запланированным собеседованиям за 7 дней не найдено.")
+
+    return Text(*content_parts)
+
+
+async def generate_followup_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
+    msg_wait = await message.answer("⏳ Собираю данные по итогам собеседований за период...")
+    
+    # 1. ГЛУБОКИЙ СБОР ДАННЫХ ИЗ ТАБЛИЦЫ СОБЫТИЙ
+    # Группируем по dialogue_id + interview_date, чтобы получить флаги всех этапов FU
+    query = db.query(
+        AnalyticsEvent.dialogue_id,
+        AnalyticsEvent.interview_date,
+        TrackedRecruiter.name.label('recruiter_name'),
+        Vacancy.city.label('city'),
+        Vacancy.title.label('vacancy_title'),
+        # Собираем флаги по типам событий
+        func.max(cast(AnalyticsEvent.event_type == 'interview_assigned', Integer)).label('is_assigned'),
+        func.max(cast(AnalyticsEvent.event_type == 'followup_sent', Integer)).label('is_fu_sent'),
+        func.max(cast(AnalyticsEvent.event_type == 'followup_reply', Integer)).label('is_fu_reply'),
+        func.max(cast(AnalyticsEvent.event_type == 'followup_success', Integer)).label('is_success'),
+        func.max(cast(AnalyticsEvent.event_type == 'followup_refusal', Integer)).label('is_refusal'),
+        func.max(cast(AnalyticsEvent.event_type == 'followup_no_show', Integer)).label('is_no_show'),
+        func.max(cast(AnalyticsEvent.event_type == 'followup_rescheduled', Integer)).label('is_rescheduled')
+    ).outerjoin(
+        TrackedRecruiter, AnalyticsEvent.recruiter_id == TrackedRecruiter.id
+    ).outerjoin(
+        Vacancy, AnalyticsEvent.vacancy_id == Vacancy.id
+    ).filter(
+        # ФИЛЬТР: по дате СОБЕСЕДОВАНИЯ
+        AnalyticsEvent.interview_date >= start_date,
+        AnalyticsEvent.interview_date <= end_date,
+        AnalyticsEvent.mode == 'followup'
+    ).group_by(
+        AnalyticsEvent.dialogue_id, 
+        AnalyticsEvent.interview_date,
+        TrackedRecruiter.name, 
+        Vacancy.city, 
+        Vacancy.title
+    ).all()
+
+    if not query:
+        await msg_wait.edit_text("🤷 За этот период событий по собеседованиям не найдено.")
+        await state.clear()
+        return
+
+    # 2. ПОДГОТОВКА СЫРЫХ ДАННЫХ ДЛЯ ЛИСТА "Сырые данные"
+    rows = []
+    for d in query:
+        rows.append({
+            "Дата собеса": d.interview_date.strftime("%d.%m.%Y"),
+            "Рекрутер": d.recruiter_name or "Не указан",
+            "Город": d.city or "Не указан",
+            "Вакансия": d.vacancy_title or "Не указана",
+            "Назначено": d.is_assigned,
+            "Инициировано FU": d.is_fu_sent,
+            "Ответили на FU": d.is_fu_reply,
+            "Пришло": 1 if (d.is_success or d.is_refusal) else 0,
+            "💼 Устроились": d.is_success,
+            "❌ Не подошли": d.is_refusal,
+            "🤷‍♂️ Не пришли": d.is_no_show,
+            "🔄 Переназначено": d.is_rescheduled
+        })
+
+    df_base = pd.DataFrame(rows)
+
+    # 3. ФУНКЦИЯ ДЛЯ ГЕНЕРАЦИИ СВОДНЫХ ЛИСТОВ
+    def create_fu_summary(groupby_col):
+        summary = df_base.groupby(groupby_col).agg({
+            'Назначено': 'sum',
+            'Инициировано FU': 'sum',
+            'Ответили на FU': 'sum',
+            'Пришло': 'sum',
+            '💼 Устроились': 'sum',
+            '❌ Не подошли': 'sum',
+            '🤷‍♂️ Не пришли': 'sum',
+            '🔄 Переназначено': 'sum'
+        }).reset_index()
+
+        # Расчет конверсий
+        # Доходимость — это % Пришедших от Назначенных
+        summary['Доходимость %'] = (summary['Пришло'] / summary['Назначено']).fillna(0)
+        # % Устроились от пришедших
+        summary['Устроились/Пришли %'] = (summary['💼 Устроились'] / summary['Пришло']).fillna(0)
+
+        # Итоговая строка
+        total = summary.sum(numeric_only=True)
+        total[groupby_col] = 'ИТОГО'
+        
+        # Пересчет % для ИТОГО (чтобы не суммировались проценты)
+        t_naz = total['Назначено'] if total['Назначено'] > 0 else 1
+        t_pri = total['Пришло'] if total['Пришло'] > 0 else 1
+        total['Доходимость %'] = total['Пришло'] / t_naz
+        total['Устроились/Пришли %'] = total['💼 Устроились'] / t_pri
+        
+        return pd.concat([summary, pd.DataFrame([total])], ignore_index=True)
+
+    # Генерируем срезы
+    df_date = create_fu_summary('Дата собеса')
+    df_rec = create_fu_summary('Рекрутер')
+    df_city = create_fu_summary('Город')
+    df_vac = create_fu_summary('Вакансия')
+
+    # 4. СОХРАНЕНИЕ В EXCEL
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
+        df_rec.to_excel(writer, index=False, sheet_name='Свод по рекрутерам')
+        df_city.to_excel(writer, index=False, sheet_name='Свод по городам')
+        df_vac.to_excel(writer, index=False, sheet_name='Свод по вакансиям')
+        df_base.to_excel(writer, index=False, sheet_name='Сырые данные')
+
+        workbook = writer.book
+        # Стили
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#CFE2F3', 'border': 1, 'align': 'center'})
+        total_fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1, 'align': 'center'})
+        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1, 'align': 'center'})
+        num_fmt = workbook.add_format({'border': 1, 'align': 'center'})
+
+        for sheet_name in writer.sheets:
+            ws = writer.sheets[sheet_name]
+            ws.freeze_panes(1, 0)
+            
+            # Выбор текущего DF для настройки ширины
+            if sheet_name == 'Свод по датам': curr_df = df_date
+            elif sheet_name == 'Свод по рекрутерам': curr_df = df_rec
+            elif sheet_name == 'Свод по городам': curr_df = df_city
+            elif sheet_name == 'Свод по вакансиям': curr_df = df_vac
+            else: curr_df = df_base
+
+            for i, col in enumerate(curr_df.columns):
+                # Авто-ширина колонок
+                column_len = max(curr_df[col].astype(str).str.len().max(), len(str(col))) + 3
+                
+                # Применяем процентный формат, если в заголовке есть %
+                if '%' in str(col):
+                    ws.set_column(i, i, 18, perc_fmt)
+                else:
+                    ws.set_column(i, i, column_len, num_fmt)
+                
+                # Шапка
+                ws.write(0, i, col, header_fmt)
+
+            # Формат строки ИТОГО (кроме сырых данных)
+            if sheet_name != 'Сырые данные':
+                last_row = len(curr_df) - 1
+                for i in range(len(curr_df.columns)):
+                    val = curr_df.iloc[last_row, i]
+                    # Если ячейка в итоговой строке процентная
+                    is_perc = '%' in curr_df.columns[i]
+                    fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1, 'num_format': '0%' if is_perc else '', 'align': 'center'})
+                    ws.write(last_row + 1, i, val, fmt)
+
+    output.seek(0)
+    await message.answer_document(
+        BufferedInputFile(output.read(), filename=f"FollowUp_Report_{start_date}_{end_date}.xlsx"),
         caption=f"📈 Аналитика дожимов ({start_date} - {end_date})"
     )
     await msg_wait.delete()
@@ -628,56 +716,66 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
 
 
 def _build_7day_stats_content(db_session: Session) -> Text:
-    content_parts = [Bold("📊 Статистика за последние 7 дней:"), "\n", Italic("(взаимоисключающие категории)"), "\n\n"]
+    content_parts = [Bold("📊 Статистика откликов за 7 дней:"), "\n", Italic("(по дате прихода кандидата)"), "\n\n"]
     
     days = [date.today() - timedelta(days=i) for i in range(7)]
     has_any_data = False
 
     for day in days:
-        # 1. ОТКЛИКИ (Всего)
-        res = db_session.query(func.count(Dialogue.id)).filter(
-            cast(Dialogue.created_at, Date) == day
-        ).scalar() or 0
-
-        # 2. ПОДОШЛО (Только qualified)
-        qual = db_session.query(func.count(Dialogue.id)).filter(
-            cast(Dialogue.created_at, Date) == day,
-            Dialogue.status == 'qualified'
-        ).scalar() or 0
-
-        # 3. ОТКАЗОВ (Только rejected)
-        rej = db_session.query(func.count(Dialogue.id)).filter(
-            cast(Dialogue.created_at, Date) == day,
-            Dialogue.status == 'rejected'
-        ).scalar() or 0
-
-        # 4. МОЛЧУНЫ (Есть в таблице молчунов И статус НЕ qualified И НЕ rejected)
-        sil = db_session.query(func.count(Dialogue.id)).join(
-            InactiveNotificationQueue, Dialogue.id == InactiveNotificationQueue.dialogue_id
+        # 1. Получаем все диалоги, созданные в этот день в обычном режиме
+        # И для каждого диалога проверяем наличие флагов из таблицы аналитики
+        # Мы используем subquery или join, чтобы понять, что стало с этими диалогами
+        
+        query = db_session.query(
+            Dialogue.id,
+            # Флаг: был ли этот диалог когда-либо помечен как собес
+            func.max(cast(AnalyticsEvent.event_type == 'interview_assigned', Integer)).label('is_qual'),
+            # Флаг: был ли по этому диалогу отказ (наш или его)
+            func.max(cast(AnalyticsEvent.event_type.in_(['rejected_by_bot', 'refusal_by_user']), Integer)).label('is_rej'),
+            # Флаг: попадал ли он в таймаут
+            func.max(cast(AnalyticsEvent.event_type == 'timed_out', Integer)).label('is_timeout')
+        ).outerjoin(
+            AnalyticsEvent, Dialogue.id == AnalyticsEvent.dialogue_id
         ).filter(
             cast(Dialogue.created_at, Date) == day,
-            Dialogue.status.notin_(['qualified', 'rejected']) # <--- ИСКЛЮЧАЕМ ТЕХ, КТО ЗАВЕРШЕН
-        ).scalar() or 0
+            Dialogue.current_mode == 'standard' # Только обычный режим
+        ).group_by(Dialogue.id).all()
 
-        # 5. В ПРОЦЕССЕ (Остальные: новые или в работе, кто еще не молчит 2 часа)
-        # Это поможет вам увидеть, сколько реально людей еще "живы" в боте
-        in_progress = res - (qual + rej + sil)
-
-        if res > 0:
+        if query:
             has_any_data = True
+            
+            total = len(query)       # Всего диалогов, созданных в этот день
+            qual = 0                 # Собесы
+            rej = 0                  # Отказы
+            silent = 0               # Молчуны
+            in_work = 0              # В работе
+
+            for row in query:
+                # ЛОГИКА ПРИОРИТЕТОВ (согласно твоему ТЗ):
+                if row.is_qual:
+                    qual += 1        # Если есть запись о собесе — это успех
+                elif row.is_rej:
+                    rej += 1         # Если собеса нет, но есть отказ — это отказ
+                elif row.is_timeout:
+                    silent += 1      # Если ни успеха, ни отказа, но был таймаут — это молчун
+                else:
+                    in_work += 1     # Остальное — в процессе (еще общаются или новый)
+
             day_str = day.strftime('%d.%m (%a)')
             content_parts.extend([
                 Bold(f"📅 {day_str}"), "\n",
-                "   Откликов: ", Bold(str(res)), "\n",
-                "   - Подошло: ", Bold(str(qual)), "\n",
-                "   - Отказов: ", Bold(str(rej)), "\n",
-                "   - Молчунов: ", Bold(str(sil)), "\n",
-                "   - В работе: ", Bold(str(in_progress)), "\n",
+                f"   Откликов: ", Bold(str(total)), "\n",
+                f"   - Подошло: {qual}\n",
+                f"   - Отказов: {rej}\n",
+                f"   - Молчуны: {silent}\n",
+                f"   - В работе: {in_work}\n",
                 "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
             ])
 
     if not has_any_data:
         return Text("📊 Данных за последние 7 дней не найдено.")
+
+    return Text(*content_parts)
 
 
 
@@ -738,147 +836,127 @@ async def export_range_manual(message: Message, state: FSMContext, db_session: S
         await message.answer("❌ Неверный формат. Пример: 01.12.2025 - 10.12.2025")
 
 async def generate_and_send_excel(message: Message, start_date: date, end_date: date, db: Session, state: FSMContext):
-    msg_wait = await message.answer("⏳ Собираю данные и формирую детальный отчет по новым правилам...")
+    msg_wait = await message.answer("⏳ Формирую детальный аналитический отчет по событиям...")
     
-    # 1. СБОР ДАННЫХ ИЗ БД
-    # Используем created_at для фильтрации по дате создания диалога в системе
-    query = db.query(Dialogue).filter(
+    # 1. ГЛУБОКИЙ СБОР ДАННЫХ
+    # Мы собираем все диалоги за период и проверяем наличие событий в аналитике для каждого из них
+    # Используем агрегацию (MAX/CASE), чтобы получить флаги событий для каждого диалога
+    query = db.query(
+        Dialogue.id,
+        Dialogue.created_at,
+        TrackedRecruiter.name.label('recruiter_name'),
+        Vacancy.city.label('city'),
+        Vacancy.title.label('vacancy_title'),
+        # Флаги событий (1 если было, 0 если нет)
+        func.max(cast(AnalyticsEvent.event_type == 'user_reply', Integer)).label('has_reply'),
+        func.max(cast(AnalyticsEvent.event_type == 'interview_assigned', Integer)).label('has_interview'),
+        func.max(cast(AnalyticsEvent.event_type == 'rejected_by_bot', Integer)).label('has_bot_rej'),
+        func.max(cast(AnalyticsEvent.event_type == 'refusal_by_user', Integer)).label('has_user_ref'),
+        func.max(cast(AnalyticsEvent.event_type == 'timed_out', Integer)).label('has_timeout')
+    ).outerjoin(
+        AnalyticsEvent, Dialogue.id == AnalyticsEvent.dialogue_id
+    ).outerjoin(
+        TrackedRecruiter, Dialogue.recruiter_id == TrackedRecruiter.id
+    ).outerjoin(
+        Vacancy, Dialogue.vacancy_id == Vacancy.id
+    ).filter(
         cast(Dialogue.created_at, Date) >= start_date,
-        cast(Dialogue.created_at, Date) <= end_date
-    )
-    dialogues = query.all()
+        cast(Dialogue.created_at, Date) <= end_date,
+        Dialogue.current_mode == 'standard' # Только обычный режим
+    ).group_by(
+        Dialogue.id, TrackedRecruiter.name, Vacancy.city, Vacancy.title
+    ).all()
 
-    if not dialogues:
+    if not query:
         await msg_wait.edit_text("🤷 За этот период откликов не найдено.")
         await state.clear()
         return
 
+    # 2. ПЕРВИЧНАЯ ГРУППИРОВКА (Сырые данные -> Статистика по ключам)
     report_map = {}
-    
-    for d in dialogues:
-        # Группировка: Дата | Рекрутер | Город | Вакансия
-        dt = d.created_at.strftime("%d.%m.%Y")
-        rec = d.recruiter.name if d.recruiter else "Не указан"
-        cit = d.vacancy.city if d.vacancy else "Не указан"
-        vac = d.vacancy.title if d.vacancy else "Не указана"
-        key = (dt, rec, cit, vac)
+    for d in query:
+        dt_str = d.created_at.strftime("%d.%m.%Y")
+        rec = d.recruiter_name or "Не указан"
+        cit = d.city or "Не указан"
+        vac = d.vacancy_title or "Не указана"
+        key = (dt_str, rec, cit, vac)
 
         if key not in report_map:
             report_map[key] = {
-                "отклики_всего": 0,
-                "начали_диалог_счетчик": 0,
-                "собес_счетчик": 0,
-                "отказался_кд_счетчик": 0,
-                "отказали_мы_счетчик": 0,
-                "молчуны_в_очереди_счетчик": 0
+                "отклики": 0, "вступили": 0, "собес": 0, 
+                "отказали_мы": 0, "отказался_кд": 0, "молчуны": 0
             }
-
+        
         m = report_map[key]
+        m["отклики"] += 1
         
-        # А) Отклики (считаем всё)
-        m["отклики_всего"] += 1
+        if d.has_reply: 
+            m["вступили"] += 1
         
-        # Б) Проверка: Начал ли пользователь диалог?
-        # Ищем хотя бы одно сообщение от 'user', которое не является системной командой
-        history = d.history or []
-        user_started = False
-        for h in history:
-            if isinstance(h, dict) and h.get('role') == 'user':
-                content = h.get('content', '')
-                if content and not content.startswith("[SYSTEM COMMAND]"):
-                    user_started = True
-                    break
-        
-        if user_started:
-            m["начали_диалог_счетчик"] += 1
+        # ЛОГИКА ПРИОРИТЕТОВ (как в ТЗ для 7 дней)
+        if d.has_interview:
+            m["собес"] += 1
+        elif d.has_bot_rej:
+            m["отказали_мы"] += 1
+        elif d.has_user_ref:
+            m["отказался_кд"] += 1
+        elif d.has_timeout and d.has_reply:
+            # Молчун: замолчал + начал диалог + нет финала (собеса/отказа)
+            m["молчуны"] += 1
 
-        # В) Собеседования (Status Qualified)
-        if d.status == 'qualified':
-            m["собес_счетчик"] += 1
-            
-        # Г) Отказался КД (Status Rejected + State Declined)
-        if d.status == 'rejected' and d.dialogue_state == 'declined_vacancy':
-            m["отказался_кд_счетчик"] += 1
-            
-        # Д) Отказали мы (State Qualification Failed)
-        if d.dialogue_state == 'qualification_failed':
-            m["отказали_мы_счетчик"] += 1
-            
-        # Е) Молчуны (есть в табл. молчунов + НЕ завершен + НАЧАЛ диалог)
-        # Мы используем флаг user_started, который вы определили чуть выше в этом же цикле
-        if d.inactive_alerts and d.status not in ['qualified', 'rejected'] and user_started:
-            m["молчуны_в_очереди_счетчик"] += 1
-
-    # 2. ФОРМИРОВАНИЕ СТРОК ДЛЯ EXCEL С ВЫЧИСЛЕНИЯМИ
+    # 3. ПОДГОТОВКА СТРОК ДЛЯ DATAFRAME
     rows = []
     for (dt, rec, cit, vac), m in report_map.items():
-        # Математика по твоим правилам:
-        отклики = m["отклики_всего"]
-        начали_диалог = m["начали_диалог_счетчик"]
-        не_вступили = отклики - начали_диалог
-        
-        собес = m["собес_счетчик"]
-        отказался_кд = m["отказался_кд_счетчик"]
-        отказали_мы = m["отказали_мы_счетчик"]
-        отказы_всего = отказался_кд + отказали_мы
-        
-        # Теперь это "чистые" молчуны (кто начал общение, но не закончил и замолчал)
-        молчуны = m["молчуны_в_очереди_счетчик"]
-
         rows.append({
-            "Дата": dt, 
-            "Рекрутер": rec, 
-            "Город": cit, 
-            "Вакансия": vac,
-            "Отклики": отклики, 
-            "Не вступили": не_вступили,
-            "Начали диалог": начали_диалог, 
-            "Собес": собес,
-            "Отказался КД": отказался_кд, 
-            "Отказали мы": отказали_мы, 
-            "Молчуны": молчуны,
-            "Отказы всего": отказы_всего
+            "Дата": dt, "Рекрутер": rec, "Город": cit, "Вакансия": vac,
+            "Отклики": m["отклики"],
+            "Не вступили": m["отклики"] - m["вступили"],
+            "Начали диалог": m["вступили"],
+            "Собес": m["собес"],
+            "Отказался КД": m["отказался_кд"],
+            "Отказали мы": m["отказали_мы"],
+            "Молчуны": m["молчуны"],
+            "Отказы всего": m["отказали_мы"] + m["отказался_кд"]
         })
 
-    # Создание DataFrame
     df_base = pd.DataFrame(rows)
-    # Сортировка по дате (внутренняя)
+    # Сортировка по дате
     df_base['dt_obj'] = pd.to_datetime(df_base['Дата'], format='%d.%m.%Y')
     df_base = df_base.sort_values(['dt_obj', 'Рекрутер']).drop(columns=['dt_obj'])
 
-    # 3. ФУНКЦИЯ ДЛЯ СВОДНЫХ ТАБЛИЦ (с расчетом конверсий)
-    def create_summary_df(groupby_col):
+    # 4. ФУНКЦИЯ ДЛЯ СВОДНЫХ ТАБЛИЦ (Группировка + Конверсии)
+    def create_summary(groupby_col):
         summary = df_base.groupby(groupby_col).agg({
-            'Отклики': 'sum', 'Не вступили': 'sum', 'Начали диалог': 'sum', 'Собес': 'sum',
-            'Отказался КД': 'sum', 'Отказали мы': 'sum', 'Молчуны': 'sum', 'Отказы всего': 'sum'
+            'Отклики': 'sum', 'Не вступили': 'sum', 'Начали диалог': 'sum', 
+            'Собес': 'sum', 'Отказался КД': 'sum', 'Отказали мы': 'sum', 
+            'Молчуны': 'sum', 'Отказы всего': 'sum'
         }).reset_index()
 
-        s = summary
-        # Конверсии
-        s['Собес/отклик %'] = (s['Собес'] / s['Отклики']).fillna(0)
-        s['Молчуны/Диалог %'] = (s['Молчуны'] / s['Начали диалог']).fillna(0)
-        s['Отказы/Диалог %'] = (s['Отказы всего'] / s['Начали диалог']).fillna(0)
+        # Расчет конверсий
+        summary['Собес/отклик %'] = (summary['Собес'] / summary['Отклики']).fillna(0)
+        summary['Молчуны/Диалог %'] = (summary['Молчуны'] / summary['Начали диалог']).fillna(0)
+        summary['Отказы/Диалог %'] = (summary['Отказы всего'] / summary['Начали диалог']).fillna(0)
 
         # Итоговая строка
-        total = s.sum(numeric_only=True)
+        total = summary.sum(numeric_only=True)
         total[groupby_col] = 'ИТОГО'
         
-        # Пересчет конверсий для строки ИТОГО
+        # Пересчет % для ИТОГО
         t_resp = total['Отклики'] if total['Отклики'] > 0 else 1
         t_dial = total['Начали диалог'] if total['Начали диалог'] > 0 else 1
         total['Собес/отклик %'] = total['Собес'] / t_resp
         total['Молчуны/Диалог %'] = total['Молчуны'] / t_dial
         total['Отказы/Диалог %'] = total['Отказы всего'] / t_dial
         
-        return pd.concat([s, pd.DataFrame([total])], ignore_index=True)
+        return pd.concat([summary, pd.DataFrame([total])], ignore_index=True)
 
-    # Генерация листов
-    df_date = create_summary_df('Дата')
-    df_rec = create_summary_df('Рекрутер')
-    df_city = create_summary_df('Город')
-    df_vac = create_summary_df('Вакансия')
+    # Листы
+    df_date = create_summary('Дата')
+    df_rec = create_summary('Рекрутер')
+    df_city = create_summary('Город')
+    df_vac = create_summary('Вакансия')
 
-    # 4. СОХРАНЕНИЕ В EXCEL (с форматированием)
+    # 5. СОХРАНЕНИЕ И ФОРМАТИРОВАНИЕ
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
         df_date.to_excel(writer, index=False, sheet_name='Свод по датам')
@@ -888,30 +966,52 @@ async def generate_and_send_excel(message: Message, start_date: date, end_date: 
         df_base.to_excel(writer, index=False, sheet_name='Общий отчет')
 
         workbook = writer.book
-        # Форматы
-        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9EAD3', 'border': 1})
-        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1})
-        num_fmt = workbook.add_format({'border': 1})
-        total_fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1})
+        # Стили из вашего ТЗ
+        header_fmt = workbook.add_format({'bold': True, 'bg_color': '#D9EAD3', 'border': 1, 'align': 'center'})
+        total_fmt = workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1, 'align': 'center'})
+        perc_fmt = workbook.add_format({'num_format': '0%', 'border': 1, 'align': 'center'})
+        num_fmt = workbook.add_format({'border': 1, 'align': 'center'})
 
         for sheet_name in writer.sheets:
             ws = writer.sheets[sheet_name]
-            ws.set_column('A:Z', 15, num_fmt)
-            # Применяем процентный формат к колонкам с % в названии
-            current_df = df_date if sheet_name == 'Свод по датам' else df_base # упрощенно
-            for i, col in enumerate(df_date.columns):
-                if '%' in col:
+            ws.freeze_panes(1, 0)
+            
+            # Определяем какой DF на листе
+            if sheet_name == 'Свод по датам': curr_df = df_date
+            elif sheet_name == 'Свод по рекрутерам': curr_df = df_rec
+            elif sheet_name == 'Свод по городам': curr_df = df_city
+            elif sheet_name == 'Свод по вакансиям': curr_df = df_vac
+            else: curr_df = df_base
+
+            for i, col in enumerate(curr_df.columns):
+                # Авто-ширина
+                column_len = max(curr_df[col].astype(str).str.len().max(), len(str(col))) + 3
+                
+                # Применяем форматы
+                if '%' in str(col):
                     ws.set_column(i, i, 18, perc_fmt)
+                else:
+                    ws.set_column(i, i, column_len, num_fmt)
+                
+                # Формат шапки
+                ws.write(0, i, col, header_fmt)
+
+            # Формат строки ИТОГО (последняя строка)
+            if sheet_name != 'Общий отчет':
+                last_row = len(curr_df) - 1
+                for i in range(len(curr_df.columns)):
+                    val = curr_df.iloc[last_row, i]
+                    fmt = total_fmt if '%' not in curr_df.columns[i] else workbook.add_format({'bold': True, 'bg_color': '#F4CCCC', 'border': 1, 'num_format': '0%', 'align': 'center'})
+                    ws.write(last_row + 1, i, val, fmt)
 
     output.seek(0)
+    file_name = f"Standard_Report_{start_date}_to_{end_date}.xlsx"
     await message.answer_document(
-        BufferedInputFile(output.read(), filename=f"Detail_Report_{start_date} - {end_date}.xlsx"),
-        caption=f"📊 Расширенный отчет ({start_date} - {end_date})"
+        BufferedInputFile(output.read(), filename=file_name),
+        caption=f"📈 Аналитика откликов ({start_date} - {end_date})"
     )
     await msg_wait.delete()
     await state.clear()
-
-
 
 
 

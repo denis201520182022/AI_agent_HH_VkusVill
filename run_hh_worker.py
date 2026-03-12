@@ -726,11 +726,19 @@ def _generate_calendar_context_2() -> str:
 
     return calendar_context
 
-def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str) -> str:
+def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str) -> str:
     """Собирает динамический системный промпт из блоков библиотеки (упрощенная версия с единым FAQ)."""
 
     required_blocks = ['#ROLE_AND_STYLE#']
-
+    # --- НОВЫЙ БЛОК: Выбор блока адреса в зависимости от города ---
+    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+    is_spb = any(city in (city_name or "").lower() for city in target_cities)
+    
+    if is_spb:
+        required_blocks.append('#ADRESS_SPB#')
+    else:
+        required_blocks.append('#ADRESS_OTHER#')
+    # --------------------------------------------------------------
     state_specific_blocks = {
         'initial_processing': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
         'awaiting_questions': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
@@ -789,7 +797,14 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     prompt_pieces.insert(1, vacancy_context)
     
 
-    return "\n\n".join(prompt_pieces)
+    # Склеиваем всё в один текст
+    full_prompt_text = "\n\n".join(prompt_pieces)
+
+    # --- ГЛОБАЛЬНАЯ ЗАМЕНА ПЛЕЙСХОЛДЕРА АДРЕСА ---
+    # Заменяем [адрес вакансии] на реальные данные из БД
+    final_prompt = full_prompt_text.replace("[адрес вакансии]", full_address or city_name)
+
+    return final_prompt
 
 async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruiter: TrackedRecruiter, prompt_library: dict, ctx_logger):
     """
@@ -873,8 +888,11 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
     followup_logic_block = prompt_library.get('#FOLLOWUP_LOGIC#', '')
     scheduling_logic = prompt_library.get('', '')
     calendar_context = _generate_calendar_context_2() 
-    vacancy_desc = _find_relevant_vacancy(prompt_library, dialogue.vacancy.title, dialogue.vacancy.city, ctx_logger)
-    
+    # Берем данные из нового поля
+    vacancy_desc = (dialogue.vacancy.extracted_info or {}).get('unified_description')
+
+    if not vacancy_desc:
+        vacancy_desc = _find_relevant_vacancy(prompt_library, dialogue.vacancy.title, dialogue.vacancy.city, ctx_logger)
     system_prompt = (
         f"{followup_logic_block}\n\n"
         f"{scheduling_logic}\n\n"
@@ -920,14 +938,32 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         dialogue.interview_result = res_interview
     elif res_category:
         dialogue.interview_result = res_category
+
+     # --- [ANALYTICS] ФИНАЛЬНЫЕ ТОЧКИ FOLLOW-UP ---
+    if res_interview == 'success':
+        await log_analytics_event(db, dialogue, 'followup_success')
     
+    elif res_interview in ['refusal', 'self_refusal']:
+        await log_analytics_event(db, dialogue, 'followup_refusal')
+    
+    elif res_category or intent == 'result_no_show':
+        # Фиксируем подтвержденную неявку
+        await log_analytics_event(db, dialogue, 'followup_no_show')
+    
+    if intent == 'reschedule_process':
+        # Фиксируем запрос на перенос
+        await log_analytics_event(db, dialogue, 'followup_rescheduled')
+    # ---------------------------------------------
+
+
+    # -------------------------------
     if res_text:
         dialogue.no_show_reason = res_text
 
     # --- ОБРАБОТКА ПЕРЕХОДА НА ЗАПИСЬ (RESCHEDULE) ---
     if intent == 'reschedule_process':
         ctx_logger.info("Follow-up: Кандидат согласился на перезапись. Переключаем на основной алгоритм.")
-        
+        await log_analytics_event(db, dialogue, 'followup_rescheduled')
         dialogue.is_followup = False
         dialogue.need_follow_up_resheduled_sent = True
         dialogue.dialogue_state = 'init_scheduling_spb' # Было .state (исправлено)
@@ -1159,7 +1195,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # --- [ANALYTICS] ОТВЕТ ПОЛЬЗОВАТЕЛЯ ---
         # Если диалог в режиме реактивации и есть новые сообщения от юзера,
         # проверяем, был ли это первый ответ, и логируем.
-        if dialogue.current_mode == 'reactivation' and dialogue.pending_messages:
+        if dialogue.pending_messages:
             # Проверяем, есть ли там реальные сообщения от юзера, а не наши system commands
             has_user_msg = any(
                 (isinstance(m, dict) and m.get('role') == 'user' and not m.get('content', '').startswith('[SYSTEM COMMAND]'))
@@ -1325,19 +1361,26 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         combined_masked_message = "\n".join(all_masked_content)
 
-        # Получаем данные вакансии (объект уже в сессии)
-        vacancy_title = dialogue.vacancy.title
+        # 1. Достаем нормализованные данные
+        vacancy_info = dialogue.vacancy.extracted_info or {}
+        relevant_vacancy_desc = vacancy_info.get('unified_description', "Описание не подгружено")
+        full_address = vacancy_info.get('full_address', dialogue.vacancy.city)
+
+        # !!! ДОБАВЬ ЭТУ СТРОКУ, иначе упадет на context_postfix ниже !!!
+        vacancy_title = dialogue.vacancy.title 
         vacancy_city = dialogue.vacancy.city or "город не указан"
 
-        relevant_vacancy_desc = _find_relevant_vacancy(prompt_library, vacancy_title, vacancy_city, ctx_logger)
-
+        # 2. Передаем всё в сборщик промпта
         system_prompt = _assemble_dynamic_prompt(
-            prompt_library,
-            dialogue.dialogue_state,
-            combined_masked_message.lower(),
-            relevant_vacancy_desc
+            prompt_library=prompt_library,
+            dialogue_state=dialogue.dialogue_state,
+            user_message=combined_masked_message.lower(),
+            vacancy_description=relevant_vacancy_desc,
+            city_name=vacancy_city,    
+            full_address=full_address          
         )
 
+        # Переменные vacancy_title и vacancy_city теперь объявлены и не вызовут ошибку тут:
         context_postfix = (
             f"[CURRENT TASK] Ты общаешься с кандидатом по вакансии '{vacancy_title}' "
             f"в городе '{vacancy_city}'. Текущее состояние: '{dialogue.dialogue_state}'."
@@ -2452,9 +2495,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status != 'qualified':
             dialogue.status = 'qualified'
-            # --- [ANALYTICS] НАЗНАЧЕН СОБЕС / ПЕРЕДАН РЕСЕРЧЕРУ ---
-            if dialogue.current_mode == 'reactivation':
-                 await log_analytics_event(db, dialogue, 'interview_assigned')
+            await log_analytics_event(db, dialogue, 'interview_assigned')
             # ------------------------------------------------------
             await statistics_manager.update_stats(db, dialogue.vacancy_id, qualified=1)
 
@@ -2626,15 +2667,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     )
                 # --- КОНЕЦ ДОПОЛНИТЕЛЬНОЙ ПРОВЕРКИ ---
 
-            # Определяем тип отказа
-            event_type = 'rejected_by_bot' # По умолчанию (qualification_failed)
-            # Добавил declined_interview в условие
+            event_type = 'rejected_by_bot' 
             if new_state in ['declined_vacancy', 'declined_interview']:
                 event_type = 'refusal_by_user'
         
-            # --- [ANALYTICS] ОТКАЗ ---
-            if dialogue.current_mode == 'reactivation':
-                await log_analytics_event(db, dialogue, event_type)
+            # --- [ANALYTICS] ОТКАЗ (МЫ ИЛИ ОН) ---
+            # Запишется либо rejected_by_bot, либо refusal_by_user
+            await log_analytics_event(db, dialogue, event_type)
             # -------------------------
 
             dialogue.status = 'rejected'

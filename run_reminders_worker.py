@@ -199,15 +199,13 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     # ТВОЕ ТРЕБОВАНИЕ: Если запись уже есть, ничего не делаем с таблицей молчунов
                     if not dialogue.inactive_alerts:
                         db.add(InactiveNotificationQueue(dialogue_id=dialogue.id, status='pending'))
+                        
+
                         ctx_logger.info(f"Диалог {dialogue_hh_id} впервые добавлен в InactiveNotificationQueue.")
                     else:
                         ctx_logger.debug(f"Диалог {dialogue_hh_id} уже зафиксирован в таблице молчунов. Повторная запись не требуется.")
 
-                    # Но статус самого диалога и уровень напоминания обновляем в любом случае,
-                    # чтобы пошел отсчет 7 дней для уровня 4.
-                    # --- [ANALYTICS] МОЛЧУН В РЕАКТИВАЦИИ ---
-                    if dialogue.current_mode == 'reactivation':
-                        await log_analytics_event(db, dialogue, 'timed_out')
+                    await log_analytics_event(db, dialogue, 'timed_out')
                     # ----------------------------------------
                     dialogue.status = 'timed_out'
                     dialogue.reminder_level = 3
@@ -657,7 +655,11 @@ async def check_and_send_followups():
                             settings.balance -= cost
                             settings.total_spent_on_followups += cost
                             
-                            
+                             # --- [ANALYTICS] СТАРТ FOLLOW-UP ---
+                            # --- [ANALYTICS] ВХОД В ВОРОНКУ FOLLOW-UP ---
+                            dialogue.current_mode = 'followup' # Переключаем режим!
+                            await log_analytics_event(db_session, dialogue, 'followup_sent')
+                            # ----------------------------------
 
                             # История
                             new_hist = {
@@ -748,7 +750,7 @@ async def check_and_send_followups():
                             
                             # Финализируем диалог
                             dialogue.interview_result = 'no_answer_after_interview'
-                            
+                            await log_analytics_event(db_session, dialogue, 'followup_no_show')
                             
                             task.status = 'sent'
                             MESSAGES_SENT_TOTAL.inc()
@@ -931,12 +933,10 @@ async def process_mailing_tasks():
                             settings.total_spent_on_reminders += cost # Считаем как ремайндеры
                             total_spent += cost
 
-                            # --- [ANALYTICS] СТАРТ РЕАКТИВАЦИИ ---
-                            # Переводим диалог в режим реактивации
-                            dialogue.current_mode = 'reactivation'
-                            dialogue.active_mailing_task_id = task.id
+                            dialogue.current_mode = 'reactivation' # Режим рассылки
+                            dialogue.active_mailing_task_id = task.id # ПРИВЯЗКА К ЗАДАЧЕ!
                             
-                            # Пишем событие в аналитику
+                            # Пишем событие (оно автоматически заберет task_id из диалога)
                             await log_analytics_event(db, dialogue, 'reactivation_sent')
                             # -------------------------------------
                             

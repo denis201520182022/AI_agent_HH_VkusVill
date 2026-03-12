@@ -615,6 +615,16 @@ async def get_negotiation_current_folder(recruiter: TrackedRecruiter, db: AsyncS
         logger.error(f"Ошибка при получении текущей папки для отклика {hh_response_id}: {e}", exc_info=True)
         return None
 
+
+async def get_vacancy_details(recruiter: TrackedRecruiter, db: AsyncSession, vacancy_id: str) -> dict | None:
+    """Получает полную информацию о вакансии по её ID."""
+    logger.debug(f"REAL_API: Запрос деталей вакансии {vacancy_id}")
+    try:
+        return await _make_request(recruiter, db, "GET", f"vacancies/{vacancy_id}")
+    except Exception as e:
+        logger.error(f"Ошибка при получении деталей вакансии {vacancy_id}: {e}")
+        return None
+
 async def close_api_client():
     """Закрывает глобальный клиент при остановке приложения."""
     await shared_api_client.aclose()
