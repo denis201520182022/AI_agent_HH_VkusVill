@@ -516,8 +516,8 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
         )
 
         # Выполняем запросы параллельно
-        consider_results, interview_results = await asyncio.gather(consider_task, interview_task)
-        
+        consider_results = await consider_task
+        interview_results = await interview_task
         rec_logger.debug(
             f"API calls finished. Found {len(consider_results)} in consider, {len(interview_results)} in interview.",
             extra={"api_duration": time.monotonic() - api_get_responses_gather_start}
