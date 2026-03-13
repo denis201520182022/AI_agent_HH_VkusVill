@@ -3,7 +3,7 @@ from zoneinfo import ZoneInfo
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, and_
 from hr_bot.db.models import AnalyticsEvent, Dialogue, Vacancy
-
+from hr_bot.db.models import AnalyticsEvent, Dialogue, Vacancy, Candidate # <-- Добавь Candidate
 logger = logging.getLogger(__name__)
 
 # Часовой пояс для корректной записи даты собеседования
@@ -45,12 +45,19 @@ async def log_analytics_event(db: AsyncSession, dialogue: Dialogue, event_type: 
             if result.scalar():
                 return
 
-        # 2. Определяем город (безопасно)
+        # 2. Определяем город (безопасно через await db.get)
         city_val = "Не определен"
-        if dialogue.vacancy and dialogue.vacancy.city:
-            city_val = dialogue.vacancy.city
-        elif dialogue.candidate and dialogue.candidate.city:
-             city_val = dialogue.candidate.city
+        
+        # Получаем вакансию явно, чтобы не ловить MissingGreenlet
+        vacancy = await db.get(Vacancy, dialogue.vacancy_id) if dialogue.vacancy_id else None
+        
+        if vacancy and vacancy.city:
+            city_val = vacancy.city
+        else:
+            # Если в вакансии нет города, проверяем кандидата
+            candidate = await db.get(Candidate, dialogue.candidate_id) if dialogue.candidate_id else None
+            if candidate and candidate.city:
+                city_val = candidate.city
 
         # 3. Снимок даты собеседования (если она есть в диалоге на момент события)
         current_interview_date = None

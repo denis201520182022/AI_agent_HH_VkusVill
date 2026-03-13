@@ -156,56 +156,60 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
 
         active_hh_ids = {str(v["id"]) for v in all_vacancies_from_api}
 
-        # 3. Синхронизация каждой вакансии
+        rec_logger.info(f"Начинаю проверку {len(all_vacancies_from_api)} вакансий из API...")
+
         for vacancy_data in all_vacancies_from_api:
             hh_vacancy_id = str(vacancy_data.get("id"))
-
-            # 1. Определяем реальный город (Приоритет: адрес -> регион)
             address_data = vacancy_data.get("address") or {}
-            # Проверяем наличие города в адресе, если его нет — берем из area
             actual_city = address_data.get("city") or vacancy_data.get("area", {}).get("name")
 
             result = await db.execute(select(Vacancy).filter_by(hh_vacancy_id=hh_vacancy_id))
             vacancy_in_db = result.scalar_one_or_none()
 
             if not vacancy_in_db:
+                rec_logger.info(f"Вакансия {hh_vacancy_id}: новая, создаю в БД")
                 vacancy_in_db = Vacancy(
                     hh_vacancy_id=hh_vacancy_id,
                     title=vacancy_data.get("name", "Без названия"),
-                    city=actual_city,  # Используем наш определенный город
+                    city=actual_city,
                     recruiter_id=current_recruiter.id
                 )
                 db.add(vacancy_in_db)
                 await db.flush()
             else:
                 vacancy_in_db.title = vacancy_data.get("name", "Без названия")
-                vacancy_in_db.city = actual_city  # Обновляем на реальный город
+                vacancy_in_db.city = actual_city
 
-                if vacancy_in_db.recruiter_id != current_recruiter.id:
-                    rec_logger.info(f"Вакансия {hh_vacancy_id} перешла к {recruiter_id}. Перенос диалогов...")
-                    vacancy_in_db.recruiter_id = current_recruiter.id
-                    stmt = (
-                        update(Dialogue)
-                        .where(Dialogue.vacancy_id == vacancy_in_db.id)
-                        .where(Dialogue.status.in_(['new', 'in_progress', 'qualified', 'timed_out']))
-                        .values(recruiter_id=current_recruiter.id)
-                    )
-                    await db.execute(stmt)
-
-            # --- ЛОГИКА ОБНОВЛЕНИЯ ДЕТАЛЕЙ РАЗ В ЧАС ---
+            # --- ЛОГИКА ОБНОВЛЕНИЯ ДЕТАЛЕЙ (ДОБАВЛЯЕМ ЛОГИ ЗДЕСЬ) ---
             need_details_sync = False
-            if not vacancy_in_db.hh_data_raw or not vacancy_in_db.details_last_synced_at:
-                need_details_sync = True # Данных нет вообще
+            reason = ""
+
+            if not vacancy_in_db.hh_data_raw:
+                need_details_sync = True
+                reason = "отсутствуют сырые данные (hh_data_raw)"
+            elif not vacancy_in_db.details_last_synced_at:
+                need_details_sync = True
+                reason = "дата последней синхронизации пуста"
             else:
                 time_since_details_sync = now - vacancy_in_db.details_last_synced_at
                 if time_since_details_sync > details_sync_interval:
-                    need_details_sync = True # Данные устарели (прошло > 1 часа)
+                    need_details_sync = True
+                    reason = f"данные устарели (прошло {time_since_details_sync.total_seconds() / 3600:.1f} ч.)"
 
             if need_details_sync:
-                rec_logger.info(f"Обновляем полные данные для вакансии {hh_vacancy_id} (раз в час)...")
-                full_vacancy_data = await hh_api.get_vacancy_details(current_recruiter, db, hh_vacancy_id)
-                if full_vacancy_data:
-                    await sync_vacancy_details(db, vacancy_in_db, full_vacancy_data)
+                rec_logger.info(f"Вакансия {hh_vacancy_id}: ТРЕБУЕТСЯ обновление (Причина: {reason})")
+                try:
+                    full_vacancy_data = await hh_api.get_vacancy_details(current_recruiter, db, hh_vacancy_id)
+                    if full_vacancy_data:
+                        await sync_vacancy_details(db, vacancy_in_db, full_vacancy_data)
+                        rec_logger.info(f"Вакансия {hh_vacancy_id}: успешно обновлена.")
+                    else:
+                        rec_logger.warning(f"Вакансия {hh_vacancy_id}: API вернуло пустой ответ.")
+                except Exception as e:
+                    rec_logger.error(f"Вакансия {hh_vacancy_id}: ошибка при скачивании деталей: {e}")
+            else:
+                # Этот лог покажет, что сканер видит вакансию, но сознательно её пропускает
+                rec_logger.debug(f"Вакансия {hh_vacancy_id}: обновление не требуется (свежая).")
 
         # 4. Обработка неактивных вакансий
         stale_result = await db.execute(select(Vacancy).filter(
