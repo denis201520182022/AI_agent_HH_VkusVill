@@ -128,7 +128,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         if current_recruiter.vacancies_last_synced_at:
             time_since_sync = now - current_recruiter.vacancies_last_synced_at
             if time_since_sync < cache_expiry_time:
-                rec_logger.debug(f"Используем кэш списка. Синхронизация: {time_since_sync.total_seconds() / 60:.1f} мин. назад.")
+                rec_logger.info(f"Используем кэш списка. Синхронизация: {time_since_sync.total_seconds() / 60:.1f} мин. назад.")
                 result = await db.execute(select(Vacancy).filter(Vacancy.recruiter_id == current_recruiter.id))
                 cached_vacancies = result.scalars().all()
                 return [{"id": v.hh_vacancy_id, "name": v.title, "area": {"name": v.city} if v.city else {}} for v in cached_vacancies]
