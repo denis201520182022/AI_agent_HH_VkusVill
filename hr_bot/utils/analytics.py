@@ -75,3 +75,4 @@ async def log_analytics_event(db: AsyncSession, dialogue: Dialogue, event_type: 
 
     except Exception as e:
         logger.error(f"Ошибка при записи аналитики ({event_type}): {e}", exc_info=True)
+

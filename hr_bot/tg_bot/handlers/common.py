@@ -585,8 +585,7 @@ async def generate_followup_excel(message: Message, start_date: date, end_date: 
     ).filter(
         # ФИЛЬТР: по дате СОБЕСЕДОВАНИЯ
         AnalyticsEvent.interview_date >= start_date,
-        AnalyticsEvent.interview_date <= end_date,
-        AnalyticsEvent.mode == 'followup'
+        AnalyticsEvent.interview_date <= end_date
     ).group_by(
         AnalyticsEvent.dialogue_id, 
         AnalyticsEvent.interview_date,
@@ -729,17 +728,16 @@ def _build_7day_stats_content(db_session: Session) -> Text:
         
         query = db_session.query(
             Dialogue.id,
-            # Флаг: был ли этот диалог когда-либо помечен как собес
-            func.max(cast(AnalyticsEvent.event_type == 'interview_assigned', Integer)).label('is_qual'),
-            # Флаг: был ли по этому диалогу отказ (наш или его)
-            func.max(cast(AnalyticsEvent.event_type.in_(['rejected_by_bot', 'refusal_by_user']), Integer)).label('is_rej'),
-            # Флаг: попадал ли он в таймаут
-            func.max(cast(AnalyticsEvent.event_type == 'timed_out', Integer)).label('is_timeout')
+            # Считаем только те события, которые произошли в режиме 'standard'
+            func.max(cast(and_(AnalyticsEvent.event_type == 'interview_assigned', AnalyticsEvent.mode == 'standard'), Integer)).label('is_qual'),
+            func.max(cast(and_(AnalyticsEvent.event_type.in_(['rejected_by_bot', 'refusal_by_user']), AnalyticsEvent.mode == 'standard'), Integer)).label('is_rej'),
+            func.max(cast(and_(AnalyticsEvent.event_type == 'timed_out', AnalyticsEvent.mode == 'standard'), Integer)).label('is_timeout')
         ).outerjoin(
             AnalyticsEvent, Dialogue.id == AnalyticsEvent.dialogue_id
         ).filter(
-            cast(Dialogue.created_at, Date) == day,
-            Dialogue.current_mode == 'standard' # Только обычный режим
+            cast(Dialogue.created_at, Date) == day
+            # ВАЖНО: Мы убрали фильтр Dialogue.current_mode == 'standard', 
+            # чтобы кандидат не исчезал из отчета, если его потом воскресили!
         ).group_by(Dialogue.id).all()
 
         if query:
@@ -848,12 +846,12 @@ async def generate_and_send_excel(message: Message, start_date: date, end_date: 
         TrackedRecruiter.name.label('recruiter_name'),
         Vacancy.city.label('city'),
         Vacancy.title.label('vacancy_title'),
-        # Флаги событий (1 если было, 0 если нет)
-        func.max(cast(AnalyticsEvent.event_type == 'user_reply', Integer)).label('has_reply'),
-        func.max(cast(AnalyticsEvent.event_type == 'interview_assigned', Integer)).label('has_interview'),
-        func.max(cast(AnalyticsEvent.event_type == 'rejected_by_bot', Integer)).label('has_bot_rej'),
-        func.max(cast(AnalyticsEvent.event_type == 'refusal_by_user', Integer)).label('has_user_ref'),
-        func.max(cast(AnalyticsEvent.event_type == 'timed_out', Integer)).label('has_timeout')
+        # ЖЕСТКАЯ ИЗОЛЯЦИЯ: Учитываем только события режима 'standard'
+        func.max(cast(and_(AnalyticsEvent.event_type == 'user_reply', AnalyticsEvent.mode == 'standard'), Integer)).label('has_reply'),
+        func.max(cast(and_(AnalyticsEvent.event_type == 'interview_assigned', AnalyticsEvent.mode == 'standard'), Integer)).label('has_interview'),
+        func.max(cast(and_(AnalyticsEvent.event_type == 'rejected_by_bot', AnalyticsEvent.mode == 'standard'), Integer)).label('has_bot_rej'),
+        func.max(cast(and_(AnalyticsEvent.event_type == 'refusal_by_user', AnalyticsEvent.mode == 'standard'), Integer)).label('has_user_ref'),
+        func.max(cast(and_(AnalyticsEvent.event_type == 'timed_out', AnalyticsEvent.mode == 'standard'), Integer)).label('has_timeout')
     ).outerjoin(
         AnalyticsEvent, Dialogue.id == AnalyticsEvent.dialogue_id
     ).outerjoin(
@@ -862,8 +860,8 @@ async def generate_and_send_excel(message: Message, start_date: date, end_date: 
         Vacancy, Dialogue.vacancy_id == Vacancy.id
     ).filter(
         cast(Dialogue.created_at, Date) >= start_date,
-        cast(Dialogue.created_at, Date) <= end_date,
-        Dialogue.current_mode == 'standard' # Только обычный режим
+        cast(Dialogue.created_at, Date) <= end_date
+        # ВАЖНО: Убрано Dialogue.current_mode == 'standard'
     ).group_by(
         Dialogue.id, TrackedRecruiter.name, Vacancy.city, Vacancy.title
     ).all()

@@ -726,15 +726,28 @@ def _generate_calendar_context_2() -> str:
 
     return calendar_context
 
-def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str) -> str:
+def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str, vacancy_title: str) -> str:
     """Собирает динамический системный промпт из блоков библиотеки (упрощенная версия с единым FAQ)."""
 
     required_blocks = ['#ROLE_AND_STYLE#']
     # --- НОВЫЙ БЛОК: Выбор блока адреса в зависимости от города ---
+    # --- УЛУЧШЕННЫЙ БЛОК: Выбор логики адреса и процесса ---
     target_cities = ['санкт-петербург', 'мурино', 'кудрово']
-    is_spb = any(city in (city_name or "").lower() for city in target_cities)
+    is_spb_city = any(city in (city_name or "").lower() for city in target_cities)
     
-    if is_spb:
+    # Список исключений (те же, что используются в логике принятия решения)
+    excluded_vacancies = [
+        'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
+        'уборщик', 'уборщица', 'помошник повара',
+        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
+        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
+    ]
+    current_title_lower = (vacancy_title or "").lower()
+    is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
+
+    # Используем блок СПб только если это СПб И это НЕ исключенная вакансия
+    # (потому что для исключенных вакансий в СПб процесс такой же, как в регионах — звонок рекрутера)
+    if is_spb_city and not is_excluded_vacancy:
         required_blocks.append('#ADRESS_SPB#')
     else:
         required_blocks.append('#ADRESS_OTHER#')
@@ -965,6 +978,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         ctx_logger.info("Follow-up: Кандидат согласился на перезапись. Переключаем на основной алгоритм.")
         await log_analytics_event(db, dialogue, 'followup_rescheduled')
         dialogue.is_followup = False
+        dialogue.current_mode = 'standard'
         dialogue.need_follow_up_resheduled_sent = True
         dialogue.dialogue_state = 'init_scheduling_spb' # Было .state (исправлено)
         # 2. Сохраняем реальные сообщения КАНДИДАТА в историю
@@ -1377,7 +1391,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             user_message=combined_masked_message.lower(),
             vacancy_description=relevant_vacancy_desc,
             city_name=vacancy_city,    
-            full_address=full_address          
+            full_address=full_address,
+            vacancy_title=vacancy_title  # <--- ДОБАВЛЕНО
         )
 
         # Переменные vacancy_title и vacancy_city теперь объявлены и не вызовут ошибку тут:
@@ -2248,8 +2263,11 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # Список фраз, которые ищем в названии
                     # Список фраз, которые ищем в названии (для этих вакансий в СПб автоматическая запись не предлагается)
                     excluded_vacancies = [
-                        'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 'уборщик', 'уборщица', 'помошник повара']
-                    
+                        'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
+                        'уборщик', 'уборщица', 'помошник повара',
+                        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
+                        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
+                    ]
                     # Проверяем, входит ли хоть одна фраза из списка в название вакансии
                     if any(phrase in current_title_lower for phrase in excluded_vacancies):
                         ctx_logger.info(

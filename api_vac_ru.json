@@ -1,0 +1,214 @@
+{
+    "id": "130708148",
+    "premium": false,
+    "billing_type": {
+        "id": "standard",
+        "name": "Стандарт"
+    },
+    "can_upgrade_billing_type": true,
+    "relations": [],
+    "name": "Продавец-консультант",
+    "insider_interview": null,
+    "response_letter_required": false,
+    "area": {
+        "id": "84",
+        "name": "Ставрополь",
+        "url": "https://api.hh.ru/areas/84"
+    },
+    "salary": {
+        "from": 40000,
+        "to": null,
+        "currency": "RUR",
+        "gross": true
+    },
+    "salary_range": {
+        "from": 40000,
+        "to": null,
+        "currency": "RUR",
+        "gross": true,
+        "mode": {
+            "id": "MONTH",
+            "name": "За месяц"
+        },
+        "frequency": {
+            "id": "MONTHLY",
+            "name": "Раз в месяц"
+        }
+    },
+    "type": {
+        "id": "open",
+        "name": "Открытая"
+    },
+    "address": {
+        "city": "Конаково",
+        "street": null,
+        "building": null,
+        "lat": 56.71324,
+        "lng": 36.77935,
+        "description": null,
+        "raw": "Конаково",
+        "metro": null,
+        "metro_stations": [],
+        "can_edit": true,
+        "id": "19991149",
+        "show_metro_only": false
+    },
+    "allow_messages": true,
+    "experience": {
+        "id": "noExperience",
+        "name": "Нет опыта"
+    },
+    "department": null,
+    "show_contacts": true,
+    "contacts": {
+        "name": "Долгополова Марина Андреевна",
+        "email": "dolgopolova@za-bota.com",
+        "phones": [
+            {
+                "comment": null,
+                "city": null,
+                "number": null,
+                "country": "7",
+                "formatted": "+7"
+            },
+            {
+                "comment": null,
+                "city": null,
+                "number": null,
+                "country": "7",
+                "formatted": "+7"
+            }
+        ],
+        "call_tracking_enabled": true
+    },
+    "description": "<strong>Обязанности:</strong> <ul> <li><strong>сборка онлайн‑заказов (учёт комментариев покупателя); проверка сроков/товарного вида; чистота; согласование замен.</strong></li> </ul> <strong>Требования:</strong> <ul> <li>Ответственность</li> <li>Исполнительность</li> </ul> <strong>Условия:</strong> <ul> <li>График 2/2, 3/3, 4/2 на выбор. Смена по 12 часов</li> <li>Выплаты 1 раз в месяц</li> </ul>",
+    "branded_description": null,
+    "vacancy_constructor_template": null,
+    "key_skills": [],
+    "auto_response": {
+        "accept_auto_response": true
+    },
+    "accept_handicapped": false,
+    "accept_kids": false,
+    "age_restriction": null,
+    "archived": false,
+    "response_url": null,
+    "specializations": [],
+    "professional_roles": [
+        {
+            "id": "40",
+            "name": "Другое"
+        }
+    ],
+    "code": null,
+    "hidden": false,
+    "quick_responses_allowed": false,
+    "branded_template": null,
+    "driver_license_types": [],
+    "accept_incomplete_resumes": true,
+    "employer": {
+        "id": "5798752",
+        "name": "Za | bota",
+        "url": "https://api.hh.ru/employers/5798752",
+        "alternate_url": "https://hh.ru/employer/5798752",
+        "logo_urls": {
+            "original": "https://img.hhcdn.ru/employer-logo-original-round/6272064.png",
+            "90": "https://img.hhcdn.ru/employer-logo-round/6272066.png",
+            "240": "https://img.hhcdn.ru/employer-logo-round/6272067.png"
+        },
+        "vacancies_url": "https://api.hh.ru/vacancies?employer_id=5798752",
+        "country_id": 1,
+        "accredited_it_employer": false,
+        "trusted": true,
+        "is_identified_by_esia": false
+    },
+    "published_at": "2026-02-24T16:02:48+0300",
+    "created_at": "2026-02-24T16:02:48+0300",
+    "initial_created_at": "2026-02-24T16:02:48+0300",
+    "negotiations_url": null,
+    "suitable_resumes_url": null,
+    "apply_alternate_url": "https://hh.ru/applicant/vacancy_response?vacancyId=130708148",
+    "has_test": false,
+    "test": null,
+    "alternate_url": "https://hh.ru/vacancy/130708148",
+    "counters": {
+        "responses": 30,
+        "views": 358,
+        "invitations": 4,
+        "unread_responses": 3,
+        "resumes_in_progress": 27,
+        "invitations_and_responses": 30
+    },
+    "expires_at": "2026-03-26T16:02:48+0300",
+    "manager": {
+        "id": "13726728"
+    },
+    "response_notifications": true,
+    "accept_temporary": true,
+    "languages": [],
+    "approved": true,
+    "employment_form": {
+        "id": "FULL",
+        "name": "Полная"
+    },
+    "fly_in_fly_out_duration": [],
+    "accept_labor_contract": false,
+    "civil_law_contracts": [
+        {
+            "id": "SELF_EMPLOYED",
+            "name": "с самозанятым"
+        },
+        {
+            "id": "INDIVIDUAL_ENTREPRENEUR",
+            "name": "с ИП"
+        },
+        {
+            "id": "INDIVIDUAL_PERSON",
+            "name": "с физлицом"
+        }
+    ],
+    "internship": false,
+    "night_shifts": false,
+    "work_format": [
+        {
+            "id": "ON_SITE",
+            "name": "На месте работодателя"
+        }
+    ],
+    "work_schedule_by_days": [
+        {
+            "id": "FOUR_ON_TWO_OFF",
+            "name": "4/2"
+        },
+        {
+            "id": "THREE_ON_THREE_OFF",
+            "name": "3/3"
+        },
+        {
+            "id": "TWO_ON_TWO_OFF",
+            "name": "2/2"
+        }
+    ],
+    "working_hours": [
+        {
+            "id": "HOURS_12",
+            "name": "12 часов"
+        }
+    ],
+    "show_logo_in_search": null,
+    "closed_for_applicants": false,
+    "previous_id": null,
+    "vacancy_properties": {
+        "appearance": {
+            "title": "Стандарт"
+        },
+        "properties": [
+            {
+                "property_type": "HH_STANDARD",
+                "parameters": [],
+                "end_time": "2026-03-26T16:02:48.581+03:00",
+                "start_time": "2026-02-24T16:02:48.581+03:00"
+            }
+        ]
+    }
+}

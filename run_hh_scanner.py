@@ -159,22 +159,27 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         # 3. Синхронизация каждой вакансии
         for vacancy_data in all_vacancies_from_api:
             hh_vacancy_id = str(vacancy_data.get("id"))
+
+            # 1. Определяем реальный город (Приоритет: адрес -> регион)
+            address_data = vacancy_data.get("address") or {}
+            # Проверяем наличие города в адресе, если его нет — берем из area
+            actual_city = address_data.get("city") or vacancy_data.get("area", {}).get("name")
+
             result = await db.execute(select(Vacancy).filter_by(hh_vacancy_id=hh_vacancy_id))
             vacancy_in_db = result.scalar_one_or_none()
 
             if not vacancy_in_db:
-                # ВАЖНО: создаем и присваиваем в vacancy_in_db, чтобы использовать ниже
                 vacancy_in_db = Vacancy(
                     hh_vacancy_id=hh_vacancy_id,
                     title=vacancy_data.get("name", "Без названия"),
-                    city=vacancy_data.get("area", {}).get("name"),
+                    city=actual_city,  # Используем наш определенный город
                     recruiter_id=current_recruiter.id
                 )
                 db.add(vacancy_in_db)
-                await db.flush() # Получаем ID для vacancy_in_db
+                await db.flush()
             else:
                 vacancy_in_db.title = vacancy_data.get("name", "Без названия")
-                vacancy_in_db.city = vacancy_data.get("area", {}).get("name")
+                vacancy_in_db.city = actual_city  # Обновляем на реальный город
 
                 if vacancy_in_db.recruiter_id != current_recruiter.id:
                     rec_logger.info(f"Вакансия {hh_vacancy_id} перешла к {recruiter_id}. Перенос диалогов...")

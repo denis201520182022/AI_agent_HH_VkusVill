@@ -58,13 +58,13 @@ async def send_verification_alert(
             )
 
             if len(alert_text) < 4090:
-                await bot.send_message(chat_id=admin_id, text=alert_text)
+                await bot.send_message(chat_id=admin_id, text=alert_text, disable_notification=True)
             else:
                 await bot.send_message(chat_id=admin_id, text=f"🚨 **INCIDENT: {esc(hh_response_id)}** (JSON слишком длинный, см. лог)")
 
             if history_text:
                 file = BufferedInputFile(history_text.encode('utf-8'), filename=f"verification_conflict_{hh_response_id}.txt")
-                await bot.send_document(chat_id=admin_id, document=file, caption="📜 История для анализа")
+                await bot.send_document(chat_id=admin_id, document=file, caption="📜 История для анализа", disable_notification=True)
 
             logger.info(f"Алерт верификации отправлен для диалога {dialogue_id}.")
 
@@ -105,11 +105,11 @@ async def send_date_conflict_alert(
                 f"🔄 *Диалог отправлен на повторную генерацию.*"
             )
 
-            await bot.send_message(chat_id=admin_id, text=alert_text)
+            await bot.send_message(chat_id=admin_id, text=alert_text, disable_notification=True)
 
             if history_text:
                 file = BufferedInputFile(history_text.encode('utf-8'), filename=f"date_conflict_{hh_response_id}.txt")
-                await bot.send_document(chat_id=admin_id, document=file, caption="📜 История диалога")
+                await bot.send_document(chat_id=admin_id, document=file, caption="📜 История диалога", disable_notification=True)
 
             logger.info(f"Алерт по дате отправлен для диалога {dialogue_id}.")
 
