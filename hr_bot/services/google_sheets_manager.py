@@ -4,7 +4,7 @@ import os
 import re
 from zoneinfo import ZoneInfo
 from typing import Optional, Any
-
+import gspread 
 import gspread_asyncio
 from google.oauth2.service_account import Credentials
 from tenacity import (
@@ -106,35 +106,77 @@ class GoogleSheetsManager:
         recruiter: Any, 
         status_label: str
     ):
-        """
-        Основной метод записи в таблицу.
-        status_label: 'собес', 'молчун', 'отказ', 'самоизменение', 'перезаписался'
-        """
         async with self.limiter:
             try:
                 client = await self.agcm.authorize()
                 ss = await client.open_by_key(self.spreadsheet_id)
                 
-                # 1. Записываем транскрибацию на Лист 2
-                # В gspread-asyncio листы нумеруются с 0. Лист 2 имеет индекс 1.
-                sheet_logs = await ss.get_worksheet(1)
+                # 1. Записываем транскрибацию на Лист 2 (он остается общим)
+                # По индексу 1 (второй лист)
+                # --- 1. РАБОТА С ЛИСТОМ ТРАНСКРИБАЦИИ (ПО НАЗВАНИЮ) ---
+                log_sheet_name = "Транскрибация"
+                try:
+                    sheet_logs = await ss.worksheet(log_sheet_name)
+                except gspread.exceptions.WorksheetNotFound:
+                    # Если листа транскрибации нет — создаем его
+                    logger.info(f"Создаю отсутствующий лист: {log_sheet_name}")
+                    sheet_logs = await ss.add_worksheet(title=log_sheet_name, rows="1000", cols="2")
+                    await sheet_logs.append_row(["hh_response_id", "История диалога"])
+                    await sheet_logs.format("A1:B1", {"textFormat": {"bold": True}})
+
                 log_text = self._format_history_text(dialogue, candidate, vacancy)
                 
-                # Добавляем строку и получаем её индекс
-                # Примечание: append_row в асинхронной версии возвращает словарь с данными об обновлении
                 result_log = await sheet_logs.append_row([dialogue.hh_response_id, log_text])
                 
-                # Извлекаем номер строки из ответа API (формат типа "Sheet2!A123:B123")
                 updated_range = result_log.get('updates', {}).get('updatedRange', '')
                 match = re.search(r'A(\d+)', updated_range)
-                row_index = match.group(1) if match else "2" # fallback на 2 если не нашли
-                
+                row_index = match.group(1) if match else "2"
                 log_sheet_id = sheet_logs.id
 
-                # 2. Записываем данные на Лист 1 (Главный)
-                sheet_main = await ss.get_worksheet(0)
+                # 2. РАБОТА С ПЕРСОНАЛЬНЫМ ЛИСТОМ РЕКРУТЕРА
+                raw_name = recruiter.name or "Unknown"
+                # Удаляем запрещенные Google символы: * ? : [ ] / \
+                clean_name = re.sub(r'[*? :\[\]/\\ ]', '_', raw_name).strip('_')
+                sheet_name = clean_name if clean_name else "Unknown"
                 
-                # Маппинг типа записи (current_mode)
+                if len(sheet_name) > 100:
+                    sheet_name = sheet_name[:97] + "..."
+
+                try:
+                    # Пытаемся найти лист по имени рекрутера
+                    sheet_target = await ss.worksheet(sheet_name)
+                except gspread.exceptions.WorksheetNotFound:
+                    # Если листа нет — создаем его
+                    logger.info(f"Создаю новый лист для рекрутера: {sheet_name}")
+                    sheet_target = await ss.add_worksheet(title=sheet_name, rows="10000", cols="12")
+                    # Записываем шапку в новый лист
+                    headers = [
+                        "Дата и время отклика", "hh_response", "Тип записи", "Статус", 
+                        "Рекрутёр", "Вакансия", "Город", "Данные КД", 
+                        "Номер телефона", "Ссылка на диалог hh", "Ссылка на транскрибацию", "Статус (ручной)"
+                    ]
+                    await sheet_target.append_row(headers)
+
+                    # --- ОФОРМЛЕНИЕ ШАПКИ ---
+                    # Делаем жирным, выравниваем по центру и добавляем легкий фон
+                    await sheet_target.format("A1:L1", {
+                        "textFormat": {"bold": True},
+                        "horizontalAlignment": "CENTER",
+                        "backgroundColor": {"red": 0.95, "green": 0.95, "blue": 0.95}
+                    })
+                    
+                    # Закрепляем первую строку
+                    await sheet_target.freeze(rows=1)
+
+                    # Устанавливаем ширину столбцов (в пикселях)
+                    # A:150, B:100, C:130, D:100, E:150, F:200, G:120, H:400, I:150, J:150
+                    widths = [250, 100, 130, 100, 200, 250, 200, 400, 250, 150, 150, 100]
+                    for i, width in enumerate(widths):
+                        # Переводим индекс в букву (A, B, C...)
+                        col_letter = chr(65 + i) 
+                        await sheet_target.set_column_width(col_letter, width)
+
+                # 3. Подготовка данных для записи
                 mode_map = {
                     'standard': 'Новый отклик',
                     'reactivation': 'Рективация молчунов',
@@ -142,40 +184,36 @@ class GoogleSheetsManager:
                 }
                 entry_type = mode_map.get(dialogue.current_mode, "Неизвестно")
                 
-                # Время отклика (МСК)
                 dt_msk = "—"
                 if dialogue.response_created_at:
                     dt_msk = dialogue.response_created_at.astimezone(SPB_TIMEZONE).strftime('%d.%m.%Y %H:%M')
 
-                # Формулы и ссылки
                 hh_resume_link = f"https://hh.ru/resume/{candidate.hh_resume_id}"
-                
-                # Формируем гиперссылку на Лист 2, ячейку B (где лежит текст диалога)
-                # gid - это ID листа внутри таблицы, range - адрес ячейки
                 transcription_formula = (
                     f'=HYPERLINK("#gid={log_sheet_id}&range=B{row_index}"; "📑 Открыть диалог")'
                 )
 
                 row_data = [
-                    dt_msk,                          # A: Дата и время отклика
-                    dialogue.hh_response_id,         # B: hh_response ID
-                    entry_type,                      # C: Тип записи
-                    status_label,                    # D: Статус (собес/молчун и т.д.)
-                    recruiter.name or "Unknown",     # E: Рекрутер
-                    vacancy.title,                   # F: Вакансия
-                    vacancy.city or "—",             # G: Город
-                    self._format_candidate_data(candidate), # H: Данные КД (текст сообщения)
-                    hh_resume_link,                  # I: Ссылка на диалог/резюме hh
-                    transcription_formula,           # J: Ссылка на транскрибацию
-                    ""                               # K: Статус от рекрутера (для ручного заполнения)
+                    dt_msk,                          # A
+                    dialogue.hh_response_id,         # B
+                    entry_type,                      # C
+                    status_label,                    # D
+                    sheet_name,                      # E
+                    vacancy.title,                   # F
+                    vacancy.city or "—",             # G
+                    self._format_candidate_data(candidate), # H
+                    candidate.phone_number or "—",   # I (НОВАЯ КОЛОНКА)
+                    hh_resume_link,                  # J
+                    transcription_formula,           # K
+                    ""                               # L
                 ]
 
-                # Используем USER_ENTERED, чтобы Google обработал формулу HYPERLINK
-                await sheet_main.append_row(row_data, value_input_option='USER_ENTERED')
+                # Записываем в лист конкретного рекрутера
+                await sheet_target.append_row(row_data, value_input_option='USER_ENTERED')
                 
-                logger.info(f"✅ Успешная синхронизация с Google Sheets для диалога {dialogue.hh_response_id}")
+                logger.info(f"✅ Данные синхронизированы в лист '{sheet_name}' для ID {dialogue.hh_response_id}")
                 return True
 
             except Exception as e:
-                logger.error(f"❌ Критическая ошибка Google Sheets для диалога {dialogue.hh_response_id}: {str(e)}")
-                raise # Выбрасываем исключение для работы ретраев tenacity
+                logger.error(f"❌ Ошибка Google Sheets: {str(e)}")
+                raise
