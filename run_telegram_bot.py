@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from aiogram.types import FSInputFile
 from sqlalchemy import select, update
 from zoneinfo import ZoneInfo
+from hr_bot.services.google_sheets_manager import GoogleSheetsManager
 # --- ДОБАВЛЕН НОВЫЙ ИМПОРТ ДЛЯ РАБОТЫ С ФАЙЛАМИ В ПАМЯТИ ---
 from aiogram.types import BufferedInputFile
 import shutil
@@ -38,7 +39,7 @@ except Exception:
     SPB_TIMEZONE = datetime.timezone(datetime.timedelta(hours=3))
 
 logger = logging.getLogger(__name__)
-
+gs_manager = GoogleSheetsManager()
 # --- КОНСТАНТЫ ДЛЯ ОЧИСТКИ ИСТОРИИ ---
 HISTORY_RETENTION_DAYS = 30
 CLEANUP_RUN_HOUR_UTC = 3
@@ -283,9 +284,16 @@ async def check_and_send_notifications(bot: Bot, health_monitor: TaskHealthMonit
                                 )
                                 logger.warning(f"Файл транскрипции для кандидата {candidate.id} отсутствовал. Отправлено только текстовое уведомление.")
                                 await asyncio.sleep(5)
-
-                            task.status = 'sent'
-                            logger.info(f"Уведомление по кандидату {candidate.id} полностью обработано.")
+                            await gs_manager.add_record(
+                                    dialogue=dialogue,
+                                    candidate=candidate,
+                                    vacancy=vacancy,
+                                    recruiter=recruiter,
+                                    status_label="собес"
+                                )
+                        
+                        task.status = 'sent'
+                        logger.info(f"Уведомление по кандидату {candidate.id} полностью обработано.")
 
                     except Exception as e:
                         task.status = 'error'
@@ -456,7 +464,13 @@ async def check_and_send_inactive_alerts(bot: Bot, health_monitor: TaskHealthMon
                                     message_thread_id=target_thread_id
                                 )
                                 logger.warning(f"Файл транскрипции для неактивного кандидата {dialogue.hh_response_id} отсутствовал. Отправлено только текстовое уведомление.")
-
+                            await gs_manager.add_record(
+                                dialogue=dialogue,
+                                candidate=candidate,
+                                vacancy=vacancy,
+                                recruiter=recruiter,
+                                status_label="молчун"
+                            )
                             task.status = 'sent'
                             task.processed_at = datetime.datetime.now(datetime.timezone.utc)
 
@@ -632,6 +646,13 @@ async def check_and_send_rejected_alerts(bot: Bot, health_monitor: TaskHealthMon
                                     message_thread_id=target_thread_id
                                 )
                                 logger.warning(f"Файл транскрипции для отклоненного кандидата {dialogue.hh_response_id} отсутствовал. Отправлено только текстовое уведомление.")
+                            await gs_manager.add_record(
+                                dialogue=dialogue,
+                                candidate=candidate,
+                                vacancy=vacancy,
+                                recruiter=recruiter,
+                                status_label="отказ"
+                            )
 
                             task.status = 'sent'
                             task.processed_at = datetime.datetime.now(datetime.timezone.utc)
@@ -795,7 +816,13 @@ async def check_and_send_declined_interview_alerts(bot: Bot, health_monitor: Tas
                                     text=message_text,
                                     message_thread_id=target_thread_id
                                 )
-                            
+                            await gs_manager.add_record(
+                                dialogue=dialogue,
+                                candidate=candidate,
+                                vacancy=vacancy,
+                                recruiter=recruiter,
+                                status_label="самоизменение"
+                            )
                             task.status = 'sent'
                             task.processed_at = datetime.datetime.now(datetime.timezone.utc)
                             logger.info(f"Уведомление об отказе от интервью (диалог {dialogue.id}) отправлено.")
@@ -960,7 +987,13 @@ async def check_and_send_rescheduled_alerts(bot: Bot, health_monitor: TaskHealth
                                     text=message_text,
                                     message_thread_id=target_thread_id
                                 )
-                            
+                            await gs_manager.add_record(
+                                dialogue=dialogue,
+                                candidate=candidate,
+                                vacancy=vacancy,
+                                recruiter=recruiter,
+                                status_label="перезаписался"
+                            )
                             task.status = 'sent'
                             task.processed_at = datetime.datetime.now(datetime.timezone.utc)
                             logger.info(f"Уведомление о переносе (диалог {dialogue.id}) отправлено.")
