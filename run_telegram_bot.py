@@ -6,6 +6,7 @@ import datetime
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session import AiohttpSession
 from dotenv import load_dotenv
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -1124,11 +1125,29 @@ async def main():
     """Главная функция запуска бота."""
     setup_logging(log_filename="telegram_bot.log")
     load_dotenv()
-    
+
+    # --- НАСТРОЙКА ПРОКСИ ДЛЯ TELEGRAM БОТА ---
+    PROXY_HOST = os.getenv("SQUID_PROXY_HOST")
+    PROXY_PORT = os.getenv("SQUID_PROXY_PORT")
+    PROXY_USER = os.getenv("SQUID_PROXY_USER")
+    PROXY_PASSWORD = os.getenv("SQUID_PROXY_PASSWORD")
+
+    bot_session = None
+    if PROXY_HOST and PROXY_PORT:
+        host = PROXY_HOST.strip('"')
+        port = PROXY_PORT.strip('"')
+        user = PROXY_USER.strip('"') if PROXY_USER else ""
+        password = PROXY_PASSWORD.strip('"') if PROXY_PASSWORD else ""
+
+        proxy_url = f"http://{user}:{password}@{host}:{port}"
+        bot_session = AiohttpSession(proxy=proxy_url)
+        logger.info(f"Telegram-бот запущен через прокси: {host}:{port}")
+    # -------------------------------------------
 
     bot = Bot(
         token=os.getenv("TELEGRAM_BOT_TOKEN"),
-        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)
+        default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN),
+        session=bot_session
     )
     dp = Dispatcher()
 

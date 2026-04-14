@@ -433,6 +433,10 @@ services:
       - DB_HOST=vv_pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
+      - SQUID_PROXY_HOST=${SQUID_PROXY_HOST}
+      - SQUID_PROXY_PORT=${SQUID_PROXY_PORT}
+      - SQUID_PROXY_USER=${SQUID_PROXY_USER}
+      - SQUID_PROXY_PASSWORD=${SQUID_PROXY_PASSWORD}
 
   # ---------------------------------------------------------------
   # МОНИТОРИНГ (Новые порты: Loki 3101, Grafana 3001)

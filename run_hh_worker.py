@@ -12,7 +12,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import func, select
 import datetime
 from sqlalchemy.orm import selectinload
-from sqlalchemy.orm import selectinload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from hr_bot.utils.analytics import log_analytics_event
 from decimal import Decimal
@@ -38,9 +37,8 @@ from hr_bot.utils.resh_in_code import check_candidate_eligibility, is_candidate_
 import signal
 import sys
 from hr_bot.utils.redis_lock import acquire_lock, release_lock
-from hr_bot.services.llm_handler import cleanup
-from hr_bot.utils.system_notifier import send_system_alert
-from sqlalchemy import func, select, delete, update  
+from hr_bot.services.llm_handler import cleanup, LlmValidationError
+from sqlalchemy import func, select, delete, update
 from hr_bot.services import interview_reminder_manager
 from hr_bot.utils.metrics import start_metrics_server, E2E_RESPONSE_LATENCY, MESSAGES_SENT_TOTAL
 from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
@@ -86,7 +84,7 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
     except (ValueError, TypeError):
         return "время не определено"
 
-async def _check_restrictions_via_llm(db: AsyncSession, dialogue: Dialogue, history_messages: list, log_extra: dict) -> bool:
+async def _check_restrictions_via_llm(db: AsyncSession, dialogue: Dialogue, recruiter: TrackedRecruiter, pending_messages: list, history_messages: list, log_extra: dict) -> bool:
     """
     Проверяет историю диалога на наличие критических ограничений (здоровье, язык) через LLM.
     Возвращает True, если найдены ограничения (нужен отказ), иначе False.
@@ -149,8 +147,18 @@ async def _check_restrictions_via_llm(db: AsyncSession, dialogue: Dialogue, hist
         # Логируем провальные попытки в БД перед вылетом
         for i in range(len(attempt_tracker)):
             await _log_llm_usage(db, dialogue, f"Restriction_Check (FAILED #{i+1}: {type(e).__name__})")
-        logger.error(f"[{dialogue.hh_response_id}] Ошибка проверки ограничений LLM: {e}", extra=log_extra)
-        return False # Fallback: если LLM упала, считаем что ограничений нет, чтобы не заблокировать нормального кандидата
+        
+        # --- КРИТИЧЕСКИЙ ОБРАБОТЧИК ---
+        await _handle_llm_failure(
+            db=db,
+            dialogue=dialogue,
+            recruiter=recruiter,
+            error=e,
+            context="Restriction Check LLM",
+            pending_msgs=pending_messages,
+            ctx_logger=logging.LoggerAdapter(logger, log_extra)
+        )
+        return None  # Возвращаем None как признак критического сбоя
 
 def _validate_age_in_text(text: str, suggested_age: any) -> bool:
     """
@@ -264,7 +272,71 @@ async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usa
     except Exception as e:
         logger.error(f"Ошибка при подготовке лога LLM ({context}): {e}")
 
-async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_date: str, history_messages: list, calendar_context: str, log_extra: dict) -> str:
+async def _handle_llm_failure(db: AsyncSession, dialogue: Dialogue, recruiter: TrackedRecruiter, error: Exception, context: str, pending_msgs: list, ctx_logger):
+    """
+    Критический сбой: LLM не ответила за 6 попыток. 
+    1. Шлем алерт админам с деталями.
+    2. Шлем заглушку кандидату.
+    3. Чистим очередь (pending_messages), чтобы не зациклиться.
+    """
+    ctx_logger.critical(f"🛑 КРИТИЧЕСКИЙ СБОЙ LLM ({context}): {type(error).__name__}: {error}")
+    
+    # 1. Формируем текст сообщений от кандидата
+    messages_text = []
+    if pending_msgs:
+        for m in pending_msgs:
+            content = m.get('content', '') if isinstance(m, dict) else str(m)
+            messages_text.append(f"- {content}")
+    
+    pending_content_str = "\n".join(messages_text) if messages_text else "Нет данных"
+
+    # 2. Шлем алерт в ТГ
+    alert_text = (
+        f"‼️ **КРИТИЧЕСКИЙ СБОЙ LLM**\n\n"
+        f"**Контекст:** {context}\n"
+        f"**Диалог ID:** `{dialogue.id}`\n"
+        f"**HH Response ID:** `{dialogue.hh_response_id}`\n"
+        f"**Рекрутер:** {recruiter.name if recruiter else 'Неизвестен'}\n"
+        f"**Вакансия:** {dialogue.vacancy.title if dialogue.vacancy else 'Неизвестна'}\n\n"
+        f"**Входящие сообщения:**\n{pending_content_str}\n\n"
+        f"**Ошибка:** `{type(error).__name__}: {error}`\n\n"
+        f"✅ **Действие:** Очередь очищена, кандидату отправлена заглушка. Требуется ручное вмешательство."
+    )
+    await send_system_alert(alert_text, alert_type="admin_only")
+
+    # 3. Шлем заглушку кандидату (через HH API)
+    fallback_msg = "Что-то с hh, вижу, что написали, но сообщение не видно. Передам специалисту. С вами свяжутся"
+    try:
+        await hh_api.send_message(recruiter, db, dialogue.hh_response_id, fallback_msg)
+    except Exception as send_err:
+        ctx_logger.error(f"Не удалось отправить заглушку кандидату: {send_err}")
+
+    # 4. Чистим очередь и фиксируем в БД
+    dialogue.pending_messages = None
+    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+
+    try:
+        await db.commit()
+        ctx_logger.info("Очередь сообщений успешно очищена после сбоя LLM.")
+    except Exception as commit_err:
+        ctx_logger.error(f"Ошибка при коммите очистки очереди: {commit_err}")
+        try:
+            await db.rollback()
+            ctx_logger.warning("Транзакция откачена после ошибки коммитa.")
+        except Exception as rollback_err:
+            ctx_logger.critical(f"Ошибка при rollback: {rollback_err}")
+        
+        # Шлем дополнительный алерт, если не удалось сохранить очистку
+        commit_alert = (
+            f"🔴 **КРИТИЧЕСКАЯ ОШИБКА КОММИТА**\n\n"
+            f"Не удалось очистить очередь после сбоя LLM.\n"
+            f"**Диалог ID:** `{dialogue.id}`\n"
+            f"**Ошибка коммита:** `{type(commit_err).__name__}: {commit_err}`\n\n"
+            f"⚠️ Требуется ручное вмешательство в БД!"
+        )
+        await send_system_alert(commit_alert, alert_type="admin_only")
+
+async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, recruiter: TrackedRecruiter, pending_messages: list, suggested_date: str, history_messages: list, calendar_context: str, log_extra: dict) -> tuple:
     """
     Техническая проверка даты (Аудит). Возвращает исправленную дату в формате YYYY-MM-DD.
     """
@@ -325,8 +397,21 @@ async def _verify_date_audit(db: AsyncSession, dialogue: Dialogue, suggested_dat
         parsed = response.get('parsed_response', {})
         return parsed.get("correct_date", suggested_date), parsed.get("reasoning", "Без обоснования")
     except Exception as e:
-        logger.error(f"Критическая ошибка аудита даты: {e}", extra=log_extra)
-        return suggested_date # В случае падения пропускаем как есть (fallback)
+        # Логируем провальные попытки
+        for i in range(len(verify_attempts)):
+            await _log_llm_usage(db, dialogue, f"Date_Audit (FAILED #{i+1}: {type(e).__name__})", model_name="gpt-4o")
+        
+        # --- КРИТИЧЕСКИЙ ОБРАБОТЧИК ---
+        await _handle_llm_failure(
+            db=db,
+            dialogue=dialogue,
+            recruiter=recruiter,
+            error=e,
+            context="Date Audit LLM",
+            pending_msgs=pending_messages,
+            ctx_logger=logging.LoggerAdapter(logger, log_extra)
+        )
+        return None, None # Возвращаем кортеж с None
     
 
 def _log_missing_vacancy(title: str, city: str):
@@ -930,9 +1015,19 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
             await _log_llm_usage(db, dialogue, "Followup_Response", usage)
 
     except Exception as e:
-        ctx_logger.error(f"Ошибка LLM в Follow-up: {e}", exc_info=True)
-        # Если упала LLM, мы НЕ чистим pending_messages и НЕ сохраняем историю, 
-        # чтобы воркер попробовал снова в следующем цикле.
+        # 1. Сначала используем существующий логгер
+        ctx_logger.error(f"Ошибка LLM в Follow-up (после всех попыток): {e}", exc_info=True)
+        
+        # 2. Вызываем наш новый обработчик сбоев
+        await _handle_llm_failure(
+            db=db, 
+            dialogue=dialogue, 
+            recruiter=recruiter, 
+            error=e, 
+            context="Follow-up Logic", 
+            pending_msgs=pending_messages, 
+            ctx_logger=ctx_logger
+        )
         return 
 
     # 5. Парсинг данных
@@ -1331,7 +1426,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             except Exception as citizenship_err:
                 # --- ЛОГИРОВАНИЕ ПОЛНОГО ПРОВАЛА ---
-                # Если tenacity исчерпала попытки, записываем в БД все неудачные заходы
                 ctx_logger.error(
                     f"[{dialogue.hh_response_id}] Анализ гражданства ПРОВАЛЕН после {len(citizenship_attempts)} попыток: {citizenship_err}",
                     extra={"action": "citizenship_analysis_failed_total"}
@@ -1341,10 +1435,18 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         db, dialogue, 
                         f"Citizenship_Analysis (FAILED #{i+1}: {type(citizenship_err).__name__})"
                     )
-                    
                 
-                # Пробрасываем ошибку дальше, чтобы воркер мог её обработать (или просто логируем и идем дальше)
-                raise citizenship_err
+                # --- ВЫЗОВ FALLBACK ОБРАБОТЧИКА ---
+                await _handle_llm_failure(
+                    db=db,
+                    dialogue=dialogue,
+                    recruiter=recruiter,
+                    error=citizenship_err,
+                    context="Citizenship Analysis",
+                    pending_msgs=pending_messages,
+                    ctx_logger=ctx_logger
+                )
+                return  # Вместо raise, чтобы остановить обработку этого диалога успешно
 
         # *************************************************************************************************************************************
         # КОНЕЦ СПЕЦИАЛЬНОЙ ОБРАБОТКИ ДЛЯ AWAITING_CITIZENSHIP
@@ -1435,10 +1537,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         except Exception as llm_error:
             # --- СЦЕНАРИЙ ПОЛНОГО ПРОВАЛА ---
-            # Если упало здесь, значит tenacity исчерпал все попытки и выкинул ошибку.
-            # В attempt_tracker лежат метки ВСЕХ попыток (например, 3 штуки).
-            # Все они считаются провальными.
-            
             ctx_logger.error(
                 f"[{dialogue.hh_response_id}] LLM Request FAILED completely after {len(attempt_tracker)} attempts: {llm_error}",
                 extra={"action": "llm_request_failed_total"}
@@ -1453,7 +1551,17 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             except Exception as log_ex:
                 ctx_logger.error(f"Failed to log LLM errors to DB: {log_ex}")
 
-            raise llm_error # Пробрасываем ошибку дальше
+            # --- ВЫЗОВ FALLBACK ОБРАБОТЧИКА ---
+            await _handle_llm_failure(
+                db=db,
+                dialogue=dialogue,
+                recruiter=recruiter,
+                error=llm_error,
+                context=f"Main Dialogue Loop ({dialogue.dialogue_state})",
+                pending_msgs=pending_messages,
+                ctx_logger=ctx_logger
+            )
+            return  # Вместо raise
 
         llm_duration = time.monotonic() - llm_call_start
         ctx_logger.debug(
@@ -1650,7 +1758,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # История: старая + то, что юзер прислал сейчас
                     full_hist = (dialogue.history or []) + user_entries_to_history
                     
-                    verified_date, audit_reason = await _verify_date_audit(db, dialogue, interview_date, full_hist, cal_context, log_context)
+                    verified_date_res = await _verify_date_audit(db, dialogue, recruiter, pending_messages, interview_date, full_hist, cal_context, log_context)
+                    if verified_date_res[0] is None:
+                        return # Сбой LLM, выходим (очередь уже очищена в _handle_llm_failure)
+                    verified_date, audit_reason = verified_date_res
 
                     # СРАВНИВАЕМ
                     if verified_date != interview_date and verified_date != "none":
@@ -2114,6 +2225,25 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 verified_data = verify_response.get('parsed_response', {}) if verify_response else {}
                 verify_age = verified_data.get('age')
                 verify_citizenship = verified_data.get('citizenship')
+                
+                # --- [END] УСПЕШНАЯ ВЕРИФИКАЦИЯ ---
+
+            except Exception as verify_err:
+                ctx_logger.error(f"[{dialogue.hh_response_id}] Финальная верификация ПРОВАЛЕНА: {verify_err}")
+                for i in range(len(verify_attempts)):
+                    await _log_llm_usage(db, dialogue, f"Final_Verify (FAILED #{i+1}: {type(verify_err).__name__})")
+                
+                # --- КРИТИЧЕСКИЙ ОБРАБОТЧИК ---
+                await _handle_llm_failure(
+                    db=db,
+                    dialogue=dialogue,
+                    recruiter=recruiter,
+                    error=verify_err,
+                    context="Final Data Verification",
+                    pending_msgs=pending_messages,
+                    ctx_logger=ctx_logger
+                )
+                return 
 
                 # Сравниваем с БД
                 db_age = dialogue.candidate.age
@@ -2206,12 +2336,17 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             
             # Вместо: has_restrictions = _has_forbidden_restrictions(full_history_for_filter)
             # Используем LLM:
-            has_restrictions = await _check_restrictions_via_llm(
+            res_rest = await _check_restrictions_via_llm(
                 db=db, 
                 dialogue=dialogue, 
+                recruiter=recruiter,
+                pending_messages=pending_messages,
                 history_messages=full_history_for_filter, 
                 log_extra=log_context
             )
+            if res_rest is None:
+                return # Сбой LLM
+            has_restrictions = res_rest
             
             if has_restrictions:
                 ctx_logger.info(
@@ -2638,19 +2773,28 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 except Exception as e:
                     # === ПОЛНЫЙ ПРОВАЛ ===
-                    ctx_logger.warning(
-                        f"[{dialogue.hh_response_id}] Ошибка при уточнении 'declined_vacancy': {e}. Считаем отказом по умолчанию.",
+                    ctx_logger.error(
+                        f"[{dialogue.hh_response_id}] Ошибка при уточнении 'declined_vacancy' (после всех попыток): {e}",
                         extra={"action": "decline_check_failed"}
                     )
-                    total_fails = len(clarification_attempts)
                     
-                    for i in range(total_fails):
+                    for i in range(len(clarification_attempts)):
                         await _log_llm_usage(
                             db, dialogue, 
                             f"DeclineClarification (FAILED #{i+1}: {type(e).__name__})"
                         )
-                    await db.commit()
-                    clarification_result = None
+                    
+                    # --- КРИТИЧЕСКИЙ ОБРАБОТЧИК ---
+                    await _handle_llm_failure(
+                        db=db,
+                        dialogue=dialogue,
+                        recruiter=recruiter,
+                        error=e,
+                        context="Decline Vacancy Clarification",
+                        pending_msgs=pending_messages,
+                        ctx_logger=ctx_logger
+                    )
+                    return 
 
                 is_real_decline = False
                 if clarification_result and 'parsed_response' in clarification_result:

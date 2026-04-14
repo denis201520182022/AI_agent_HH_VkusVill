@@ -238,9 +238,13 @@ services:
     env_file:
       - .env
     environment:
-      - DB_HOST=zz_pgbouncer
+      - DB_HOST=vv_pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
+      - SQUID_PROXY_HOST=${SQUID_PROXY_HOST}
+      - SQUID_PROXY_PORT=${SQUID_PROXY_PORT}
+      - SQUID_PROXY_USER=${SQUID_PROXY_USER}
+      - SQUID_PROXY_PASSWORD=${SQUID_PROXY_PASSWORD}
 
     # ---------------------------------------------------------------
   # LOKI (База данных логов)

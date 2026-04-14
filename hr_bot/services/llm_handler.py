@@ -15,6 +15,11 @@ from hr_bot.utils.redis_lock import close_redis
 
 
 
+class LlmValidationError(Exception):
+    """Исключение для ошибок валидации ответа LLM (пустой ответ или кривой JSON)."""
+    pass
+
+
 load_dotenv()
 logger = logging.getLogger(__name__)
 
@@ -57,10 +62,8 @@ logger.info(f"Клиент OpenAI настроен на работу через 
 
 
 @retry(
-    stop=stop_after_attempt(3),  # Попытаться 3 раза (1 оригинальная + 2 повтора)
-    wait=wait_exponential(multiplier=1, min=4, max=10), # Экспоненциальная задержка: 4с, 8с (максимум 10с)
-    # По умолчанию tenacity повторяет попытки для любого исключения, наследующегося от Exception.
-    # Поэтому retry_if_exception_type явно указывать не нужно для "любых ошибок".
+    stop=stop_after_attempt(6),  # Попытаться 6 раз
+    wait=wait_exponential(multiplier=1, min=4, max=180), # До 180 секунд (3 минуты)
 )
 async def get_bot_response(system_prompt: str, dialogue_history: list, user_message: str, current_datetime_utc: datetime.datetime, attempt_tracker: list = None, skip_instructions: bool = False, extra_context: dict = None) -> dict:
     """
@@ -126,7 +129,13 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         
 
         #print(response_content)
-        parsed_response = json.loads(response_content)
+        if not response_content or not response_content.strip():
+            raise LlmValidationError("LLM returned an empty response")
+
+        try:
+            parsed_response = json.loads(response_content)
+        except json.JSONDecodeError as je:
+            raise LlmValidationError(f"LLM returned invalid JSON: {je}") from je
 
         # --- ИЗМЕНИТЬ ЭТУ ЧАСТЬ (чтобы вернуть статистику наружу) ---
         return {
@@ -152,8 +161,8 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
 # Найти в конце файла или после функции get_bot_response
 
 @retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=1, min=4, max=10),
+    stop=stop_after_attempt(6),
+    wait=wait_exponential(multiplier=1, min=4, max=180),
 )
 async def get_smart_bot_response(system_prompt: str, dialogue_history: list, user_message: str, current_datetime_utc: datetime.datetime, attempt_tracker: list = None, skip_instructions: bool = False, extra_context: dict = None) -> dict:
     """
@@ -210,8 +219,16 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
             f"Raw LLM Response: {response_content}..."
         )
 
+        if not response_content or not response_content.strip():
+            raise LlmValidationError("SMART LLM returned an empty response")
+
+        try:
+            parsed_response = json.loads(response_content)
+        except json.JSONDecodeError as je:
+            raise LlmValidationError(f"SMART LLM returned invalid JSON: {je}") from je
+
         return {
-            "parsed_response": json.loads(response_content),
+            "parsed_response": parsed_response,
             "usage_stats": {
                 "prompt_tokens": usage.prompt_tokens,
                 "completion_tokens": usage.completion_tokens,

@@ -9,7 +9,7 @@ psycopg2-binary
 python-dotenv
 requests
 SQLAlchemy
-pandas 
+pandas
 openpyxl
 httpx
 tenacity
@@ -22,3 +22,4 @@ python-json-logger>=2.0.7
 prometheus-client
 gspread-asyncio
 google-auth
+aiohttp-socks
