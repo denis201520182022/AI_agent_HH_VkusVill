@@ -2194,7 +2194,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 extra={"action": "profile_complete_start_check"}
             )
 
-            is_eligible = check_candidate_eligibility(dialogue.candidate)
+            # Передаем и кандидата, и название вакансии для проверки возраста
+            is_eligible = check_candidate_eligibility(dialogue.candidate, dialogue.vacancy.title)
 
             # --- НОВАЯ ПРОВЕРКА НА ОГРАНИЧЕНИЯ ---
             # Собираем полную историю (из БД + то что пришло сейчас)

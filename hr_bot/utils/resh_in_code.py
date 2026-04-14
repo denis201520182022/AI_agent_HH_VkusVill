@@ -16,25 +16,38 @@ def is_candidate_profile_complete(candidate) -> bool:
 
     return all([has_citizenship, has_age])
 
-def check_candidate_eligibility(candidate) -> bool:
+def check_candidate_eligibility(candidate, vacancy_title: str) -> bool:
     """
     Проверяет кандидата по жестким критериям (Возраст + Гражданство).
     Возвращает True, если кандидат подходит.
     """
-    # 1. Проверка возраста (18-58 включительно)
-    if not (18 <= candidate.age <= 58):
+    # 1. ОПРЕДЕЛЕНИЕ ТИПА ВАКАНСИИ
+    title_lower = (vacancy_title or "").lower()
+    
+    # Ключевые слова для сборщиков (из вашего списка)
+    picker_keywords = [
+        'сборщик', 
+        'сканировщик', 
+        'комплектовщик'
+    ]
+    
+    # Проверяем, является ли вакансия "сборочной"
+    is_picker = any(word in title_lower for word in picker_keywords)
+    
+    # Устанавливаем верхний порог возраста
+    max_age = 42 if is_picker else 58
+
+    # 2. ПРОВЕРКА ВОЗРАСТА (18 - max_age включительно)
+    if not (18 <= candidate.age <= max_age):
         return False
     
-    # 2. Проверка гражданства
-    # Список стран, граждане которых подходят без дополнительных условий
+    # 3. ПРОВЕРКА ГРАЖДАНСТВА (оставляем без изменений)
     allowed_countries = ['рф', 'еаэс', "внж рф", "рвп рф", "россия", "рвп", "внж", "армения", "беларусь", "беларусия", "киргизия", "казахстан"]
     cand_citizen = (candidate.citizenship or "").lower().strip()
     
-    # Если страна из списка найдена в строке гражданства - ОК
     if any(country in cand_citizen for country in allowed_countries):
         return True
         
-    # Если другая страна, ищем упоминание ВНЖ или РВП
     if 'внж' in cand_citizen or 'рвп' in cand_citizen or 'вид на жительство' in cand_citizen:
         return True
         
