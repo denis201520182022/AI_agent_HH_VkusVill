@@ -239,7 +239,7 @@ services:
     env_file:
       - .env
     environment:
-      - DB_HOST=vv_pgbouncer
+      - DB_HOST=zz_pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
       - SQUID_PROXY_HOST=${SQUID_PROXY_HOST}
