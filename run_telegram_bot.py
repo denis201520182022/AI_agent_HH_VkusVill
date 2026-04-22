@@ -6,7 +6,8 @@ import datetime
 from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-from aiogram.client.session import AiohttpSession
+from aiogram.client.session.aiohttp import AiohttpSession
+
 from dotenv import load_dotenv
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
