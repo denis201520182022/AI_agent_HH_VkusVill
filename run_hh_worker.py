@@ -237,7 +237,7 @@ async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usa
     """
     try:
         # 1. Выбор тарифа и расчеты
-        pricing = MODEL_PRICING.get(model_name, MODEL_PRICING["gpt-4o-mini"])
+        pricing = llm_handler.MODEL_PRICING.get(model_name, llm_handler.MODEL_PRICING["gpt-4o-mini"])
         stats = usage_stats or {}
         p_tokens = stats.get('prompt_tokens', 0)
         c_tokens = stats.get('completion_tokens', 0)
@@ -986,11 +986,18 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
     followup_logic_block = prompt_library.get('#FOLLOWUP_LOGIC#', '')
     scheduling_logic = prompt_library.get('', '')
     calendar_context = _generate_calendar_context_2() 
-    # Берем данные из нового поля
-    vacancy_desc = (dialogue.vacancy.extracted_info or {}).get('unified_description')
+    # Берем данные из HH
+    hh_description = (dialogue.vacancy.extracted_info or {}).get('unified_description', "")
+    
+    # Берем данные из блоков (Google Docs)
+    blocks_description = _find_relevant_vacancy(prompt_library, dialogue.vacancy.title, dialogue.vacancy.city, ctx_logger)
 
-    if not vacancy_desc:
-        vacancy_desc = _find_relevant_vacancy(prompt_library, dialogue.vacancy.title, dialogue.vacancy.city, ctx_logger)
+    # Склеиваем (HH + Блоки)
+    if hh_description:
+        vacancy_desc = f"{hh_description}\n\n--- ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ ---\n{blocks_description}"
+    else:
+        vacancy_desc = blocks_description
+
     system_prompt = (
         f"{followup_logic_block}\n\n"
         f"{scheduling_logic}\n\n"
@@ -1222,13 +1229,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # Пересоздаем адаптер с полным набором данных
         ctx_logger = logging.LoggerAdapter(logger, log_context)
         
-        # === НОВЫЙ БЛОК: КОНТРОЛЬ СТОИМОСТИ И АЛЕРТОВ ===
+        # === НОВЫЙ БЛОК: КОНТРОЛЬ СТОИМОСТИ И АЛЕРТОВ (ЧЕРЕЗ REDIS) ===
         try:
-            total_cost_usd = float(dialogue.total_cost or 0)
-            total_cost_rub = total_cost_usd * 85.0
+            # Получаем актуальные данные о расходах из Redis
+            cost_info = await llm_handler.get_dialogue_cost_info(dialogue.id)
+            total_cost_rub = cost_info.get("rub", 0.0)
+            total_cost_usd = cost_info.get("usd", 0.0)
 
-            # 1. АЛЕРТ (если больше 10 руб)
-            if total_cost_rub > 8.0:
+            # 1. АЛЕРТ (порог 10 руб)
+            if total_cost_rub >= 10.0:
                 alert_key = f"cost_alert_sent:{dialogue.id}"
                 # acquire_lock вернет True, если ключа нет (шлем алерт первый раз за 3 дня)
                 if await acquire_lock(alert_key, timeout=259200): 
@@ -1237,13 +1246,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         dialogue_id=dialogue.id,
                         hh_response_id=dialogue.hh_response_id,
                         total_cost_rub=total_cost_rub,
+                        total_cost_usd=total_cost_usd,
                         history=dialogue.history or [],
                         recruiter_name=recruiter.name if recruiter else "Неизвестен",
                         vacancy_title=dialogue.vacancy.title if dialogue.vacancy else "Неизвестна"
                     )
 
-            # 2. СТОП-КРАН (если больше 100 руб) - Защита от бесконечных циклов
-            if total_cost_rub > 20.0:
+            # 2. СТОП-КРАН (порог 20 руб) - Защита от бесконечных циклов
+            if total_cost_rub >= 20.0:
                 ctx_logger.critical(f"🛑 КРИТИЧЕСКИЙ РАСХОД: {total_cost_rub:.2f} руб. Блокирую диалог!")
                 dialogue.pending_messages = None  # Останавливаем цикл
                 dialogue.dialogue_state = 'error_loop_blocked' # Помечаем для админа
@@ -1251,7 +1261,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 return # Выходим из обработки этого диалога
 
         except Exception as cost_err:
-            ctx_logger.error(f"Ошибка в блоке контроля стоимости: {cost_err}")
+            ctx_logger.error(f"Ошибка в блоке контроля стоимости (Redis): {cost_err}")
+        # === КОНЕЦ БЛОКА ===
         # === КОНЕЦ БЛОКА ===
 
         if dialogue.is_followup:
@@ -1477,9 +1488,24 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         combined_masked_message = "\n".join(all_masked_content)
 
-        # 1. Достаем нормализованные данные
+        # 1. Достаем нормализованные данные из HH
         vacancy_info = dialogue.vacancy.extracted_info or {}
-        relevant_vacancy_desc = vacancy_info.get('unified_description', "Описание не подгружено")
+        hh_description = vacancy_info.get('unified_description', "")
+
+        # 1.1 Достаем описание из блоков (Google Docs, как было раньше)
+        blocks_description = _find_relevant_vacancy(
+            prompt_library=prompt_library,
+            vacancy_title=dialogue.vacancy.title,
+            vacancy_city=dialogue.vacancy.city,
+            context_logger=ctx_logger
+        )
+
+        # 1.2 Склеиваем (сначала HH, потом Блоки)
+        if hh_description:
+            relevant_vacancy_desc = f"{hh_description}\n\n--- ДОПОЛНИТЕЛЬНАЯ ИНФОРМАЦИЯ ---\n{blocks_description}"
+        else:
+            relevant_vacancy_desc = blocks_description
+
         full_address = vacancy_info.get('full_address', dialogue.vacancy.city)
 
         # !!! ДОБАВЬ ЭТУ СТРОКУ, иначе упадет на context_postfix ниже !!!
@@ -3005,17 +3031,19 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             dialogue.dialogue_state = new_state
             dialogue.pending_messages = None
             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-            # === ПРОВЕРКА АНОМАЛЬНОЙ СТОИМОСТИ (С ЗАЩИТОЙ ОТ СПАМА ЧЕРЕЗ REDIS) ===
+            # === ПРОВЕРКА АНОМАЛЬНОЙ СТОИМОСТИ (ЧЕРЕЗ REDIS) ===
             try:
-                total_rub = float(dialogue.total_cost or 0) * 85.0
-                if total_rub > 10.0:
+                cost_info = await llm_handler.get_dialogue_cost_info(dialogue.id)
+                total_rub = cost_info.get("rub", 0.0)
+                total_usd = cost_info.get("usd", 0.0)
+                
+                if total_rub >= 10.0:
                     # Ключ в редисе, который скажет нам, что мы УЖЕ слали алерт по этому диалогу
                     # Ставим время жизни 3 дня (259200 сек), чтобы ключ сам удалился
                     alert_key = f"cost_alert_sent:{dialogue.id}"
 
                     # acquire_lock вернет True, если ключа нет (и создаст его),
                     # или False, если ключ уже есть.
-                    # Мы используем это как "флаг однократности"
                     already_sent = not await acquire_lock(alert_key, timeout=259200)
 
                     if not already_sent:
@@ -3024,6 +3052,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             dialogue_id=dialogue.id,
                             hh_response_id=dialogue.hh_response_id,
                             total_cost_rub=total_rub,
+                            total_cost_usd=total_usd,
                             history=dialogue.history or [],
                             recruiter_name=recruiter.name if recruiter else "Неизвестен",
                             vacancy_title=dialogue.vacancy.title if dialogue.vacancy else "Неизвестна"
@@ -3031,7 +3060,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     else:
                         ctx_logger.debug("Алерт стоимости уже отправлялся ранее, пропускаем.")
             except Exception as cost_alert_err:
-                ctx_logger.error(f"Ошибка в блоке алерта стоимости: {cost_alert_err}")
+                ctx_logger.error(f"Ошибка в блоке алерта стоимости (Redis): {cost_alert_err}")
 
             # Flush для проверки constraint violations перед commit
             await db.flush()

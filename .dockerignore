@@ -15,4 +15,46 @@ monitoring/data/
 *.sql
 *.log
 api_vac.json
-api_res.json    
+api_res.json 
+
+# Виртуальное окружение (самый тяжелый мусор)
+venv/
+.venv/
+env/
+
+# Логи и временные файлы
+logs/
+*.log
+backups/
+historical_reports/
+missing_vacancies.txt
+followup_export_*.txt
+
+# Python cache
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Конфиденциальные данные (их лучше прокидывать через ENV или volumes)
+.env
+# credentials.json  # Если ты прокидываешь его через volume в compose, то игнорируй здесь
+
+# Git
+.git
+.gitignore
+
+# Docker & CI/CD
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Мониторинг (конфиги нужны только хосту для запуска контейнеров мониторинга)
+monitoring/
+
+# IDE и прочее
+.vscode/
+.idea/
+instrustion.md
+alembic/
+alembic.ini

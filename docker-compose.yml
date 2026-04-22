@@ -62,91 +62,91 @@ services:
   # ==========================================
   # РЕКРУТЕР 1 (ID: 6 - Долгополова Марина)
   # ==========================================
-  zz_scanner_r6:
-    <<: [*default-logging, *python-limits]
-    build: .
-    image: hh_bot_core:latest
-    container_name: zz_scanner_r6
-    restart: always
-    command: python run_hh_scanner.py --recruiter_ids 6  
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-      - ./missing_vacancies.txt:/app/missing_vacancies.txt
-    depends_on:
-      - zz_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=zz_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
+  # zz_scanner_r6:
+  #   <<: [*default-logging, *python-limits]
+  #   build: .
+  #   image: hh_bot_core:latest
+  #   container_name: zz_scanner_r6
+  #   restart: always
+  #   command: python run_hh_scanner.py --recruiter_ids 6  
+  #   volumes:
+  #     - ./logs:/app/logs
+  #     - ./credentials.json:/app/credentials.json
+  #     - ./missing_vacancies.txt:/app/missing_vacancies.txt
+  #   depends_on:
+  #     - zz_pgbouncer
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - DB_HOST=zz_pgbouncer
+  #     - DB_PORT=6432
+  #     - REDIS_HOST=host.docker.internal
 
-  zz_worker_6:
-    <<: [*default-logging, *python-limits]
-    image: hh_bot_core:latest
-    container_name: zz_worker_6
-    restart: always
-    command: python run_hh_worker.py --recruiter_ids 6
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-    depends_on:
-      - zz_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=zz_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
+  # zz_worker_6:
+  #   <<: [*default-logging, *python-limits]
+  #   image: hh_bot_core:latest
+  #   container_name: zz_worker_6
+  #   restart: always
+  #   command: python run_hh_worker.py --recruiter_ids 6
+  #   volumes:
+  #     - ./logs:/app/logs
+  #     - ./credentials.json:/app/credentials.json
+  #   depends_on:
+  #     - zz_pgbouncer
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - DB_HOST=zz_pgbouncer
+  #     - DB_PORT=6432
+  #     - REDIS_HOST=host.docker.internal
 
   # ==========================================
   # РЕКРУТЕР 2 (ID: 21 - Измайлова Анастасия)
   # ==========================================
-  zz_scanner_21:
-    <<: [*default-logging, *python-limits]
-    image: hh_bot_core:latest
-    container_name: zz_scanner_21
-    restart: always
-    command: python run_hh_scanner.py --recruiter_ids 21
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-      - ./missing_vacancies.txt:/app/missing_vacancies.txt
-    depends_on:
-      - zz_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=zz_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
+  # zz_scanner_21:
+  #   <<: [*default-logging, *python-limits]
+  #   image: hh_bot_core:latest
+  #   container_name: zz_scanner_21
+  #   restart: always
+  #   command: python run_hh_scanner.py --recruiter_ids 21
+  #   volumes:
+  #     - ./logs:/app/logs
+  #     - ./credentials.json:/app/credentials.json
+  #     - ./missing_vacancies.txt:/app/missing_vacancies.txt
+  #   depends_on:
+  #     - zz_pgbouncer
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - DB_HOST=zz_pgbouncer
+  #     - DB_PORT=6432
+  #     - REDIS_HOST=host.docker.internal
 
-  zz_worker_21:
-    <<: [*default-logging, *python-limits]
-    image: hh_bot_core:latest
-    container_name: zz_worker_21
-    restart: always
-    command: python run_hh_worker.py --recruiter_ids 21
-    volumes:
-      - ./logs:/app/logs
-      - ./credentials.json:/app/credentials.json
-    depends_on:
-      - zz_pgbouncer
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    env_file:
-      - .env
-    environment:
-      - DB_HOST=zz_pgbouncer
-      - DB_PORT=6432
-      - REDIS_HOST=host.docker.internal
+  # zz_worker_21:
+  #   <<: [*default-logging, *python-limits]
+  #   image: hh_bot_core:latest
+  #   container_name: zz_worker_21
+  #   restart: always
+  #   command: python run_hh_worker.py --recruiter_ids 21
+  #   volumes:
+  #     - ./logs:/app/logs
+  #     - ./credentials.json:/app/credentials.json
+  #   depends_on:
+  #     - zz_pgbouncer
+  #   extra_hosts:
+  #     - "host.docker.internal:host-gateway"
+  #   env_file:
+  #     - .env
+  #   environment:
+  #     - DB_HOST=zz_pgbouncer
+  #     - DB_PORT=6432
+  #     - REDIS_HOST=host.docker.internal
 
   # ---------------------------------------------------------------
   # SCANNER (Общий)

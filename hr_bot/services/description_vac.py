@@ -80,11 +80,11 @@ async def sync_vacancy_details(db: AsyncSession, vacancy_obj: Vacancy, raw_data:
         unified_text = (
             f"{instruction}"
             # f"Зарплата: {salary_str}\n"
-            f"Оформление: {contracts_str}\n"
+            # f"Оформление: {contracts_str}\n"
             # f"Выплаты: {pay_freq}\n"
             # f"График: {schedules}\n"
             # f"Часы работы: {working_hours}\n"
-            f"Формат: {work_formats}\n"
+            # f"Формат: {work_formats}\n"
             f"Адрес: {full_addr}\n\n"
             f"Описание вакансии:\n{clean_html(raw_data.get('description', ''))}"
         )

@@ -11,8 +11,23 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 import datetime
 import os # <--- Добавь
 from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
-from hr_bot.utils.redis_lock import close_redis 
-
+import logging
+from logging.handlers import TimedRotatingFileHandler
+import os
+from hr_bot.utils.redis_lock import DistributedSemaphore, get_redis_client, close_redis 
+# --- ЦЕНЫ И КУРС ---
+MODEL_PRICING = {
+    "gpt-4o-mini": {
+        "input": 0.150,
+        "output": 0.600,
+    },
+    "gpt-4o": {
+        "input": 2.500,
+        "output": 10.000,
+    }
+}
+USD_TO_RUB_RATE = 85.0
+REDIS_COST_TTL = 60 * 60 * 24 * 60  # 60 дней (2 месяца)
 
 
 class LlmValidationError(Exception):
@@ -22,6 +37,36 @@ class LlmValidationError(Exception):
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+
+
+
+# Путь теперь ведет в папку /app/logs, которая прокинута в docker-compose
+LOG_DIR = "/app/logs"
+LLM_DEBUG_LOG_PATH = os.path.join(LOG_DIR, "debug_llm_responses.log")
+
+# Создаем папку, если её нет (на всякий случай)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+# Настройка ротируемого логгера
+llm_debug_logger = logging.getLogger("llm_debug")
+llm_debug_logger.setLevel(logging.INFO)
+llm_debug_logger.propagate = False # Чтобы эти логи не дублировались в основной лог
+
+# when="midnight" — ротация в полночь
+# interval=1 — каждые 1 сутки
+# backupCount=1 — хранить только 1 старый файл (вчерашний). 
+# Если поставить 0 — удалит сразу при наступлении новых суток.
+handler = TimedRotatingFileHandler(
+    LLM_DEBUG_LOG_PATH, 
+    when="midnight", 
+    interval=1, 
+    backupCount=1, 
+    encoding="utf-8"
+)
+formatter = logging.Formatter('%(message)s') # Для этого файла нам не нужен префикс, только тело
+handler.setFormatter(formatter)
+llm_debug_logger.addHandler(handler)
 
 # --- ДОБАВЛЕНО: Глобальный семафор для LLM запросов ---
 # Определяет максимальное количество ОДНОВРЕМЕННЫХ запросов к OpenAI.
@@ -58,6 +103,72 @@ client = AsyncOpenAI(
 )
 
 logger.info(f"Клиент OpenAI настроен на работу через прокси: {SQUID_PROXY_HOST}:{SQUID_PROXY_PORT}")
+
+
+async def _log_usage_to_redis(dialogue_id, model_name, usage_stats):
+    """
+    Записывает токены и стоимость в Redis для конкретного диалога.
+    """
+    if not dialogue_id or not usage_stats:
+        return
+    
+    pricing = MODEL_PRICING.get(model_name)
+    if not pricing:
+        return
+    
+    p_tokens = usage_stats.get("prompt_tokens", 0)
+    c_tokens = usage_stats.get("completion_tokens", 0)
+    cached_tokens = usage_stats.get("cached_tokens", 0)
+    
+    # Расчет стоимости в USD
+    # Кэшированные токены на 50% дешевле обычных (стандарт OpenAI)
+    cost_usd = (
+        ((p_tokens - cached_tokens) * pricing["input"] / 1_000_000) +
+        (cached_tokens * (pricing["input"] * 0.5) / 1_000_000) +
+        (c_tokens * pricing["output"] / 1_000_000)
+    )
+    
+    redis = get_redis_client()
+    key = f"llm_cost:dialogue:{dialogue_id}"
+    
+    try:
+        # Используем pipeline для атомарности и производительности
+        async with redis.pipeline(transaction=True) as pipe:
+            pipe.hincrby(key, "prompt_tokens", p_tokens)
+            pipe.hincrby(key, "completion_tokens", c_tokens)
+            pipe.hincrby(key, "cached_tokens", cached_tokens)
+            pipe.hincrbyfloat(key, "cost_usd", cost_usd)
+            pipe.expire(key, REDIS_COST_TTL)
+            await pipe.execute()
+    except Exception as e:
+        logger.error(f"Error logging LLM cost to Redis for dialogue {dialogue_id}: {e}")
+
+
+async def get_dialogue_cost_info(dialogue_id) -> dict:
+    """
+    Возвращает информацию о затратах на диалог из Redis (в USD и RUB).
+    """
+    redis = get_redis_client()
+    key = f"llm_cost:dialogue:{dialogue_id}"
+    
+    try:
+        data = await redis.hgetall(key)
+        if not data:
+            return {"usd": 0.0, "rub": 0.0, "tokens": {}}
+        
+        cost_usd = float(data.get("cost_usd", 0))
+        return {
+            "usd": cost_usd,
+            "rub": cost_usd * USD_TO_RUB_RATE,
+            "tokens": {
+                "prompt": int(data.get("prompt_tokens", 0)),
+                "completion": int(data.get("completion_tokens", 0)),
+                "cached": int(data.get("cached_tokens", 0))
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting cost from Redis for dialogue {dialogue_id}: {e}")
+        return {"usd": 0.0, "rub": 0.0, "tokens": {}}
 
 
 
@@ -98,7 +209,23 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
                 temperature=0.0
             )
         # ----------------------------------------------------
+        # ----------------------------------------------------
+        # 1. Сразу дампим весь ответ в JSON-строку
+        full_response_dump = response.model_dump_json(indent=2)
+        response_content = response.choices[0].message.content
 
+        # 2. ЗАПИСЬ В ОТДЕЛЬНЫЙ ФАЙЛ (теперь через логгер с ротацией)
+        try:
+            log_entry = (
+                f"\n{'='*50}\n"
+                f"TIMESTAMP: {datetime.datetime.now()}\n"
+                f"DIALOGUE_ID: {(extra_context or {}).get('dialogue_id', 'unknown')}\n"
+                f"FULL_RESPONSE:\n{full_response_dump}\n"
+                f"{'='*50}\n"
+            )
+            llm_debug_logger.info(log_entry)
+        except Exception as log_error:
+            ctx_logger.error(f"Error writing to debug log: {log_error}")
         response_content = response.choices[0].message.content
         finish_reason = response.choices[0].finish_reason  # ### <--- НОВОЕ: Причина остановки
 
@@ -126,11 +253,34 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
             f"Raw LLM Response: {response_content}..."
         )
         
+        # --- ЛОГИРОВАНИЕ В REDIS ---
+        dialogue_id = (extra_context or {}).get("dialogue_id")
+        if dialogue_id:
+            await _log_usage_to_redis(dialogue_id, "gpt-4o-mini", {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": cached_tokens
+            })
+        # ---------------------------
+        
         
 
-        #print(response_content)
-        if not response_content or not response_content.strip():
-            raise LlmValidationError("LLM returned an empty response")
+        refusal_msg = getattr(response.choices[0].message, "refusal", None)
+        
+        if refusal_msg or not response_content or not response_content.strip():
+            current_len = len(dialogue_history)
+            if current_len > 10:
+                dialogue_history[:] = dialogue_history[-10:]
+                ctx_logger.warning(f"🔪 Отказ/пустота LLM. История усечена до 10 сообщений (было {current_len}).")
+            elif current_len > 5:
+                dialogue_history[:] = dialogue_history[-5:]
+                ctx_logger.warning(f"🔪 Отказ/пустота LLM. История усечена до 5 сообщений (было {current_len}).")
+            elif current_len > 2:
+                dialogue_history[:] = dialogue_history[-2:]
+                ctx_logger.warning(f"🔪 Отказ/пустота LLM. История усечена до 2 сообщений (было {current_len}).")
+                
+            error_msg = f"LLM returned refusal: {refusal_msg}" if refusal_msg else "LLM returned an empty response"
+            raise LlmValidationError(error_msg)
 
         try:
             parsed_response = json.loads(response_content)
@@ -219,8 +369,32 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
             f"Raw LLM Response: {response_content}..."
         )
 
-        if not response_content or not response_content.strip():
-            raise LlmValidationError("SMART LLM returned an empty response")
+        # --- ЛОГИРОВАНИЕ В REDIS ---
+        dialogue_id = (extra_context or {}).get("dialogue_id")
+        if dialogue_id:
+            await _log_usage_to_redis(dialogue_id, "gpt-4o", {
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "cached_tokens": cached_tokens
+            })
+        # ---------------------------
+
+        refusal_msg = getattr(response.choices[0].message, "refusal", None)
+        
+        if refusal_msg or not response_content or not response_content.strip():
+            current_len = len(dialogue_history)
+            if current_len > 10:
+                dialogue_history[:] = dialogue_history[-10:]
+                ctx_logger.warning(f"🔪 Отказ/пустота SMART LLM. История усечена до 10 сообщений (было {current_len}).")
+            elif current_len > 5:
+                dialogue_history[:] = dialogue_history[-5:]
+                ctx_logger.warning(f"🔪 Отказ/пустота SMART LLM. История усечена до 5 сообщений (было {current_len}).")
+            elif current_len > 2:
+                dialogue_history[:] = dialogue_history[-2:]
+                ctx_logger.warning(f"🔪 Отказ/пустота SMART LLM. История усечена до 2 сообщений (было {current_len}).")
+                
+            error_msg = f"SMART LLM returned refusal: {refusal_msg}" if refusal_msg else "SMART LLM returned an empty response"
+            raise LlmValidationError(error_msg)
 
         try:
             parsed_response = json.loads(response_content)
