@@ -153,6 +153,7 @@ services:
   # ---------------------------------------------------------------
   zz_scanner_0:
     <<: [*default-logging, *python-limits]
+    build: .
     image: hh_bot_core:latest
     container_name: zz_scanner_0
     restart: always
