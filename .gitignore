@@ -24,4 +24,5 @@ hh_stress_test.py
 venv_date_test/
 11.py
 api_vac.json
-
+backups/
+missing_vacancies.txt

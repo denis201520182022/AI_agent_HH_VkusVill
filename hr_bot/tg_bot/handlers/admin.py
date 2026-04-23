@@ -7,6 +7,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy.orm import Session
 import io
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 from aiogram.types import BufferedInputFile
 from sqlalchemy import select
 from hr_bot.db.models import Dialogue
@@ -64,9 +65,13 @@ class RecruiterManagement(StatesGroup):
     update_topic_rescheduled = State()   # <-- НОВОЕ
 
 class SettingsManagement(StatesGroup):
-    set_balance = State()              # Вместо set_limit
-    set_cost_dialogue = State()        # Стоимость входа
-    set_cost_long_reminder = State()   # Стоимость напоминалок (7/14/21 день)
+    # Для баланса
+    choosing_balance = State() # Выбор какой баланс пополнить
+    set_balance_value = State() # Ввод суммы
+    
+    # Для тарифов
+    set_cost_dialogue = State()
+    set_cost_reactivation = State() # Заменили long_reminder на reactivation
     set_cost_followup = State()
      
 # --- Обработчики отмены ---
@@ -94,53 +99,83 @@ async def limits_menu(message: Message, db_session: Session):
         return
 
     content = Text(
-        Bold("📊 Управление балансом:"), "\n\n",
-        "Текущий баланс: ", Bold(f"{settings.balance:.2f}"), " руб.\n\n",
-        
-        Bold("📈 История затрат:"), "\n",
-        #"- Потрачено на диалоги: ", Bold(f"{settings.total_spent_on_dialogues:.2f}"), " руб.\n",
-        "- Потрачено на напоминания: ", Bold(f"{settings.total_spent_on_reminders:.2f}"), " руб.\n",
-        "- Потрачено на follow-up: ", Bold(f"{settings.total_spent_on_followups:.2f}"), " руб.\n\n", # <-- ДОБАВЛЕНО
+        Bold("📊 Управление балансом:"), "\n",
+        "- Баланс новых откликов: ", Bold(f"{settings.balance_standard:.2f}"), " руб.\n",
+        "- Баланс рассылок и фоллоуапов: ", Bold(f"{settings.balance_outbound:.2f}"), " руб.\n\n",
         
         "💰 ", Bold("Тарифы:"), "\n",
-        "Новый диалог: ", Bold(f"{settings.cost_per_dialogue:.2f}"), " руб.\n",
-        "Долгое напоминание: ", Bold(f"{settings.cost_per_long_reminder:.2f}"), " руб.\n",
-        "Follow-up: ", Bold(f"{settings.cost_per_followup:.2f}"), " руб.\n\n", # <-- ДОБАВЛЕНО
+        "- Новый отклик: ", Bold(f"{settings.cost_per_dialogue:.2f}"), " руб.\n",
+        "- Follow-up: ", Bold(f"{settings.cost_per_followup:.2f}"), " руб.\n",
+        "- Реактивация (рассылка): ", Bold(f"{settings.cost_per_reactivation:.2f}"), " руб.\n\n",
         
-        "🔔 Уведомление при балансе < ", Bold(f"{settings.low_balance_threshold:.2f}"), " руб."
+        "🔔 Уведомление при балансе < ", Bold(f"{settings.low_balance_threshold:.2f}"), " руб.\n\n",
+
+        Bold("📈 История затрат (всего):"), "\n",
+        "- На новые диалоги: ", Bold(f"{settings.total_spent_standard:.2f}"), " руб.\n",
+        "- На Follow-up: ", Bold(f"{settings.total_spent_followup:.2f}"), " руб.\n",
+        "- На Реактивацию: ", Bold(f"{settings.total_spent_reactivation:.2f}"), " руб."
     )
-    # Используем ту же клавиатуру
+    
+    # Клавиатура должна содержать кнопку callback_data="set_limit" и "set_tariff"
     await message.answer(**content.as_kwargs(), reply_markup=limits_menu_keyboard)
 
-@router.callback_query(F.data == "set_limit") # Оставляем callback как в клавиатуре
-async def start_set_balance(callback: CallbackQuery, state: FSMContext):
-    await state.set_state(SettingsManagement.set_balance)
-    await callback.message.answer("Введите новую сумму общего баланса в рублях (например: 5000):")
+# --- ЛОГИКА ПОПОЛНЕНИЯ БАЛАНСА (ДВА ВАРИАНТА) ---
+
+@router.callback_query(F.data == "set_limit")
+async def start_set_balance_choice(callback: CallbackQuery, state: FSMContext):
+    # Создаем временную клавиатуру для выбора баланса
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🔵 Новые диалоги (Отклики)", callback_data="target_balance_standard")
+    kb.button(text="🟠 Фолоуап, реактивация", callback_data="target_balance_outbound")
+    kb.adjust(1)
+    
+    await callback.message.answer("Какой баланс вы хотите изменить?", reply_markup=kb.as_markup())
+    await state.set_state(SettingsManagement.choosing_balance)
     await callback.answer()
 
-@router.message(SettingsManagement.set_balance)
-async def process_set_balance(message: Message, state: FSMContext, db_session: Session):
+@router.callback_query(SettingsManagement.choosing_balance, F.data.startswith("target_balance_"))
+async def process_balance_choice(callback: CallbackQuery, state: FSMContext):
+    target = callback.data.replace("target_balance_", "")
+    await state.update_data(target_field=target)
+    
+    label = "Новые диалоги (Отклики)" if target == "standard" else "Фолоуап, реактивация"
+    await callback.message.edit_text(f"Установка баланса для: <b>{label}</b>\nВведите новую сумму в рублях:", parse_mode="HTML")
+    await state.set_state(SettingsManagement.set_balance_value)
+    await callback.answer()
+
+@router.message(SettingsManagement.set_balance_value)
+async def process_set_balance_value(message: Message, state: FSMContext, db_session: Session):
     try:
-        new_balance = float(message.text.replace(',', '.'))
-        if new_balance < 0: raise ValueError
-    except (ValueError, TypeError):
-        await message.answer("❌ Сумма должна быть числом. Попробуйте еще раз.")
+        new_value = float(message.text.replace(',', '.'))
+        if new_value < 0: raise ValueError
+    except:
+        await message.answer("❌ Введите корректное число.")
         return
 
+    data = await state.get_data()
+    target = data.get("target_field")
     settings = db_session.query(AppSettings).filter_by(id=1).first()
-    settings.balance = new_balance
-    
-    # Сбрасываем флаг уведомления, если баланс теперь выше порога
-    if new_balance >= settings.low_balance_threshold:
-        settings.low_limit_notified = False
+
+    if target == "standard":
+        settings.balance_standard = new_value
+        # Сбрасываем флаг уведомления, если пополнили
+        if new_value >= settings.low_balance_threshold:
+            settings.notified_low_standard = False
+    else:
+        settings.balance_outbound = new_value
+        if new_value >= settings.low_balance_threshold:
+            settings.notified_low_outbound = False
 
     db_session.commit()
     await state.clear()
-    await message.answer(f"✅ Баланс обновлен: {new_balance:.2f} руб.", reply_markup=admin_keyboard)
+    await message.answer(f"✅ Баланс <b>{target}</b> обновлен до {new_value:.2f} руб.", reply_markup=admin_keyboard, parse_mode="HTML")
+
+# --- ЛОГИКА ТАРИФОВ (ОБНОВЛЕННАЯ ПОД МОДЕЛЬ) ---
+
 @router.callback_query(F.data == "set_tariff")
-async def start_set_cost_dialogue(callback: CallbackQuery, state: FSMContext):
+async def start_set_tariffs(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SettingsManagement.set_cost_dialogue)
-    await callback.message.answer("Введите стоимость создания ОДНОГО ДИАЛОГА (в рублях):")
+    await callback.message.answer("Шаг 1/3: Введите стоимость НОВОГО ОТКЛИКА (в рублях):")
     await callback.answer()
 
 @router.message(SettingsManagement.set_cost_dialogue)
@@ -151,27 +186,24 @@ async def process_set_cost_dialogue(message: Message, state: FSMContext, db_sess
         settings.cost_per_dialogue = val
         db_session.commit()
         
-        # Переходим к следующему шагу - стоимость напоминалки
-        await state.set_state(SettingsManagement.set_cost_long_reminder)
-        await message.answer(f"✅ Ок. Теперь введите стоимость ПАЧКИ ДОЛГИХ НАПОМИНАНИЙ (7/14/21 день):")
-    except:
-        await message.answer("❌ Ошибка в числе. Попробуйте еще раз.")
-        
-@router.message(SettingsManagement.set_cost_long_reminder)
-async def process_set_cost_reminder(message: Message, state: FSMContext, db_session: Session):
-    try:
-        val = float(message.text.replace(',', '.'))
-        settings = db_session.query(AppSettings).filter_by(id=1).first()
-        settings.cost_per_long_reminder = val
-        db_session.commit()
-        
-        # ТЕПЕРЬ ПЕРЕХОДИМ К СЛЕДУЮЩЕМУ ШАГУ ВМЕСТО ЗАВЕРШЕНИЯ
-        await state.set_state(SettingsManagement.set_cost_followup)
-        await message.answer("✅ Ок. Теперь введите стоимость FOLLOW-UP (дожима после собеседования):")
+        await state.set_state(SettingsManagement.set_cost_reactivation)
+        await message.answer(f"✅ Ок. Шаг 2/3: Введите стоимость ОДНОГО СООБЩЕНИЯ РЕАКТИВАЦИИ (рассылка):")
     except:
         await message.answer("❌ Ошибка в числе.")
 
-# --- НОВАЯ ФУНКЦИЯ ---
+@router.message(SettingsManagement.set_cost_reactivation)
+async def process_set_cost_reactivation(message: Message, state: FSMContext, db_session: Session):
+    try:
+        val = float(message.text.replace(',', '.'))
+        settings = db_session.query(AppSettings).filter_by(id=1).first()
+        settings.cost_per_reactivation = val # Используем поле из модели
+        db_session.commit()
+        
+        await state.set_state(SettingsManagement.set_cost_followup)
+        await message.answer("✅ Ок. Шаг 3/3: Введите стоимость FOLLOW-UP (дожим после встречи):")
+    except:
+        await message.answer("❌ Ошибка в числе.")
+
 @router.message(SettingsManagement.set_cost_followup)
 async def process_set_cost_followup(message: Message, state: FSMContext, db_session: Session):
     try:
@@ -181,7 +213,7 @@ async def process_set_cost_followup(message: Message, state: FSMContext, db_sess
         db_session.commit()
         
         await state.clear()
-        await message.answer("✅ Все тарифы (диалоги, напоминания, follow-up) успешно обновлены.", reply_markup=admin_keyboard)
+        await message.answer("✅ Все тарифы успешно обновлены.", reply_markup=admin_keyboard)
     except:
         await message.answer("❌ Ошибка в числе.")
 

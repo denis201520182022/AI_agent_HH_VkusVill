@@ -267,50 +267,84 @@ def get_month_ranges(year, month):
     end_date = date(year, month, last_day)
     return start_date, end_date
 
+def get_all_periods(start_year, start_month):
+    """Генерирует список периодов с указанной даты по текущий день"""
+    periods = []
+    
+    # 1. Добавляем период "За все время"
+    today = date.today()
+    all_time_start = date(start_year, start_month, 1)
+    periods.append(("За_все_время", all_time_start, today))
+    
+    # 2. Генерируем помесячные периоды (от текущего месяца назад к прошлому)
+    current_date = today
+    while current_date >= all_time_start:
+        year = current_date.year
+        month = current_date.month
+        
+        # Название месяца на русском для имени файла
+        month_names = {
+            1: "Январь", 2: "Февраль", 3: "Март", 4: "Апрель", 
+            5: "Май", 6: "Июнь", 7: "Июль", 8: "Август", 
+            9: "Сентябрь", 10: "Октябрь", 11: "Ноябрь", 12: "Декабрь"
+        }
+        period_name = f"{month_names[month]}_{year}"
+        
+        # Начало и конец конкретного месяца
+        m_start = date(year, month, 1)
+        last_day = calendar.monthrange(year, month)[1]
+        
+        # Если это текущий месяц (апрель 2026), ограничиваем текущим днем
+        if year == today.year and month == today.month:
+            m_end = today
+        else:
+            m_end = date(year, month, last_day)
+            
+        periods.append((period_name, m_start, m_end))
+        
+        # Переходим к предыдущему месяцу
+        first_of_current = current_date.replace(day=1)
+        current_date = first_of_current - timedelta(days=1)
+        
+    return periods
+
 def main():
     # Создаем папку для отчетов
-    output_dir = "historical_reports"
+    output_dir = "reports_april_2026"
     os.makedirs(output_dir, exist_ok=True)
 
-    # Задаем периоды для отчетов
-    all_time_start = date(2023, 1, 1) # Можно поменять на год старта проекта
-    all_time_end = date.today()
-    
-    ranges = [
-        ("За_все_время", all_time_start, all_time_end),
-        ("Март_2026", *get_month_ranges(2026, 3)),
-        ("Февраль_2026", *get_month_ranges(2026, 2)),
-        ("Январь_2026", *get_month_ranges(2026, 1)),
-        ("Декабрь_2025", *get_month_ranges(2025, 12)),
-        ("Ноябрь_2025", *get_month_ranges(2025, 11)),
-        ("Октябрь_2025", *get_month_ranges(2025, 10)),
-    ]
+    # Укажите здесь год и месяц начала работы вашего бота, 
+    # чтобы скрипт знал, как далеко уходить в историю.
+    START_PROJECT_YEAR = 2025 
+    START_PROJECT_MONTH = 1
 
-    print(f"🚀 Запуск генерации исторических отчетов в папку '{output_dir}/'...\n")
+    ranges = get_all_periods(START_PROJECT_YEAR, START_PROJECT_MONTH)
 
-    # Открываем синхронную сессию БД
+    print(f"🚀 Запуск генерации исторических отчетов (на момент апреля 2026)...")
+    print(f"📁 Папка: {os.path.abspath(output_dir)}\n")
+
     db = SyncSessionLocal()
     
     try:
         for period_name, start_d, end_d in ranges:
-            print(f"--- Генерация для периода: {period_name.replace('_', ' ')} ---")
+            print(f"--- Период: {period_name.replace('_', ' ')} ({start_d} - {end_d}) ---")
             
-            # Файлы для обычной статы
-            reg_filepath = os.path.join(output_dir, f"Regular_{period_name}.xlsx")
+            # 1. Обычный отчет
+            reg_filename = f"Regular_{period_name}.xlsx"
+            reg_filepath = os.path.join(output_dir, reg_filename)
             generate_regular_report(db, start_d, end_d, reg_filepath)
             
-            # Файлы для Follow-up
-            fu_filepath = os.path.join(output_dir, f"FollowUp_{period_name}.xlsx")
+            # 2. Follow-up отчет
+            fu_filename = f"FollowUp_{period_name}.xlsx"
+            fu_filepath = os.path.join(output_dir, fu_filename)
             generate_followup_report(db, start_d, end_d, fu_filepath)
-            print()
+            print("-" * 50)
 
-        print("✅ Все отчеты успешно сформированы!")
+        print(f"\n✅ Все отчеты (всего {len(ranges) * 2} файлов) успешно сформированы!")
         
     except Exception as e:
-        print(f"❌ Произошла ошибка при выгрузке: {e}")
-        
+        print(f"❌ Ошибка в процессе выгрузки: {e}")
     finally:
-        # Обязательно закрываем сессию
         db.close()
 
 if __name__ == "__main__":

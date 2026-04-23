@@ -607,7 +607,7 @@ async def check_and_send_followups():
                     continue
 
                 logger.info(f"[Follow-up] Найдено {len(tasks)} задач для отправки.")
-
+            
                 for task in tasks:
                     dialogue = task.dialogue
                     if not dialogue or not dialogue.recruiter:
@@ -638,13 +638,23 @@ async def check_and_send_followups():
                         cost = settings.cost_per_followup if settings else Decimal('10.00')
 
                         # Проверка баланса ДО отправки
-                        if not settings or settings.balance < cost:
+                        if not settings or settings.balance_outbound < cost:
                             ctx_logger.warning(f"Недостаточно средств ({settings.balance if settings else 0}) для Follow-up. Отмена.")
                             task.status = 'cancelled_no_funds'
                             task.processed_at = now_utc
                             await db_session.commit()
                             continue
-                        
+                        if settings.balance_outbound < settings.low_balance_threshold and not settings.notified_low_outbound:
+                            asyncio.create_task(send_system_alert(
+                                f"⚠️ Внимание! БАЛАНС РАССЫЛОК (Outbound) ниже {settings.low_balance_threshold} руб. "
+                                f"Текущий остаток: {settings.balance_outbound} руб.", alert_type="balance"
+                            ))
+                            settings.notified_low_outbound = True
+
+                        if settings.balance_outbound >= settings.low_balance_threshold:
+                            settings.notified_low_outbound = False
+
+                            
                         # 2. Отправка сообщения (Блокирующая операция)
                         # Мы удерживаем лок на AppSettings, пока ждем ответа от API. 
                         # Это гарантирует, что баланс не изменится "под ногами".
@@ -652,8 +662,8 @@ async def check_and_send_followups():
                         
                         if send_result == 200:
                             # УСПЕХ: Только теперь списываем деньги
-                            settings.balance -= cost
-                            settings.total_spent_on_followups += cost
+                            settings.balance_outbound -= cost
+                            settings.total_spent_followup += cost
                             
                              # --- [ANALYTICS] СТАРТ FOLLOW-UP ---
                             # --- [ANALYTICS] ВХОД В ВОРОНКУ FOLLOW-UP ---
@@ -911,14 +921,24 @@ async def process_mailing_tasks():
                         settings = settings_res.scalar_one_or_none()
                         
                         # Цена за "долгий" ремайндер/дожим
-                        cost = settings.cost_per_long_reminder if settings else Decimal('5.00')
+                        cost = settings.cost_per_reactivation if settings else Decimal('5.00')
                         
-                        if not settings or settings.balance < cost:
-                            logger.warning(f"[MailingTask #{task.id}] Недостаточно средств на балансе! Остаток: {settings.balance}. Остановка задачи.")
+                        if not settings or settings.balance_outbound < cost:
+                            logger.warning(f"[MailingTask #{task.id}] Недостаточно средств на балансе Outbound! Остановка.")
                             task.status = 'paused_no_funds'
                             await db.commit()
                             break # Прерываем цикл рассылки
-                        
+
+                        if settings.balance_outbound < settings.low_balance_threshold and not settings.notified_low_outbound:
+                            asyncio.create_task(send_system_alert(
+                                f"⚠️ Внимание! БАЛАНС РАССЫЛОК (Outbound) ниже {settings.low_balance_threshold} руб. "
+                                f"Текущий остаток: {settings.balance_outbound} руб.", alert_type="balance"
+                            ))
+                            settings.notified_low_outbound = True
+
+                        if settings.balance_outbound >= settings.low_balance_threshold:
+                            settings.notified_low_outbound = False
+
                         # --- ОТПРАВКА ---
                         logger.info(f"[MailingTask #{task.id}] Отправка для диалога ID {dialogue.id} (HH: {dialogue.hh_response_id})...")
                         
@@ -929,8 +949,8 @@ async def process_mailing_tasks():
                         if send_status == 200:
                             # УСПЕХ
                             # 1. Списываем деньги
-                            settings.balance -= cost
-                            settings.total_spent_on_reminders += cost # Считаем как ремайндеры
+                            settings.balance_outbound -= cost
+                            settings.total_spent_reactivation += cost
                             total_spent += cost
 
                             dialogue.current_mode = 'reactivation' # Режим рассылки

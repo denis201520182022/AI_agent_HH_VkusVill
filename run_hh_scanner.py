@@ -325,8 +325,8 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     continue
 
                 # ПРОВЕРКА БАЛАНСА
-                if settings.balance < settings.cost_per_dialogue:
-                    scan_logger.warning(f"Недостаточно средств на балансе ({settings.balance}). Отклик {response_id} пропущен.")
+                if settings.balance_standard < settings.cost_per_dialogue:
+                    scan_logger.warning(f"Недостаточно средств на стандартном балансе ({settings.balance_standard}). Отклик {response_id} пропущен.")
                     continue
 
                 NEW_RESPONSES_TOTAL.labels(recruiter_id=str(recruiter_id), vacancy_id=str(associated_vacancy_id_str)).inc() # <--- МЕТРИКА
@@ -399,8 +399,8 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
 
                 # СПИСАНИЕ СРЕДСТВ + СТАТИСТИКА
                 cost = settings.cost_per_dialogue
-                settings.balance -= cost
-                settings.total_spent_on_dialogues += cost # Увеличиваем счетчик диалогов
+                settings.balance_standard -= cost
+                settings.total_spent_standard += cost # Обновляем новый накопительный счетчик
 
                 # Пытаемся получить сообщения, но ошибка здесь НЕ ДОЛЖНА отменять создание диалога
                 try:
@@ -447,16 +447,17 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
 
                 # Проверка лимита для уведомления
                 # УВЕДОМЛЕНИЕ О НИЗКОМ БАЛАНСЕ
-                if settings.balance < settings.low_balance_threshold and not settings.low_limit_notified:
+                # Проверка порога для стандартного баланса
+                if settings.balance_standard < settings.low_balance_threshold and not settings.notified_low_standard:
                     asyncio.create_task(send_system_alert(
-                        f"⚠️ Внимание! Баланс ниже {settings.low_balance_threshold} руб. "
-                        f"Текущий остаток: {settings.balance} руб.", alert_type="balance"
+                        f"⚠️ Внимание! СТАНДАРТНЫЙ баланс (новые диалоги) ниже {settings.low_balance_threshold} руб. "
+                        f"Текущий остаток: {settings.balance_standard} руб.", alert_type="balance"
                     ))
-                    settings.low_limit_notified = True
+                    settings.notified_low_standard = True
 
-                # Если баланс пополнили выше порога, сбрасываем флаг (опционально, но удобно)
-                if settings.balance >= settings.low_balance_threshold:
-                    settings.low_limit_notified = False
+                # Сброс флага, если баланс пополнили
+                if settings.balance_standard >= settings.low_balance_threshold:
+                    settings.notified_low_standard = False
 
             except Exception as e:
                 err_logger = locals().get('scan_logger', rec_logger)

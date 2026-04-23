@@ -230,18 +230,30 @@ class AppSettings(Base):
     __tablename__ = 'app_settings'
     
     id = Column(Integer, primary_key=True)
-    # Используем server_default для базы данных и default для SQLAlchemy
-    balance = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
-    # Новые несбрасываемые счетчики
-    total_spent_on_dialogues = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
-    total_spent_on_reminders = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
-    cost_per_dialogue = Column(Numeric(10, 2), nullable=False, default=19.00, server_default='19.00')
-    cost_per_long_reminder = Column(Numeric(10, 2), nullable=False, default=5.00, server_default='5.00')
-    cost_per_followup = Column(Numeric(10, 2), nullable=False, default=10.00, server_default='10.00')
-    total_spent_on_followups = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
-    low_balance_threshold = Column(Numeric(10, 2), nullable=False, default=500.00, server_default='500.00')
-    low_limit_notified = Column(Boolean, nullable=False, default=False, server_default='false')
 
+    # --- БАЛАНСЫ ---
+    # Для новых диалогов (Scanner)
+    balance_standard = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
+    # Для Фоллоу-ап и Реактивации (Mailing / Follow-up)
+    balance_outbound = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
+
+    # --- ТАРИФЫ (ЦЕНЫ) ---
+    cost_per_dialogue = Column(Numeric(10, 2), nullable=False, default=19.00, server_default='19.00')
+    cost_per_followup = Column(Numeric(10, 2), nullable=False, default=10.00, server_default='10.00')
+    cost_per_reactivation = Column(Numeric(10, 2), nullable=False, default=5.00, server_default='5.00')
+
+    # --- НАКОПИТЕЛЬНЫЕ СЧЕТЧИКИ ТРАТ (ДЛЯ АНАЛИТИКИ) ---
+    total_spent_standard = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
+    total_spent_followup = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
+    total_spent_reactivation = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
+
+    # --- УВЕДОМЛЕНИЯ О ПОРОГАХ ---
+    low_balance_threshold = Column(Numeric(10, 2), nullable=False, default=500.00, server_default='500.00')
+    # Флаги, чтобы не спамить уведомлениями
+    notified_low_standard = Column(Boolean, nullable=False, default=False, server_default='false')
+    notified_low_outbound = Column(Boolean, nullable=False, default=False, server_default='false')
+
+    
     # --- НОВАЯ МОДЕЛЬ ДЛЯ УВЕДОМЛЕНИЙ О НЕАКТИВНЫХ КАНДИДАТАХ ---
 class InactiveNotificationQueue(Base):
     __tablename__ = 'inactive_notification_queue'
