@@ -977,6 +977,7 @@ async def process_mailing_tasks():
                             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
                             
                             messages_sent_count += 1
+                            task.messages_sent = messages_sent_count
                             MESSAGES_SENT_TOTAL.inc()
                             
                             # Небольшая пауза, чтобы не душить API

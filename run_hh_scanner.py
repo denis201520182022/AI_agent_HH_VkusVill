@@ -507,7 +507,7 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
             rec_logger.warning("Этап 2: Нет активных вакансий для проверки обновлений.")
             return
 
-        rec_logger.debug(
+        rec_logger.info(
             f"Этап 2: Проверка обновлений в папках 'Подумать' и 'Собеседование' "
             f"для {len(vacancy_ids)} вакансий..."
         )
@@ -540,17 +540,17 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
 
         for folder_name, (resp, _) in tagged_responses:
             response_id = resp.get('id')
-
+            logger.info(f"итерация for folder_name, (resp, _) in tagged_responses:")
             if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
                 continue
 
             dialogue_result = await db.execute(
-                select(Dialogue).filter_by(hh_response_id=response_id).with_for_update()
+                select(Dialogue).filter_by(hh_response_id=response_id).with_for_update(skip_locked=True)
             )
             dialogue = dialogue_result.scalar_one_or_none()
             
             if not dialogue:
-                logger.debug(f"Найдено обновление для отклика {response_id}, которого нет в нашей БД. Пропускаем.")
+                logger.info(f"Найдено обновление для отклика {response_id}, которого нет в нашей БД. Пропускаем.")
                 continue
             # 3. СОЗДАЕМ ЛОГГЕР УРОВНЯ ДИАЛОГА
             # Теперь все логи ниже будут содержать ID диалога и вакансии
@@ -575,7 +575,7 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
             api_get_messages_start = time.monotonic()
             all_messages_from_api = await hh_api.get_messages(recruiter, db, resp['messages_url'])
             
-            ctx_logger.debug(
+            ctx_logger.info(
                 f"[Recruiter {recruiter.name}, Dialogue {response_id}] "
                 f"API get_messages took: {time.monotonic() - api_get_messages_start:.2f} sec."
             )
