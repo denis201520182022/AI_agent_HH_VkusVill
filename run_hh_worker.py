@@ -897,7 +897,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 
     vacancy_context = (
         "[CRITICAL CONTEXT] Ниже представлено описание вакансии той, на которую откликнулся кандидат. "
-        "Используй ИСКЛЮЧИТЕЛЬНО эту информацию при ответах на вопросы о вакансии.\n" +
+        "Важно!!!У этой информации приоритет перед информацией в разделе '#FAQ (Частые вопросы кандидатов)'\n" +
         vacancy_description
     )
     prompt_pieces.insert(1, vacancy_context)
