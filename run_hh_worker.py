@@ -815,27 +815,35 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     """Собирает динамический системный промпт из блоков библиотеки (упрощенная версия с единым FAQ)."""
 
     required_blocks = ['#ROLE_AND_STYLE#']
-    # --- НОВЫЙ БЛОК: Выбор блока адреса в зависимости от города ---
-    # --- УЛУЧШЕННЫЙ БЛОК: Выбор логики адреса и процесса ---
+    # --- ЛОГИКА ВЫБОРА БЛОКА АДРЕСА ---
     target_cities = ['санкт-петербург', 'мурино', 'кудрово']
     is_spb_city = any(city in (city_name or "").lower() for city in target_cities)
     
-    # Список исключений (те же, что используются в логике принятия решения)
+    current_title_lower = (vacancy_title or "").lower()
+
+    # Список 1: Исключения для Питера (идут в #ADRESS_OTHER#)
     excluded_vacancies = [
         'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
-        'уборщик', 'уборщица', 'помошник повара',
-        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
-        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
+        'уборщик', 'уборщица', 'помошник повара'
     ]
-    current_title_lower = (vacancy_title or "").lower()
-    is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
+    
+    # Список 2: Сборщики для Питера (идут в #ADRESS_SPB_1#)
+    sborshik_vacancies = [
+        'сборщик', 'комплектовщик', 'упаковщик'
+    ]
 
-    # Используем блок СПб только если это СПб И это НЕ исключенная вакансия
-    # (потому что для исключенных вакансий в СПб процесс такой же, как в регионах — звонок рекрутера)
-    if is_spb_city and not is_excluded_vacancy:
-        required_blocks.append('#ADRESS_SPB#')
-    else:
+    is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
+    is_sborshik_vacancy = any(phrase in current_title_lower for phrase in sborshik_vacancies)
+
+    if not is_spb_city or is_excluded_vacancy:
+        # Если не Питер ИЛИ это исключение (повар и т.д.)
         required_blocks.append('#ADRESS_OTHER#')
+    elif is_sborshik_vacancy:
+        # Если Питер И это сборщик/комплектовщик/упаковщик
+        required_blocks.append('#ADRESS_SPB_1#')
+    else:
+        # Если Питер И любая другая вакансия (например, продавец)
+        required_blocks.append('#ADRESS_SPB_2#')
     # --------------------------------------------------------------
     state_specific_blocks = {
         'initial_processing': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
