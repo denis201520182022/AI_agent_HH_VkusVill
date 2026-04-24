@@ -284,7 +284,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 # --- БЕЗОПАСНЫЙ ДОСТУП К ДАННЫМ РЕЗЮМЕ ---
                 resume_info = resp.get('resume')
                 if not resume_info:
-                    rec_logger.debug(f"Отклик {response_id} без резюме. Пропуск.")
+                    rec_logger.info(f"Отклик {response_id} без резюме. Пропуск.")
                     continue
 
                 candidate_first_name = resume_info.get('first_name', 'Неизвестно')
@@ -305,15 +305,16 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     "action": "new_response_found"
                 })
                 # -----------------------------------------
-                scan_logger.debug(f"Начинаю детальную обработку отклика. Вакансия (HH ID): {associated_vacancy_id_str}")
+                scan_logger.info(f"Начинаю детальную обработку отклика. Вакансия (HH ID): {associated_vacancy_id_str}")
                 if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
+                    scan_logger.info("Пропуск отклика")
                     continue
 
                 # Проверка существования
                 exists_query = select(func.count()).select_from(Dialogue).filter_by(hh_response_id=response_id)
                 result = await db.execute(exists_query)
                 if result.scalar() > 0:
-                    scan_logger.warning(
+                    scan_logger.error(
                         f"⚠️ Отклик {response_id} найден в 'response', но диалог уже есть в БД. "
                         f"Выполняю повторный перенос в 'consider'."
                     )
@@ -411,7 +412,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 # --- КРИТИЧЕСКИЙ МОМЕНТ: ПЕРЕМЕЩЕНИЕ ---
                 # Сначала перемещаем, чтобы зафиксировать намерение
                 await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')
-
+                scan_logger.info("Перемещен в консидер")
                 # СПИСАНИЕ СРЕДСТВ + СТАТИСТИКА
                 cost = settings.cost_per_dialogue
                 settings.balance_standard -= cost
