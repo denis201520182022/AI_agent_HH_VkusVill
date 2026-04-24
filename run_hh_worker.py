@@ -1809,7 +1809,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             v_weekday = weekdays_ru[weekday_idx]
                             
                             # Проверка на праздники (Feb 23 и т.д.) и Воскресенье ПРЯМО ЗДЕСЬ
-                            is_feb_23 = (v_date_obj.month == 2 and v_date_obj.day == 23)
+                            holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
+                            is_holiday = (v_date_obj.month, v_date_obj.day) in holidays
                             is_sunday = (weekday_idx == 6)
                             
                         except Exception:
@@ -1834,10 +1835,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         # ФОРМИРУЕМ ТЕКСТ КОМАНДЫ (Разрешение конфликта)
                         correction_content = "" # Инициализация
                         
-                        if is_sunday or is_feb_23:
-                            # СЦЕНАРИЙ: Аудитор нашел дату, но она ЗАПРЕЩЕНА.
-                            # Мы говорим модели: "Юзер хочет эту дату, но она плохая. СБРОСЬ дату в JSON".
-                            reason_msg = "это воскресенье" if is_sunday else "это праздничный день (23 февраля)"
+                        if is_sunday or is_holiday:
+                            reason_msg = "это воскресенье" if is_sunday else "это праздничный день"
                             
                             correction_content = (
                                 f"[SYSTEM COMMAND] Ты ошибся в интерпретации. Пользователь имел в виду {verified_date} ({v_weekday}), но {reason_msg}, когда собеседования НЕ проводятся. "
@@ -1891,7 +1890,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                     # 2. Вычисляем данные о выбранной дате
                     v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
-                    is_feb_23 = (v_date_obj.month == 2 and v_date_obj.day == 23)
+                    holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
+                    is_holiday = (v_date_obj.month, v_date_obj.day) in holidays
                     weekday_idx = v_date_obj.weekday()  # 0 = Пн, 6 = Вс
                     weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
                     correct_weekday = weekdays_ru[weekday_idx]
@@ -1909,7 +1909,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     is_warehouse = any(word in current_title_low for word in warehouse_keywords)
 
                     # 3. Определяем базовые слоты по регламенту
-                    if weekday_idx == 6 or is_feb_23:  # Добавили проверку на 23 февраля
+                    if weekday_idx == 6 or is_holiday:  # Добавили проверку на 23 февраля
                         slots = []
                     elif weekday_idx == 5:  # Суббота
                         slots = ["14:00"]
@@ -1927,10 +1927,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # ---------------------------------------
 
                     # 4. Формируем текст инструкции
-                    if is_feb_23:
+                    if is_holiday:
                         hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} — это ПРАЗДНИК (23 февраля)!!! "
-                            f"В праздничные дни собеседования не проводятся. Запись невозможна. Предложи другой день."
+                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} — это праздничный день!!! "
+                            f"В праздничные дни офисы закрыты и собеседования не проводятся. Запись невозможна. Предложи другой день."
                         )
 
                     elif weekday_idx == 6:
@@ -1998,8 +1998,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
                     ]
                     is_warehouse = any(word in (dialogue.vacancy.title or "").lower() for word in warehouse_keywords)
-                    is_feb_23 = (v_date_obj.month == 2 and v_date_obj.day == 23) # <--- НОВАЯ СТРОКА
-                    if weekday_idx == 6 or is_feb_23: # Добавили проверку
+                    holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
+                    is_holiday = (v_date_obj.month, v_date_obj.day) in holidays # <--- НОВАЯ СТРОКА
+                    if weekday_idx == 6 or is_holiday:
                         allowed_slots = []
                     elif weekday_idx == 5: # Сб
                         allowed_slots = ["14:00"]
@@ -2023,8 +2024,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         # Формируем текст ошибки
                         if not allowed_slots:
                             
-                            if is_feb_23:
-                                error_msg = f"23 февраля ({interview_date}) — праздничный день, офисы закрыты, собеседования не проводятся."
+                            if is_holiday:
+                                error_msg = f"{interview_date} — праздничный день, офисы закрыты, собеседования не проводятся."
                             elif weekday_idx == 6:
                                 error_msg = f"По воскресеньям ({interview_date}) собеседования не проводятся."
                             else:
