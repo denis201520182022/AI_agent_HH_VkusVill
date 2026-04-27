@@ -2,12 +2,25 @@ import os
 import asyncio
 import logging
 from aiogram import Bot
+from aiogram.client.session.aiohttp import AiohttpSession
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from hr_bot.db.models import SessionLocal, TelegramUser
 
 # Инициализируем логгер
 logger = logging.getLogger(__name__)
+
+def get_session():
+    """Создает сессию для работы через прокси, если они настроены."""
+    host = os.getenv("SQUID_PROXY_HOST", "").strip('"')
+    port = os.getenv("SQUID_PROXY_PORT", "").strip('"')
+    user = os.getenv("SQUID_PROXY_USER", "").strip('"')
+    password = os.getenv("SQUID_PROXY_PASSWORD", "").strip('"')
+    
+    if host and port:
+        proxy_url = f"http://{user}:{password}@{host}:{port}"
+        return AiohttpSession(proxy=proxy_url)
+    return None
 
 async def send_system_alert(message_text: str, alert_type: str = "admin_only"):
     """
@@ -24,8 +37,9 @@ async def send_system_alert(message_text: str, alert_type: str = "admin_only"):
           Отправляется ВСЕМ.
     """
     
-    # Создаем объект бота внутри функции, чтобы всегда использовать актуальный токен
-    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"))
+    # Создаем сессию и объект бота внутри функции
+    session = get_session()
+    bot = Bot(token=os.getenv("TELEGRAM_BOT_TOKEN"), session=session)
     
     async with SessionLocal() as db:
         try:

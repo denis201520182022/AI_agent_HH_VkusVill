@@ -1073,9 +1073,9 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         # Фиксируем подтвержденную неявку
         await log_analytics_event(db, dialogue, 'followup_no_show')
     
-    if intent == 'reschedule_process':
-        # Фиксируем запрос на перенос
-        await log_analytics_event(db, dialogue, 'followup_rescheduled')
+    # if intent == 'reschedule_process':
+    #     # Фиксируем запрос на перенос
+    #     await log_analytics_event(db, dialogue, 'followup_rescheduled')
     # ---------------------------------------------
 
 
@@ -1088,7 +1088,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         ctx_logger.info("Follow-up: Кандидат согласился на перезапись. Переключаем на основной алгоритм.")
         await log_analytics_event(db, dialogue, 'followup_rescheduled')
         dialogue.is_followup = False
-        dialogue.current_mode = 'standard'
+        # dialogue.current_mode = 'standard'
         dialogue.need_follow_up_resheduled_sent = True
         dialogue.dialogue_state = 'init_scheduling_spb' # Было .state (исправлено)
         # 2. Сохраняем реальные сообщения КАНДИДАТА в историю
@@ -1323,15 +1323,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # --- [ANALYTICS] ОТВЕТ ПОЛЬЗОВАТЕЛЯ ---
         # Если диалог в режиме реактивации и есть новые сообщения от юзера,
         # проверяем, был ли это первый ответ, и логируем.
-        if dialogue.pending_messages:
-            # Проверяем, есть ли там реальные сообщения от юзера, а не наши system commands
-            has_user_msg = any(
-                (isinstance(m, dict) and m.get('role') == 'user' and not m.get('content', '').startswith('[SYSTEM COMMAND]'))
-                for m in dialogue.pending_messages
-            )
-            if has_user_msg:
-                # check_duplicates=True гарантирует, что мы запишем только ПЕРВЫЙ ответ в этой рассылке
-                await log_analytics_event(db, dialogue, 'user_reply', check_duplicates=True)
+        # if dialogue.pending_messages:
+        #     # Проверяем, есть ли там реальные сообщения от юзера, а не наши system commands
+        #     has_user_msg = any(
+        #         (isinstance(m, dict) and m.get('role') == 'user' and not m.get('content', '').startswith('[SYSTEM COMMAND]'))
+        #         for m in dialogue.pending_messages
+        #     )
+        #     if has_user_msg:
+        #         # check_duplicates=True гарантирует, что мы запишем только ПЕРВЫЙ ответ в этой рассылке
+        #         await log_analytics_event(db, dialogue, 'user_reply', check_duplicates=True)
         # --------------------------------------
 
 

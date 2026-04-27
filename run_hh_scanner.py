@@ -409,6 +409,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 from hr_bot.utils.analytics import log_analytics_event # Если нет в импортах сверху
                 await log_analytics_event(db, dialogue, 'response_created')
                 
+                
                 # --- КРИТИЧЕСКИЙ МОМЕНТ: ПЕРЕМЕЩЕНИЕ ---
                 # Сначала перемещаем, чтобы зафиксировать намерение
                 await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')

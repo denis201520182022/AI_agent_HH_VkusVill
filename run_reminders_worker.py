@@ -159,6 +159,30 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                 # Логика времени
                 dialogue_last_updated = dialogue.last_updated or dialogue.created_at
                 time_since_update = now - dialogue_last_updated
+                # --- НОВАЯ ЛОГИКА: ТАЙМАУТ ДЛЯ РЕАКТИВАЦИИ (РАССЫЛОК) ---
+                if dialogue.current_mode == 'reactivation' and dialogue.status == 'in_progress':
+                    if time_since_update > datetime.timedelta(hours=3):
+                        # Проверяем, что последнее сообщение было от бота (assistant)
+                        history = dialogue.history or []
+                        # Ищем последнее значимое сообщение (не системную команду)
+                        last_message_role = None
+                        for msg in reversed(history):
+                            if "[SYSTEM COMMAND]" not in msg.get('content', ''):
+                                last_message_role = msg.get('role')
+                                break
+                        
+                        if last_message_role == 'assistant':
+                            ctx_logger.info(f"Диалог {dialogue_hh_id} (реактивация) молчит > 3ч. Перевод в timed_out.")
+                            
+                            dialogue.status = 'timed_out'
+                            # Сбрасываем режим, чтобы он снова мог попасть под рассылку или обычные дожимы
+                            
+                            dialogue.last_updated = now
+                            
+                            await log_analytics_event(db, dialogue, 'timed_out')
+                            await db.commit()
+                            return # Выходим, так как диалог обработан
+                # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
                 reminder_messages = []
                 next_level = None
@@ -816,16 +840,19 @@ async def run_reminders_cycle(target_recruiter_ids=None):
 async def process_mailing_tasks():
     """
     Фоновая задача для обработки массовых рассылок (MailingTask).
-    Версия: Порционная (BATCH), с учетом времени тишины и сохранением прогресса.
+    Версия: Высокопроизводительная (PARALLEL BATCH) с фильтрацией живых рекрутеров.
     """
-    logger.info("Запущен обработчик задач рассылки (MailingTask).")
-    BATCH_SIZE = 20 # Оптимальный размер порции
+    logger.info("Запущен оптимизированный обработчик задач рассылки (MailingTask).")
+    BATCH_SIZE = 50  # Увеличили размер пачки
+    CONCURRENT_LIMIT = 5  # Сколько сообщений слать одновременно (чтобы не забанил HH)
+    
+    semaphore = asyncio.Semaphore(CONCURRENT_LIMIT)
 
     while True:
         if shutdown_requested:
             break
 
-        # 1. ПРОВЕРКА ВРЕМЕНИ ТИШИНЫ (как в дожимах)
+        # 1. ПРОВЕРКА ВРЕМЕНИ ТИШИНЫ
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         current_time_spb = now_utc.astimezone(SPB_TIMEZONE)
         if not (REMINDER_START_HOUR_LOCAL <= current_time_spb.hour < REMINDER_END_HOUR_LOCAL):
@@ -834,7 +861,7 @@ async def process_mailing_tasks():
 
         async with SessionLocal() as db:
             try:
-                # 2. ИЩЕМ ЗАДАЧУ (берем либо ту, что в процессе, либо новую)
+                # 2. ИЩЕМ ЗАДАЧУ
                 stmt = (
                     select(MailingTask)
                     .filter(MailingTask.status.in_(['pending', 'in_progress']))
@@ -846,23 +873,26 @@ async def process_mailing_tasks():
                 task = result.scalar_one_or_none()
 
                 if not task:
-                    await asyncio.sleep(20) # Нет задач - отдыхаем
+                    await asyncio.sleep(20)
                     continue
 
-                # 3. ЕСЛИ ЗАДАЧА НОВАЯ - ИНИЦИАЛИЗИРУЕМ
+                # 3. ИНИЦИАЛИЗАЦИЯ НОВОЙ ЗАДАЧИ (с фильтром по активным рекрутерам)
                 if task.status == 'pending':
                     task.status = 'in_progress'
                     task.processed_at = now_utc
                     
-                    # Считаем общее кол-во кандидатов один раз для статистики
                     count_query = (
                         select(func.count(Dialogue.id))
                         .join(Dialogue.vacancy)
+                        .join(Dialogue.recruiter) # Присоединяем для фильтрации
                         .filter(
                             Dialogue.status == 'timed_out',
                             Dialogue.dialogue_state.notin_(['vacancy_closed_or_resume_not_found', 'refusal']),
                             Dialogue.last_updated <= now_utc - datetime.timedelta(days=task.days_silent_min),
-                            Dialogue.last_updated >= now_utc - datetime.timedelta(days=task.days_silent_max)
+                            Dialogue.last_updated >= now_utc - datetime.timedelta(days=task.days_silent_max),
+                            # ФИЛЬТР: Только активные с токенами
+                            TrackedRecruiter.is_auth_active == True,
+                            TrackedRecruiter.access_token.isnot(None)
                         )
                     )
                     if task.vacancy_pattern:
@@ -873,23 +903,26 @@ async def process_mailing_tasks():
                     count_res = await db.execute(count_query)
                     task.candidates_found = count_res.scalar()
                     await db.commit()
-                    logger.info(f"[MailingTask #{task.id}] Старт. Найдено кандидатов: {task.candidates_found}")
+                    logger.info(f"[MailingTask #{task.id}] Старт. Найдено активных кандидатов: {task.candidates_found}")
 
-                # 4. ВЫБИРАЕМ ПОРЦИЮ (BATCH) ДИАЛОГОВ
+                # 4. ВЫБИРАЕМ ПОРЦИЮ ДИАЛОГОВ (с фильтром по активным рекрутерам)
                 cutoff_recent = now_utc - datetime.timedelta(days=task.days_silent_min)
                 cutoff_oldest = now_utc - datetime.timedelta(days=task.days_silent_max)
 
                 query = (
                     select(Dialogue)
                     .join(Dialogue.vacancy)
+                    .join(Dialogue.recruiter) # Присоединяем рекрутера
                     .options(selectinload(Dialogue.recruiter), selectinload(Dialogue.vacancy))
                     .filter(
                         Dialogue.status == 'timed_out',
                         Dialogue.dialogue_state.notin_(['vacancy_closed_or_resume_not_found', 'refusal']),
                         Dialogue.last_updated <= cutoff_recent,
                         Dialogue.last_updated >= cutoff_oldest,
-                        # Берем тех, кому еще не слали в этой задаче
-                        (Dialogue.active_mailing_task_id != task.id) | (Dialogue.active_mailing_task_id == None)
+                        (Dialogue.active_mailing_task_id != task.id) | (Dialogue.active_mailing_task_id == None),
+                        # ФИЛЬТР: Пропускаем диалоги неактивных рекрутеров
+                        TrackedRecruiter.is_auth_active == True,
+                        TrackedRecruiter.access_token.isnot(None)
                     )
                     .limit(BATCH_SIZE)
                 )
@@ -902,86 +935,107 @@ async def process_mailing_tasks():
                 batch = res.scalars().all()
 
                 if not batch:
-                    # КАНДИДАТЫ ЗАКОНЧИЛИСЬ
                     task.status = 'completed'
                     task.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     await db.commit()
                     logger.info(f"[MailingTask #{task.id}] Полностью завершена.")
                     continue
 
-                # 5. ЦИКЛ ОТПРАВКИ ВНУТРИ ПОРЦИИ
-                for dialogue in batch:
-                    if shutdown_requested: break
-                    
-                    try:
-                        # --- БЛОК ОПЛАТЫ И АЛЕРТОВ (ИЗ СТАРОЙ ФУНКЦИИ) ---
-                        settings_res = await db.execute(select(AppSettings).filter_by(id=1).with_for_update())
-                        settings = settings_res.scalar_one_or_none()
-                        cost = settings.cost_per_reactivation if settings else Decimal('5.00')
+                # 5. ФУНКЦИЯ ДЛЯ ПАРАЛЛЕЛЬНОЙ ОБРАБОТКИ ОДНОГО ДИАЛОГА
+                async def process_single_candidate(d_id):
+                    async with semaphore:
+                        # Каждому кандидату своя сессия, чтобы не мешать другим и быстро коммитить
+                        async with SessionLocal() as local_db:
+                            try:
+                                # Подгружаем диалог и настройки внутри сессии
+                                stmt_d = select(Dialogue).options(selectinload(Dialogue.recruiter)).filter(Dialogue.id == d_id).with_for_update()
+                                d_res = await local_db.execute(stmt_d)
+                                dialogue = d_res.scalar_one_or_none()
+                                
+                                settings_res = await local_db.execute(select(AppSettings).filter_by(id=1).with_for_update())
+                                settings = settings_res.scalar_one_or_none()
+                                
+                                if not dialogue or not settings: return False
+                                
+                                cost = settings.cost_per_reactivation
+                                if settings.balance_outbound < cost:
+                                    return "out_of_funds"
 
-                        if not settings or settings.balance_outbound < cost:
-                            task.status = 'paused_no_funds'
-                            await db.commit()
-                            logger.warning(f"[MailingTask #{task.id}] Остановка: нет денег.")
-                            break 
+                                # Проверка порогов баланса
+                                if settings.balance_outbound < settings.low_balance_threshold and not settings.notified_low_outbound:
+                                    asyncio.create_task(send_system_alert(
+                                        f"⚠️ БАЛАНС РАССЫЛОК ниже {settings.low_balance_threshold} руб. Оставлось: {settings.balance_outbound} руб."
+                                    ))
+                                    settings.notified_low_outbound = True
+                                elif settings.balance_outbound >= settings.low_balance_threshold:
+                                    settings.notified_low_outbound = False
 
-                        # Проверка порога баланса (Алерты)
-                        if settings.balance_outbound < settings.low_balance_threshold and not settings.notified_low_outbound:
-                            asyncio.create_task(send_system_alert(
-                                f"⚠️ Внимание! БАЛАНС РАССЫЛОК (Outbound) ниже {settings.low_balance_threshold} руб. Текущий остаток: {settings.balance_outbound} руб."
-                            ))
-                            settings.notified_low_outbound = True
-                        elif settings.balance_outbound >= settings.low_balance_threshold:
-                            settings.notified_low_outbound = False
+                                # ОТПРАВКА
+                                status = await hh_api.send_message(dialogue.recruiter, local_db, dialogue.hh_response_id, task.message_text)
+                                
+                                if status == 200:
+                                    settings.balance_outbound -= cost
+                                    settings.total_spent_reactivation += cost
+                                    
+                                    dialogue.current_mode = 'reactivation'
+                                    dialogue.status = 'in_progress'
+                                    dialogue.active_mailing_task_id = task.id
+                                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                                    
+                                    new_history = {
+                                        'role': 'assistant',
+                                        'content': task.message_text,
+                                        'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK'),
+                                        'type': 'mass_mailing'
+                                    }
+                                    dialogue.history = (list(dialogue.history) if dialogue.history else []) + [new_history]
+                                    
+                                    await log_analytics_event(local_db, dialogue, 'reactivation_sent')
+                                    MESSAGES_SENT_TOTAL.inc()
+                                    await local_db.commit()
+                                    return "sent"
+                                
+                                elif status == 403:
+                                    dialogue.status = 'vacancy_closed_or_resume_not_found'
+                                    dialogue.active_mailing_task_id = task.id
+                                    await local_db.commit()
+                                    return "closed"
+                                
+                                return "error"
+                            except Exception as e:
+                                logger.error(f"Ошибка в процессе отправки диалога {d_id}: {e}")
+                                return "error"
 
-                        # --- ОТПРАВКА ---
-                        status = await hh_api.send_message(dialogue.recruiter, db, dialogue.hh_response_id, task.message_text)
-                        
-                        if status == 200:
-                            # 1. Деньги
-                            settings.balance_outbound -= cost
-                            settings.total_spent_reactivation += cost
-                            task.total_cost = (task.total_cost or 0) + cost
-                            
-                            # 2. Диалог
-                            dialogue.current_mode = 'reactivation'
-                            dialogue.active_mailing_task_id = task.id
-                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                            
-                            # 3. История
-                            new_history = {
-                                'role': 'assistant',
-                                'content': task.message_text,
-                                'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK'),
-                                'type': 'mass_mailing'
-                            }
-                            dialogue.history = (list(dialogue.history) if dialogue.history else []) + [new_history]
-                            
-                            # 4. Аналитика и счетчики
-                            await log_analytics_event(db, dialogue, 'reactivation_sent')
-                            task.messages_sent += 1
-                            MESSAGES_SENT_TOTAL.inc()
-                            
-                            await db.commit()
-                            await asyncio.sleep(1.5) # Пауза между сообщениями
+                # 6. ЗАПУСК ПАРАЛЛЕЛЬНОЙ ПАЧКИ
+                tasks_to_run = [process_single_candidate(d.id) for d in batch]
+                results = await asyncio.gather(*tasks_to_run)
 
-                        elif status == 403:
-                            dialogue.status = 'vacancy_closed_or_resume_not_found'
-                            dialogue.active_mailing_task_id = task.id
-                            await db.commit()
-                        else:
-                            logger.error(f"HH API error {status} for dialogue {dialogue.id}")
+                # 7. ОБНОВЛЕНИЕ СТАТИСТИКИ ЗАДАЧИ
+                sent_count = results.count("sent")
+                
+                # Снова лочим задачу, чтобы обновить общие счетчики
+                stmt_task = select(MailingTask).filter(MailingTask.id == task.id).with_for_update()
+                res_task = await db.execute(stmt_task)
+                current_task = res_task.scalar_one()
+                
+                current_task.messages_sent += sent_count
+                # Суммируем затраты
+                cost_per_one = (await db.execute(select(AppSettings.cost_per_reactivation))).scalar() or Decimal('5.00')
+                current_task.total_cost = (current_task.total_cost or 0) + (sent_count * cost_per_one)
 
-                    except Exception as e:
-                        logger.error(f"Ошибка в под-цикле рассылки: {e}")
-                        await db.rollback()
+                if "out_of_funds" in results:
+                    current_task.status = 'paused_no_funds'
+                    logger.warning(f"[MailingTask #{task.id}] Остановка: недостаточно средств на балансе Outbound.")
+
+                await db.commit()
+                logger.info(f"[MailingTask #{task.id}] Обработана пачка {len(batch)}. Успешно отправлено: {sent_count}")
 
             except Exception as e:
                 logger.error(f"Критическая ошибка MailingTask: {e}", exc_info=True)
                 await db.rollback()
 
-        # Пауза между пачками
-        await asyncio.sleep(10)
+        # Маленькая пауза между пачками, чтобы не перегружать CPU
+        await asyncio.sleep(5)
 
 
 # --- ИСПРАВЛЕНИЕ: Убрали лишний отступ у main (вынесли из предыдущей функции) ---

@@ -8,6 +8,7 @@ from aiogram.filters import CommandStart, Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import func, cast, Date
+from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from aiogram.utils.formatting import Text, Bold, Italic
 from aiogram.utils.keyboard import InlineKeyboardBuilder # <-- Добавить
@@ -141,14 +142,47 @@ async def process_mailing_days(message: Message, state: FSMContext):
     except:
         await message.answer("❌ Неверный формат. Введите два числа через дефис, например: <code>7-30</code>", parse_mode="HTML")
 
-# 6. Собираем Текст и показываем Превью
+# 6. Собираем Текст и показываем Превью с расчетом кандидатов
 @router.message(MailingTaskStates.waiting_for_message)
-async def process_mailing_text(message: Message, state: FSMContext):
+async def process_mailing_text(message: Message, state: FSMContext, db_session: Session):
     await state.update_data(message_text=message.text)
     data = await state.get_data()
     
+    # --- ЛОГИКА РАСЧЕТА (ИДЕНТИЧНА ВОРКЕРУ) ---
+    # Мы используем datetime.now(timezone.utc) для чистого сравнения с last_updated
+    # --- ЛОГИКА РАСЧЕТА (ПОЛНАЯ КОПИЯ БОЕВОГО ВОРКЕРА) ---
+    now_utc = datetime.now(timezone.utc)
+    cutoff_recent = now_utc - timedelta(days=data['days_min'])
+    cutoff_oldest = now_utc - timedelta(days=data['days_max'])
+
+    query = (
+        db_session.query(func.count(Dialogue.id))
+        .join(Vacancy, Dialogue.vacancy_id == Vacancy.id)
+        .join(TrackedRecruiter, Dialogue.recruiter_id == TrackedRecruiter.id)
+        .filter(
+            Dialogue.status == 'timed_out',
+            Dialogue.dialogue_state.notin_(['vacancy_closed_or_resume_not_found', 'refusal']),
+            Dialogue.last_updated <= cutoff_recent,
+            Dialogue.last_updated >= cutoff_oldest,
+            # ФИЛЬТРЫ РЕКРУТЕРА (как в блоке #3 и #4 воркера)
+            TrackedRecruiter.is_auth_active == True,
+            TrackedRecruiter.access_token.isnot(None) 
+        )
+    )
+
+    # Логика паттернов (в воркере f"%{task.vacancy_pattern}%")
+    if data['vacancy_pattern'] and data['vacancy_pattern'] != '%':
+        query = query.filter(Vacancy.title.ilike(f"%{data['vacancy_pattern']}%"))
+    
+    if data['city_pattern'] and data['city_pattern'] != '%':
+        query = query.filter(Vacancy.city.ilike(f"%{data['city_pattern']}%"))
+
+    candidates_count = query.scalar() or 0
+    # ------------------------------------------
+
     preview = (
         f"📋 <b>Проверка параметров рассылки:</b>\n\n"
+        f"👥 Будет охвачено: <b>{candidates_count} чел.</b>\n"
         f"🔹 Вакансия: <code>{data['vacancy_pattern']}</code>\n"
         f"🔹 Город: <code>{data['city_pattern']}</code>\n"
         f"🔹 Молчание: от <b>{data['days_min']}</b> до <b>{data['days_max']}</b> дней\n\n"
@@ -160,11 +194,18 @@ async def process_mailing_text(message: Message, state: FSMContext):
     
     # Создаем кнопку подтверждения
     kb = InlineKeyboardBuilder()
+    
+    # Кнопку запуска показываем в любом случае, чтобы пользователь видел результат
     kb.button(text="✅ ЗАПУСТИТЬ", callback_data="confirm_mailing_start")
     kb.button(text="❌ ОТМЕНА", callback_data="cancel_fsm")
     kb.adjust(1)
     
     await state.set_state(MailingTaskStates.waiting_for_confirmation)
+    
+    # Если кандидатов 0, просто добавим предупреждение в текст, но не ломаем интерфейс
+    if candidates_count == 0:
+        preview += "\n\n⚠️ <b>Внимание:</b> По вашим фильтрам найдено 0 кандидатов. Если запустите, рассылка сразу завершится."
+
     await message.answer(preview, reply_markup=kb.as_markup(), parse_mode="HTML")
 
 # 7. Финал: Сохранение в БД
@@ -225,55 +266,94 @@ def _build_reactivation_7day_stats_content(db_session: Session) -> Text:
     has_any_data = False
 
     for day in days:
-        # 1. Сначала находим "базу": все пары (dialogue_id, mailing_task_id), 
-        # которым была отправлена рассылка именно в этот день.
-        base_candidates = db_session.query(
-            AnalyticsEvent.dialogue_id, 
+        # 1. Находим "базу": пары (диалог + рассылка), где отправка сообщения была именно в этот день
+        # Это гарантирует, что мы анализируем результаты рассылок, запущенных в дату 'day'
+        base_sent = db_session.query(
+            AnalyticsEvent.dialogue_id,
             AnalyticsEvent.mailing_task_id
         ).filter(
             AnalyticsEvent.event_type == 'reactivation_sent',
+            AnalyticsEvent.mode == 'reactivation',
             cast(AnalyticsEvent.created_at, Date) == day
         ).subquery()
 
-        # 2. Теперь для этих же кандидатов и тех же задач собираем все последующие события
-        # (ответы, собесы, отказы), которые могли произойти когда угодно позже.
-        funnel_events = db_session.query(
-            AnalyticsEvent.event_type,
-            func.count(func.distinct(AnalyticsEvent.dialogue_id))
+        # 2. Собираем все флаги событий для этих пар. 
+        # Группировка по (dialogue_id, mailing_task_id) делает воронку уникальной.
+        # Берем события ТОЛЬКО с mode='reactivation'
+        results = db_session.query(
+            AnalyticsEvent.dialogue_id,
+            func.max(cast(AnalyticsEvent.event_type == 'user_reply', Integer)).label('has_reply'),
+            func.max(cast(AnalyticsEvent.event_type == 'interview_assigned', Integer)).label('has_interview'),
+            func.max(cast(AnalyticsEvent.event_type == 'rejected_by_bot', Integer)).label('has_bot_rej'),
+            func.max(cast(AnalyticsEvent.event_type == 'refusal_by_user', Integer)).label('has_user_ref'),
+            func.max(cast(AnalyticsEvent.event_type == 'timed_out', Integer)).label('has_timeout')
         ).join(
-            base_candidates, 
+            base_sent,
             and_(
-                AnalyticsEvent.dialogue_id == base_candidates.c.dialogue_id,
-                AnalyticsEvent.mailing_task_id == base_candidates.c.mailing_task_id
+                AnalyticsEvent.dialogue_id == base_sent.c.dialogue_id,
+                AnalyticsEvent.mailing_task_id == base_sent.c.mailing_task_id
             )
-        ).group_by(AnalyticsEvent.event_type).all()
+        ).filter(
+            AnalyticsEvent.mode == 'reactivation'
+        ).group_by(
+            AnalyticsEvent.dialogue_id,
+            AnalyticsEvent.mailing_task_id
+        ).all()
 
-        stats = {e[0]: e[1] for e in funnel_events}
+        sent_total = len(results)
 
-        # База рассылки за этот день
-        sent = stats.get('reactivation_sent', 0)
-        
-        if sent > 0:
+        if sent_total > 0:
             has_any_data = True
             
-            awakened = stats.get('user_reply', 0)
-            success = stats.get('interview_assigned', 0)
-            rejected_bot = stats.get('rejected_by_bot', 0)
-            refusal_user = stats.get('refusal_by_user', 0)
-            timeout = stats.get('timed_out', 0)
-            
-            # Конверсия из "Отправлено" в "Ответ"
-            conv_reply = round((awakened / sent * 100), 1) if sent > 0 else 0
+            replied_count = 0
+            success_count = 0      # Записаны
+            refusal_bot_count = 0  # Отказ бот
+            refusal_user_count = 0 # Отказ сам
+            timeout_count = 0      # Снова уснули
+            in_progress_count = 0  # В работе
 
+            for d in results:
+                # В статистику ответов попадают те, кто совершил 'user_reply' в режиме реактивации
+                if d.has_reply:
+                    replied_count += 1
+                    
+                    # --- САМОИСКЛЮЧАЮЩАЯ ВОРОНКА (ПРИОРИТЕТЫ) ---
+                    # ПРИОРИТЕТ 2: Собеседование (Записаны)
+                    # Попадет сюда, только если не было отказа
+                    if d.has_interview:
+                        success_count += 1
+                    # ПРИОРИТЕТ 1: Любой отказ (Самый жесткий финал)
+                    # Если есть и отказ, и собес - считаем в отказ по твоей логике
+                    elif d.has_user_ref:
+                        refusal_user_count += 1
+                    elif d.has_bot_rej:
+                        refusal_bot_count += 1
+                    
+                    
+                    
+                    # ПРИОРИТЕТ 3: Снова уснули (Timed Out)
+                    # Попадет сюда, если не было ни отказа, ни собеса, но сработал таймаут
+                    elif d.has_timeout:
+                        timeout_count += 1
+                    
+                    # ПРИОРИТЕТ 4: В работе
+                    # Ответил, но еще не дошел ни до одного из финальных статусов выше
+                    else:
+                        in_progress_count += 1
+
+            # Конверсия из "Отправлено" в "Ответ"
+            conv_reply = round((replied_count / sent_total * 100), 1) if sent_total > 0 else 0
             day_str = day.strftime('%d.%m (%a)')
+
             content_parts.extend([
                 Bold(f"📅 Рассылка от {day_str}"), "\n",
-                f"   📤 Отправлено: {sent}\n",
-                f"   💬 Ответило: {awakened} ", Italic(f"({conv_reply}%)"), "\n",
-                f"   ✅ Записаны: {success}\n",
-                f"   🤖 Отказ (бот): {rejected_bot}\n",
-                f"   🙅‍♂️ Отказ (сам): {refusal_user}\n",
-                f"   💤 Снова уснули: {timeout}\n",
+                f"   📤 Отправлено: {sent_total}\n",
+                f"   💬 Ответило: {replied_count} ", Italic(f"({conv_reply}%)"), "\n",
+                f"   ✅ Записаны: {success_count}\n",
+                f"   🤖 Отказ (бот): {refusal_bot_count}\n",
+                f"   🙅‍♂️ Отказ (сам): {refusal_user_count}\n",
+                f"   💤 Снова уснули: {timeout_count}\n",
+                f"   ⏳ В работе: {in_progress_count}\n",
                 "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
             ])
 
@@ -392,7 +472,6 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
         elif d.is_user_ref:
             m["отказался_кд"] += 1
         elif d.is_timeout and d.is_reply:
-            # Только если вступил в диалог, но замолчал (не имея финала)
             m["молчуны"] += 1
 
     # 3. ПОДГОТОВКА СТРОК ДЛЯ DATAFRAME

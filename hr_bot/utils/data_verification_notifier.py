@@ -7,7 +7,7 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
 from aiogram.types import BufferedInputFile
-
+from aiogram.client.session.aiohttp import AiohttpSession
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -15,6 +15,17 @@ logger = logging.getLogger(__name__)
 def esc(text):
     """Экранирование спецсимволов для MarkdownV2/Markdown"""
     return str(text).replace('_', '\\_').replace('*', '\\*').replace('[', '\\[').replace('`', '\\`').replace('>', '\\>')
+
+def get_session():
+    host = os.getenv("SQUID_PROXY_HOST", "").strip('"')
+    port = os.getenv("SQUID_PROXY_PORT", "").strip('"')
+    user = os.getenv("SQUID_PROXY_USER", "").strip('"')
+    password = os.getenv("SQUID_PROXY_PASSWORD", "").strip('"')
+    
+    if host and port:
+        proxy_url = f"http://{user}:{password}@{host}:{port}"
+        return AiohttpSession(proxy=proxy_url)
+    return None
 
 async def send_verification_alert(
     dialogue_id: int,
@@ -38,7 +49,8 @@ async def send_verification_alert(
         return
 
     try:
-        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)) as bot:
+        session = get_session()
+        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN), session=session) as bot:
             
             alert_text = (
                 f"🚨 **INCIDENT: Ошибка верификации данных**\n\n"
@@ -92,7 +104,10 @@ async def send_date_conflict_alert(
         return
 
     try:
-        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)) as bot:
+        session = get_session()
+
+
+        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN), session=session) as bot:
             alert_text = (
                 f"📅 **INCIDENT: Ошибка в дате (Галлюцинация)**\n\n"
                 f"Диалог ID: `{esc(dialogue_id)}`\n"
@@ -138,7 +153,8 @@ async def send_cost_alert(
         return
 
     try:
-        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN)) as bot:
+        session = get_session()
+        async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN), session=session) as bot:
             
             # Ссылка на диалог в HH (для быстрого перехода)
             hh_link = f"https://spb.hh.ru/negotiations/{hh_response_id}"
