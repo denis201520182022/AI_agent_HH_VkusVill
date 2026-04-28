@@ -404,6 +404,21 @@ class MailingTask(Base):
     # Статистика
     candidates_found = Column(Integer, default=0) # Сколько диалогов попало в выборку
     messages_sent = Column(Integer, default=0)    # Сколько реально отправлено (успешно)
+        # --- НОВЫЕ ПОЛЯ ДЛЯ ДЕТАЛЬНОЙ СТАТИСТИКИ РАССЫЛКИ ---
+
+    # Счетчик обработанных диалогов (инкрементальный, показывает текущий прогресс)
+    processed_count = Column(Integer, default=0, server_default='0', nullable=False)
+
+    # Сколько диалогов было пропущено (вакансия закрыта, резюме удалено, нет токена и т.д.)
+    skipped_count = Column(Integer, default=0, server_default='0', nullable=False)
+
+    # Сколько диалогов завершилось с ошибкой отправки (сетевые ошибки, 5xx и пр.)
+    error_count = Column(Integer, default=0, server_default='0', nullable=False)
+
+    # Детальный лог обработки: список событий в формате
+    # [{"ts": "2026-04-28T10:15:30Z", "dialogue_id": 123, "action": "sent|skipped|error", "reason": "vacancy_closed|network_error|..."}]
+    processing_log = Column(JSONB, nullable=True, default=lambda: [])
+    # ---------------------------------------------------
     total_cost = Column(Numeric(12, 2), default=0.00) # Сколько денег списано за эту рассылку
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())

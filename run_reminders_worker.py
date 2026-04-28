@@ -74,6 +74,58 @@ def signal_handler(sig, frame):
     shutdown_requested = True
 
 
+# --- ХЕЛПЕР: Добавление события в лог обработки ---
+def add_to_processing_log(task_obj, dialogue_id, hh_id, action, reason=None):
+    """Добавляет запись в processing_log задачи рассылки."""
+    current_log = task_obj.processing_log if task_obj.processing_log else []
+    current_log.append({
+        "ts": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "dialogue_id": dialogue_id,
+        "hh_response_id": hh_id,
+        "action": action,      # "sent", "skipped", "error"
+        "reason": reason       # например: "vacancy_closed", "network_error"
+    })
+    task_obj.processing_log = current_log  # Важно: переназначение, чтобы SQLAlchemy увидел изменение
+# ----------------------------------------------------
+# --- ХЕЛПЕР: Формирование отчёта по задаче рассылки ---
+def format_mailing_report(task_obj) -> str:
+    """Формирует читаемый отчёт о завершении задачи рассылки."""
+    total = task_obj.candidates_found
+    sent = task_obj.messages_sent
+    skipped = task_obj.skipped_count
+    errors = task_obj.error_count
+    processed = task_obj.processed_count
+    cost = task_obj.total_cost or 0
+    
+    # Процент от найденных, которые реально обработали
+    progress_pct = round((processed / total * 100) if total > 0 else 0, 1)
+    # Процент успешных от обработанных
+    success_rate = round((sent / processed * 100) if processed > 0 else 0, 1)
+    
+    report = (
+        f"📬 <b>Рассылка #{task_obj.id} завершена</b>\n"
+        f"🔍 Найдено кандидатов: {total}\n"
+        f"✅ Обработано: {processed} ({progress_pct}%)\n"
+        f"   ├─ Отправлено: {sent} ({success_rate}%)\n"
+        f"   ├─ Пропущено: {skipped}\n"
+        f"   └─ Ошибки: {errors}\n"
+        f"💰 Списано: {cost} руб."
+    )
+    
+    # Добавляем причины пропусков, если есть детализация
+    if task_obj.processing_log:
+        skip_reasons = {}
+        for entry in task_obj.processing_log:
+            if entry.get("action") == "skipped" and entry.get("reason"):
+                reason = entry["reason"]
+                skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+        
+        if skip_reasons:
+            reasons_str = " | ".join([f"{k}: {v}" for k, v in skip_reasons.items()])
+            report += f"\n⚠️ Причины пропусков: {reasons_str}"
+    
+    return report
+# --------------------------------------------------------
 async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, semaphore: asyncio.Semaphore):
     """
     Обрабатывает напоминание для одного диалога в изолированной сессии.
@@ -939,6 +991,14 @@ async def process_mailing_tasks():
                     task.completed_at = datetime.datetime.now(datetime.timezone.utc)
                     await db.commit()
                     logger.info(f"[MailingTask #{task.id}] Полностью завершена.")
+                    
+                    # === ОТПРАВКА АЛЕРТА АДМИНАМ ===
+                    # Формируем и отправляем отчёт асинхронно (не блокируем основной поток)
+                    report_text = format_mailing_report(task)
+                    asyncio.create_task(
+                        send_system_alert(report_text, alert_type="admin_only")
+                    )
+                    # =================================
                     continue
 
                 # 5. ФУНКЦИЯ ДЛЯ ПАРАЛЛЕЛЬНОЙ ОБРАБОТКИ ОДНОГО ДИАЛОГА
@@ -993,42 +1053,98 @@ async def process_mailing_tasks():
                                     await log_analytics_event(local_db, dialogue, 'reactivation_sent')
                                     MESSAGES_SENT_TOTAL.inc()
                                     await local_db.commit()
-                                    return "sent"
+                                    return {
+                                        "result": "sent",
+                                        "dialogue_id": dialogue.id,
+                                        "hh_response_id": dialogue.hh_response_id,
+                                        "reason": None
+                                    }
                                 
                                 elif status == 403:
                                     dialogue.status = 'vacancy_closed_or_resume_not_found'
                                     dialogue.active_mailing_task_id = task.id
                                     await local_db.commit()
-                                    return "closed"
+                                    return {
+                                        "result": "skipped",
+                                        "dialogue_id": dialogue.id,
+                                        "hh_response_id": dialogue.hh_response_id,
+                                        "reason": "vacancy_closed_or_resume_not_found"
+                                    }
                                 
-                                return "error"
+                                return {
+                                    "result": "error",
+                                    "dialogue_id": d_id,  # используем d_id, т.к. dialogue может не загрузиться
+                                    "hh_response_id": None,
+                                    "reason": str(e)[:100] if e else "unknown_error"  # обрезаем, чтобы не засорять лог
+                                }
                             except Exception as e:
                                 logger.error(f"Ошибка в процессе отправки диалога {d_id}: {e}")
-                                return "error"
+                                return {
+                                    "result": "error",
+                                    "dialogue_id": d_id,  # используем d_id, т.к. dialogue может не загрузиться
+                                    "hh_response_id": None,
+                                    "reason": str(e)[:100] if e else "unknown_error"  # обрезаем, чтобы не засорять лог
+                                }
 
                 # 6. ЗАПУСК ПАРАЛЛЕЛЬНОЙ ПАЧКИ
                 tasks_to_run = [process_single_candidate(d.id) for d in batch]
                 results = await asyncio.gather(*tasks_to_run)
 
                 # 7. ОБНОВЛЕНИЕ СТАТИСТИКИ ЗАДАЧИ
-                sent_count = results.count("sent")
+                # Фильтруем только успешные результаты-словари
+                valid_results = [r for r in results if isinstance(r, dict)]
+                
+                sent_count = sum(1 for r in valid_results if r["result"] == "sent")
+                skipped_count = sum(1 for r in valid_results if r["result"] == "skipped")
+                error_count = sum(1 for r in valid_results if r["result"] == "error")
                 
                 # Снова лочим задачу, чтобы обновить общие счетчики
                 stmt_task = select(MailingTask).filter(MailingTask.id == task.id).with_for_update()
                 res_task = await db.execute(stmt_task)
                 current_task = res_task.scalar_one()
                 
+                # Инкрементим счётчики
+                current_task.processed_count += len(valid_results)  # всего обработано в этой пачке
                 current_task.messages_sent += sent_count
-                # Суммируем затраты
+                current_task.skipped_count += skipped_count
+                current_task.error_count += error_count
+                
+                # Добавляем события в лог (по одному на диалог)
+                for res in valid_results:
+                    add_to_processing_log(
+                        task_obj=current_task,
+                        dialogue_id=res["dialogue_id"],
+                        hh_id=res["hh_response_id"],
+                        action=res["result"],
+                        reason=res["reason"]
+                    )
+                
+                # Суммируем затраты (только за успешные отправки)
                 cost_per_one = (await db.execute(select(AppSettings.cost_per_reactivation))).scalar() or Decimal('5.00')
-                current_task.total_cost = (current_task.total_cost or 0) + (sent_count * cost_per_one)
+                current_task.total_cost = (current_task.total_cost or Decimal('0.00')) + (sent_count * cost_per_one)
 
                 if "out_of_funds" in results:
                     current_task.status = 'paused_no_funds'
                     logger.warning(f"[MailingTask #{task.id}] Остановка: недостаточно средств на балансе Outbound.")
+                    # === АЛЕРТ О НЕХВАТКЕ СРЕДСТВ ===
+                    urgent_text = (
+                        f"🚨 <b>Рассылка #{current_task.id} приостановлена!</b>\n"
+                        f"❌ Причина: недостаточно средств на балансе Outbound.\n"
+                        # f"📊 Обработано: {current_task.processed_count}/{current_task.candidates_found}\n"
+                        # f"💰 Текущий баланс: {settings.balance_outbound if settings else 'N/A'} руб.\n"
+                        # f"💸 Стоимость одной отправки: {settings.cost_per_reactivation if settings else 'N/A'} руб."
+                    )
+                    asyncio.create_task(
+                        send_system_alert(urgent_text, alert_type="admin_only")
+                    )
+                    # =================================
 
                 await db.commit()
-                logger.info(f"[MailingTask #{task.id}] Обработана пачка {len(batch)}. Успешно отправлено: {sent_count}")
+                logger.info(
+                    f"[MailingTask #{task.id}] Пачка: {len(batch)} диалогов. "
+                    f"Отправлено: {sent_count}, Пропущено: {skipped_count}, Ошибки: {error_count}. "
+                    f"Прогресс: {current_task.processed_count}/{current_task.candidates_found}"
+                )
 
             except Exception as e:
                 logger.error(f"Критическая ошибка MailingTask: {e}", exc_info=True)

@@ -16,6 +16,7 @@ from sqlalchemy.orm import selectinload
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
+from sqlalchemy import update 
 import re
 from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.sentry_config import init_sentry
@@ -109,6 +110,9 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
 async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSession) -> list:
     function_start_time = time.monotonic()
     current_recruiter = await db.get(TrackedRecruiter, recruiter_id)
+    if not current_recruiter:
+        logger.error(f"Рекрутер с ID {recruiter_id} не найден.")
+        return []
     rec_logger = logging.LoggerAdapter(logger, {
         "recruiter_id": recruiter_id, 
         "recruiter_name": current_recruiter.name,
@@ -177,8 +181,46 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 db.add(vacancy_in_db)
                 await db.flush()
             else:
+                # === ВАКАНСИЯ УЖЕ ЕСТЬ В БД ===
                 vacancy_in_db.title = vacancy_data.get("name", "Без названия")
                 vacancy_in_db.city = actual_city
+                
+                # 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверка смены владельца
+                if vacancy_in_db.recruiter_id != current_recruiter.id:
+                    old_recruiter_id = vacancy_in_db.recruiter_id
+                    
+                    # 1. Обновляем владельца вакансии
+                    vacancy_in_db.recruiter_id = current_recruiter.id
+                    
+                    # 2. Массово переносим ВСЕ диалоги к новому рекрутеру
+                    result = await db.execute(
+                        update(Dialogue)
+                        .where(Dialogue.vacancy_id == vacancy_in_db.id)
+                        .values(recruiter_id=current_recruiter.id)
+                        .execution_options(synchronize_session=False)  # ← Важно для производительности
+                    )
+                    transferred_count = result.rowcount
+                    
+                    # 3. Логируем событие
+                    rec_logger.info(
+                        f"🔁 Вакансия {hh_vacancy_id} перешла от рекрутера {old_recruiter_id} "
+                        f"к {current_recruiter.name}. Перенесено диалогов: {transferred_count}"
+                    )
+                    
+                    # 4. (Опционально) Аналитика: событие передачи
+                    # from hr_bot.utils.analytics import log_analytics_event
+                    # await log_analytics_event(
+                    #     db, 
+                    #     None,  # dialogue=None, т.к. событие на уровне вакансии
+                    #     'vacancy_transferred',
+                    #     extra_data={
+                    #         'vacancy_id': vacancy_in_db.id,
+                    #         'hh_vacancy_id': hh_vacancy_id,
+                    #         'from_recruiter_id': old_recruiter_id,
+                    #         'to_recruiter_id': current_recruiter.id,
+                    #         'dialogues_count': transferred_count
+                    #     }
+                    # )
 
             # --- ЛОГИКА ОБНОВЛЕНИЯ ДЕТАЛЕЙ (ДОБАВЛЯЕМ ЛОГИ ЗДЕСЬ) ---
             need_details_sync = False
@@ -217,7 +259,24 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
             Vacancy.hh_vacancy_id.notin_(active_hh_ids)
         ))
         for stale_vac in stale_result.scalars().all():
+            old_recruiter_id = stale_vac.recruiter_id
+            
+            # 1. Освобождаем вакансию
             stale_vac.recruiter_id = None
+            
+            # 2. Переносим ВСЕ диалоги в "общий пул" (recruiter_id = None)
+            result = await db.execute(
+                update(Dialogue)
+                .where(Dialogue.vacancy_id == stale_vac.id)
+                .values(recruiter_id=None)
+            )
+            transferred_count = result.rowcount
+            
+            # 3. Логируем
+            rec_logger.info(
+                f"🔓 Вакансия {stale_vac.hh_vacancy_id} освобождена. "
+                f"Диалоги ({transferred_count} шт.) перенесены в общий пул."
+            )
 
         current_recruiter.vacancies_last_synced_at = now
         await db.commit() 

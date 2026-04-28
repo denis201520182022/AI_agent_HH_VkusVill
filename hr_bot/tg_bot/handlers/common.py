@@ -43,7 +43,7 @@ from sqlalchemy import cast, Date, func
 from datetime import date, timedelta
 # Предполагается, что Bold, Italic, Text импортированы из aiogram.utils.formatting или аналогичной библиотеки
 from aiogram.utils.formatting import Bold, Italic, Text
-
+from aiogram.utils.keyboard import InlineKeyboardBuilder
 import io
 import pandas as pd
 from datetime import date
@@ -80,12 +80,120 @@ class MailingTaskStates(StatesGroup):
     waiting_for_days = State()
     waiting_for_message = State()
     waiting_for_confirmation = State()
+# --- КЛАВИАТУРА: Меню Реактивации ---
 
-# 2. Вход в режим создания рассылки
+
+def get_reactivation_menu_keyboard():
+    """Возвращает клавиатуру с двумя кнопками: просмотр задач / создать новую."""
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👁️ Текущие задачи", callback_data="reactivation_view_tasks")
+    builder.button(text="✨ Создать новую", callback_data="reactivation_create_new")
+    builder.adjust(1)  # Кнопки в одну колонку
+    return builder.as_markup()
+# -------------------------------------
+
+
+
+# 2. Вход в режим реактивации — теперь показывает МЕНЮ
 @router.message(F.text == "🚀 Реактивация")
 async def start_mailing_task_creation(message: Message, state: FSMContext):
-    await state.set_state(MailingTaskStates.waiting_for_vacancy)
+    # Сначала очищаем состояние, если пользователь зашёл из другого потока
+    await state.clear()
+    
     await message.answer(
+        "🚀 <b>Реактивация кандидатов</b>\n\n"
+        "Что вы хотите сделать?",
+        reply_markup=get_reactivation_menu_keyboard(),
+        parse_mode="HTML"
+    )
+
+# 5. Кнопка "Назад" в меню реактивации
+@router.callback_query(F.data == "reactivation_back")
+async def reactivation_back(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "🚀 <b>Реактивация кандидатов</b>\n\n"
+        "Что вы хотите сделать?",
+        reply_markup=get_reactivation_menu_keyboard(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+# 3. Просмотр текущих задач реактивации
+@router.callback_query(F.data == "reactivation_view_tasks")
+async def view_active_mailing_tasks(callback: CallbackQuery, db_session: Session):
+    # Загружаем активные задачи, сортируем по времени создания (новые сверху)
+    active_tasks = db_session.query(MailingTask).filter(
+        MailingTask.status.in_(['pending', 'in_progress', 'paused_no_funds'])
+    ).order_by(MailingTask.created_at.desc()).limit(10).all()
+    
+    if not active_tasks:
+        await callback.message.edit_text(
+            "📋 <b>Нет активных задач</b>\n\n"
+            "На данный момент в очереди нет задач на реактивацию.\n"
+            "Создайте новую, чтобы запустить рассылку по «молчунам».",
+            reply_markup=get_reactivation_menu_keyboard(),
+            parse_mode="HTML"
+        )
+        await callback.answer()
+        return
+    
+    # Формируем список задач
+    tasks_text = "📋 <b>Активные задачи реактивации:</b>\n\n"
+    
+    for task in active_tasks:
+        # Статус эмодзи
+        status_emoji = {
+            'pending': '⏳',
+            'in_progress': '🔄',
+            'paused_no_funds': '💸',
+            'completed': '✅',
+            'failed': '❌'
+        }.get(task.status, '❓')
+        
+        # Прогресс, если задача в работе
+        progress = ""
+        if task.candidates_found > 0:
+            pct = round(task.processed_count / task.candidates_found * 100, 1)
+            progress = f"\n   📊 Прогресс: {task.processed_count}/{task.candidates_found} ({pct}%)"
+        
+        tasks_text += (
+            f"{status_emoji} <b>Задача #{task.id}</b>\n"
+            f"   🔹 Вакансия: <code>{task.vacancy_pattern}</code>\n"
+            f"   🔹 Город: <code>{task.city_pattern}</code>\n"
+            f"   🔹 Молчание: {task.days_silent_min}-{task.days_silent_max} дн.\n"
+            f"   🔹 Найдено: {task.candidates_found}{progress}\n"
+            f"   🔹 Отправлено: {task.messages_sent} | Пропущено: {task.skipped_count}\n"
+            f"   🔹 Статус: <i>{task.status}</i>\n"
+            f"   🕐 Создана: {task.created_at.astimezone(SPB_TIMEZONE).strftime('%d.%m %H:%M')}\n"
+            "⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯\n"
+        )
+    
+    # Кнопка "Назад" + "Создать новую"
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✨ Создать новую", callback_data="reactivation_create_new")
+    kb.button(text="⬅️ Назад", callback_data="reactivation_back")
+    kb.adjust(1)
+    
+    await callback.message.edit_text(
+        tasks_text,
+        reply_markup=kb.as_markup(),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+
+# 4. Запуск создания новой задачи (из меню)
+@router.callback_query(F.data == "reactivation_create_new")
+async def start_new_mailing_task(callback: CallbackQuery, state: FSMContext):
+    # 1. Сначала подтверждаем callback!
+    await callback.answer()
+    
+    # 2. Затем удаляем меню
+    await callback.message.delete()
+    
+    # 3. Запускаем FSM
+    await state.set_state(MailingTaskStates.waiting_for_vacancy)
+    await callback.message.answer(
         "🚀 <b>Создание задачи на реактивацию</b>\n\n"
         "Шаг 1/4: Введите название вакансии (или часть названия).\n"
         "<i>Например: Сборщик</i>\n"
