@@ -1016,7 +1016,38 @@ async def process_mailing_tasks():
                                 settings = settings_res.scalar_one_or_none()
                                 
                                 if not dialogue or not settings: return False
-                                
+                                # === НОВАЯ ЛОГИКА: ПРОВЕРКА ПАПКИ НА HH ===
+                                current_folder_on_hh = await hh_api.get_negotiation_current_folder(
+                                    dialogue.recruiter, local_db, dialogue.hh_response_id
+                                )
+                                if current_folder_on_hh is None:
+                                    return
+                                if current_folder_on_hh == 404:
+                                    # Отклик удален или вакансия пропала
+                                    dialogue.status = 'not_found'
+                                    dialogue.active_mailing_task_id = task.id
+                                    await local_db.commit()
+                                    return {
+                                        "result": "skipped",
+                                        "dialogue_id": dialogue.id,
+                                        "hh_response_id": dialogue.hh_response_id,
+                                        "reason": "not_found_on_hh"
+                                    }
+
+                                if current_folder_on_hh != 'consider':
+                                    # Рекрутер уже обработал кандидата вручную (перевел в отказ/интервью)
+                                    dialogue.status = 'recruiter_handled'
+                                    # Чтобы он больше не попадал в выборку для этой рассылки
+                                    dialogue.active_mailing_task_id = task.id 
+                                    await local_db.commit()
+                                    return {
+                                        "result": "skipped",
+                                        "dialogue_id": dialogue.id,
+                                        "hh_response_id": dialogue.hh_response_id,
+                                        "reason": f"moved_to_{current_folder_on_hh}"
+                                    }
+                                # =========================================
+
                                 cost = settings.cost_per_reactivation
                                 if settings.balance_outbound < cost:
                                     return "out_of_funds"
