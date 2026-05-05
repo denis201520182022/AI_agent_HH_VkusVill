@@ -270,8 +270,8 @@ async def process_mailing_text(message: Message, state: FSMContext, db_session: 
         .filter(
             Dialogue.status == 'timed_out',
             Dialogue.dialogue_state.notin_(['vacancy_closed_or_resume_not_found', 'refusal']),
-            Dialogue.last_updated <= cutoff_recent,
-            Dialogue.last_updated >= cutoff_oldest,
+            Dialogue.last_message_at <= cutoff_recent,
+            Dialogue.last_message_at >= cutoff_oldest,
             # ФИЛЬТРЫ РЕКРУТЕРА (как в блоке #3 и #4 воркера)
             TrackedRecruiter.is_auth_active == True,
             TrackedRecruiter.access_token.isnot(None) 

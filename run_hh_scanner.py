@@ -459,7 +459,8 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     status='new',
                     dialogue_state='initial_processing',
                     response_created_at=response_created_at_dt,
-                    current_mode='standard'
+                    current_mode='standard',
+                    last_message_at=datetime.datetime.now(datetime.timezone.utc)
                 )
                 db.add(dialogue)
                 
@@ -687,6 +688,7 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
 
                 dialogue.pending_messages = (dialogue.pending_messages or []) + new_msgs
                 dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
 
                 msg_count = len(new_msgs)
                 MESSAGES_RECEIVED_TOTAL.labels(recruiter_id=str(recruiter_id)).inc(msg_count) # <--- МЕТРИКА

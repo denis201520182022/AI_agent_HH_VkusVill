@@ -365,6 +365,7 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                         dialogue.reminder_level = next_level
                         MESSAGES_SENT_TOTAL.inc()
                         dialogue.last_updated = now
+                        dialogue.last_message_at = now
                         await db.commit()
 
             except Exception as e:
@@ -588,6 +589,7 @@ async def check_and_send_interview_reminders():
                                 f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}."
                                 
                             )
+                            dialogue.last_message_at = now_utc
 
                         elif send_result == 403:
                             # ВАКАНСИЯ ЗАКРЫТА
@@ -744,6 +746,7 @@ async def check_and_send_followups():
                              # --- [ANALYTICS] СТАРТ FOLLOW-UP ---
                             # --- [ANALYTICS] ВХОД В ВОРОНКУ FOLLOW-UP ---
                             dialogue.current_mode = 'followup' # Переключаем режим!
+                            dialogue.last_message_at = now_utc
                             await log_analytics_event(db_session, dialogue, 'followup_sent')
                             # ----------------------------------
 
@@ -802,7 +805,7 @@ async def check_and_send_followups():
                             tomorrow_spb = now_spb.date() + datetime.timedelta(days=1)
                             next_time_spb = datetime.datetime.combine(tomorrow_spb, datetime.time(12, 0)).replace(tzinfo=SPB_TIMEZONE)
                             next_time_utc = next_time_spb.astimezone(datetime.timezone.utc)
-                            
+                            dialogue.last_message_at = now_utc
                             db_session.add(InterviewFollowup(
                                 dialogue_id=dialogue.id,
                                 step=3,
@@ -839,6 +842,7 @@ async def check_and_send_followups():
                             await log_analytics_event(db_session, dialogue, 'followup_no_show')
                             
                             task.status = 'sent'
+                            dialogue.last_message_at = now_utc
                             MESSAGES_SENT_TOTAL.inc()
                             ctx_logger.info("Step 3 отправлен. Диалог помечен как 'no_answer_after_interview'.")
 
@@ -940,8 +944,8 @@ async def process_mailing_tasks():
                         .filter(
                             Dialogue.status == 'timed_out',
                             Dialogue.dialogue_state.notin_(['vacancy_closed_or_resume_not_found', 'refusal']),
-                            Dialogue.last_updated <= now_utc - datetime.timedelta(days=task.days_silent_min),
-                            Dialogue.last_updated >= now_utc - datetime.timedelta(days=task.days_silent_max),
+                            Dialogue.last_message_at <= now_utc - datetime.timedelta(days=task.days_silent_min),
+                            Dialogue.last_message_at >= now_utc - datetime.timedelta(days=task.days_silent_max),
                             # ФИЛЬТР: Только активные с токенами
                             TrackedRecruiter.is_auth_active == True,
                             TrackedRecruiter.access_token.isnot(None)
@@ -969,8 +973,8 @@ async def process_mailing_tasks():
                     .filter(
                         Dialogue.status == 'timed_out',
                         Dialogue.dialogue_state.notin_(['vacancy_closed_or_resume_not_found', 'refusal']),
-                        Dialogue.last_updated <= cutoff_recent,
-                        Dialogue.last_updated >= cutoff_oldest,
+                        Dialogue.last_message_at <= cutoff_recent,
+                        Dialogue.last_message_at >= cutoff_oldest,
                         (Dialogue.active_mailing_task_id != task.id) | (Dialogue.active_mailing_task_id == None),
                         # ФИЛЬТР: Пропускаем диалоги неактивных рекрутеров
                         TrackedRecruiter.is_auth_active == True,
@@ -1072,7 +1076,7 @@ async def process_mailing_tasks():
                                     dialogue.status = 'in_progress'
                                     dialogue.active_mailing_task_id = task.id
                                     dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                                    
+                                    dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
                                     new_history = {
                                         'role': 'assistant',
                                         'content': task.message_text,

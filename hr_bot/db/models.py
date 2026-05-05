@@ -146,6 +146,7 @@ class Dialogue(Base):
         onupdate=func.timezone('UTC', func.now()),
         index=True
     )
+    last_message_at = Column(DateTime(timezone=True), nullable=True, index=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     response_created_at = Column(DateTime(timezone=True), nullable=True)
     

@@ -1133,7 +1133,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
             # Чистим очередь
             dialogue.pending_messages = None
             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-            
+            dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
             await db.commit() # <--- ЕДИНСТВЕННЫЙ COMMIT
             ctx_logger.info("Follow-up диалог успешно обновлен и сохранен.")
             
@@ -3023,6 +3023,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         if message_sent == 200:
             # Генерируем время ответа бота по МСК
             bot_response_time_msk = datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK') # <-- ДОБАВЛЕНО
+            dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
             bot_message_entry = {
                 'message_id': f'bot_{time.time()}',
                 'role': 'assistant',
