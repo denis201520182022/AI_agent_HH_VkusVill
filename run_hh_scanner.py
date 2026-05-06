@@ -123,7 +123,8 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         cache_expiry_time = datetime.timedelta(minutes=VACANCY_CACHE_DURATION_MINUTES)
         # Интервал обновления деталей вакансии (1 час)
         details_sync_interval = datetime.timedelta(hours=1)
-
+        vacancies_to_transfer = []  # Для смены владельца
+        vacancies_to_release = []   # Для ухода в архив
         if not current_recruiter:
             rec_logger.error(f"Рекрутер с ID {recruiter_id} не найден.")
             return []
@@ -187,25 +188,30 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 
                 # 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверка смены владельца
                 if vacancy_in_db.recruiter_id != current_recruiter.id:
-                    old_recruiter_id = vacancy_in_db.recruiter_id
-                    
-                    # 1. Обновляем владельца вакансии
+
+                    # Просто запоминаем ID и меняем поле в модели Vacancy
+                    vacancies_to_transfer.append(vacancy_in_db.id)
                     vacancy_in_db.recruiter_id = current_recruiter.id
+                    # НИКАКОГО db.execute(update(Dialogue)) ТУТ НЕТ
+                    # old_recruiter_id = vacancy_in_db.recruiter_id
                     
-                    # 2. Массово переносим ВСЕ диалоги к новому рекрутеру
-                    result = await db.execute(
-                        update(Dialogue)
-                        .where(Dialogue.vacancy_id == vacancy_in_db.id)
-                        .values(recruiter_id=current_recruiter.id)
-                        .execution_options(synchronize_session=False)  # ← Важно для производительности
-                    )
-                    transferred_count = result.rowcount
+                    # # 1. Обновляем владельца вакансии
+                    # vacancy_in_db.recruiter_id = current_recruiter.id
                     
-                    # 3. Логируем событие
-                    rec_logger.info(
-                        f"🔁 Вакансия {hh_vacancy_id} перешла от рекрутера {old_recruiter_id} "
-                        f"к {current_recruiter.name}. Перенесено диалогов: {transferred_count}"
-                    )
+                    # # 2. Массово переносим ВСЕ диалоги к новому рекрутеру
+                    # result = await db.execute(
+                    #     update(Dialogue)
+                    #     .where(Dialogue.vacancy_id == vacancy_in_db.id)
+                    #     .values(recruiter_id=current_recruiter.id)
+                    #     .execution_options(synchronize_session=False)  # ← Важно для производительности
+                    # )
+                    # transferred_count = result.rowcount
+                    
+                    # # 3. Логируем событие
+                    # rec_logger.info(
+                    #     f"🔁 Вакансия {hh_vacancy_id} перешла от рекрутера {old_recruiter_id} "
+                    #     f"к {current_recruiter.name}. Перенесено диалогов: {transferred_count}"
+                    # )
                     
                     # 4. (Опционально) Аналитика: событие передачи
                     # from hr_bot.utils.analytics import log_analytics_event
@@ -259,25 +265,49 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
             Vacancy.hh_vacancy_id.notin_(active_hh_ids)
         ))
         for stale_vac in stale_result.scalars().all():
-            old_recruiter_id = stale_vac.recruiter_id
-            
-            # 1. Освобождаем вакансию
-            stale_vac.recruiter_id = None
-            
-            # 2. Переносим ВСЕ диалоги в "общий пул" (recruiter_id = None)
-            result = await db.execute(
-                update(Dialogue)
-                .where(Dialogue.vacancy_id == stale_vac.id)
-                .values(recruiter_id=None)
-            )
-            transferred_count = result.rowcount
-            
-            # 3. Логируем
-            rec_logger.info(
-                f"🔓 Вакансия {stale_vac.hh_vacancy_id} освобождена. "
-                f"Диалоги ({transferred_count} шт.) перенесены в общий пул."
-            )
 
+            vacancies_to_release.append(stale_vac.id)
+            stale_vac.recruiter_id = None
+            # НИКАКОГО db.execute(update(Dialogue)) ТУТ НЕТ
+
+            # old_recruiter_id = stale_vac.recruiter_id
+            
+            # # 1. Освобождаем вакансию
+            # stale_vac.recruiter_id = None
+            
+            # # 2. Переносим ВСЕ диалоги в "общий пул" (recruiter_id = None)
+            # result = await db.execute(
+            #     update(Dialogue)
+            #     .where(Dialogue.vacancy_id == stale_vac.id)
+            #     .values(recruiter_id=None)
+            # )
+            # transferred_count = result.rowcount
+            
+            # # 3. Логируем
+            # rec_logger.info(
+            #     f"🔓 Вакансия {stale_vac.hh_vacancy_id} освобождена. "
+            #     f"Диалоги ({transferred_count} шт.) перенесены в общий пул."
+            # )
+        # --- МАССОВОЕ ОБНОВЛЕНИЕ ДИАЛОГОВ (БЫСТРО И В КОНЦЕ) ---
+        if vacancies_to_transfer:
+            await db.execute(
+                update(Dialogue)
+                .where(Dialogue.vacancy_id.in_(vacancies_to_transfer))
+                .values(recruiter_id=current_recruiter.id)
+                .execution_options(synchronize_session=False)
+            )
+            rec_logger.info(f"Передано диалогов для {len(vacancies_to_transfer)} вакансий")
+
+        if vacancies_to_release:
+            await db.execute(
+                update(Dialogue)
+                .where(Dialogue.vacancy_id.in_(vacancies_to_release))
+                .values(recruiter_id=None)
+                .execution_options(synchronize_session=False)
+            )
+            rec_logger.info(f"Освобождено диалогов для {len(vacancies_to_release)} вакансий")
+        # ------------------------------------------------------
+        
         current_recruiter.vacancies_last_synced_at = now
         await db.commit() 
         
