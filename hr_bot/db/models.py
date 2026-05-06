@@ -132,9 +132,9 @@ class Dialogue(Base):
     __tablename__ = 'dialogues'
     id = Column(Integer, primary_key=True, index=True)
     hh_response_id = Column(String(50), unique=True, nullable=False)
-    recruiter_id = Column(Integer, ForeignKey('tracked_recruiters.id'))
+    recruiter_id = Column(Integer, ForeignKey('tracked_recruiters.id'), index=True)
     candidate_id = Column(Integer, ForeignKey('candidates.id'))
-    vacancy_id = Column(Integer, ForeignKey('vacancies.id'))
+    vacancy_id = Column(Integer, ForeignKey('vacancies.id'), index=True)
     dialogue_state = Column(String(100))
     status = Column(String(50), nullable=False, default='new')
     reminder_level = Column(Integer, nullable=False, default=0, server_default='0')
