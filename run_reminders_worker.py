@@ -1012,9 +1012,9 @@ async def process_mailing_tasks():
                         async with SessionLocal() as local_db:
                             try:
                                 # Подгружаем диалог и настройки внутри сессии
-                                settings_res = await local_db.execute(select(AppSettings).filter_by(id=1).with_for_update(skip_locked=True))
+                                settings_res = await local_db.execute(select(AppSettings).filter_by(id=1).with_for_update())
                                 settings = settings_res.scalar_one_or_none()
-                                stmt_d = select(Dialogue).options(selectinload(Dialogue.recruiter)).filter(Dialogue.id == d_id).with_for_update()
+                                stmt_d = select(Dialogue).options(selectinload(Dialogue.recruiter)).filter(Dialogue.id == d_id).with_for_update(skip_locked=True)
                                 d_res = await local_db.execute(stmt_d)
                                 dialogue = d_res.scalar_one_or_none()
                                 
