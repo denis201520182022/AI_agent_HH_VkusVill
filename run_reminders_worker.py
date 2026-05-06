@@ -947,12 +947,14 @@ async def process_mailing_tasks():
         # 1. ПРОВЕРКА ВРЕМЕНИ ТИШИНЫ
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         current_time_spb = now_utc.astimezone(SPB_TIMEZONE)
+        logger.info("Начало цикла реактивации")
         if not (REMINDER_START_HOUR_LOCAL <= current_time_spb.hour < REMINDER_END_HOUR_LOCAL):
             await asyncio.sleep(60)
             continue
 
         # 2. ИЩЕМ ЗАДАЧУ (Короткая транзакция только для захвата задачи)
         async with SessionLocal() as db:
+            logger.info("Открыли транзакцию 1")
             try:
                 stmt = (
                     select(MailingTask)
@@ -963,6 +965,7 @@ async def process_mailing_tasks():
                 )
                 result = await db.execute(stmt)
                 task = result.scalar_one_or_none()
+                logger.info("Получили задачу")
 
                 if not task:
                     await asyncio.sleep(20)
@@ -1005,6 +1008,7 @@ async def process_mailing_tasks():
 
                 # СРАЗУ КОММИТИМ И ОТПУСКАЕМ LOCK с MailingTask
                 await db.commit()
+                logger.info("Коммит после взятия задачи")
             except Exception as e:
                 logger.error(f"Ошибка при захвате MailingTask: {e}")
                 await db.rollback()
@@ -1013,6 +1017,7 @@ async def process_mailing_tasks():
 
         # 3. ВЫБИРАЕМ ПОРЦИЮ ДИАЛОГОВ (В новой сессии, без лока MailingTask)
         async with SessionLocal() as batch_db:
+            logger.info("Открыли транзакцию 2")
             try:
                 cutoff_recent = now_utc - datetime.timedelta(days=days_min)
                 cutoff_oldest = now_utc - datetime.timedelta(days=days_max)
@@ -1059,6 +1064,7 @@ async def process_mailing_tasks():
                 
                 # Сохраняем ID диалогов из батча для параллельной обработки
                 batch_dialogue_ids = [d.id for d in batch]
+                logger.info("Получили id диалогов")
                 
             except Exception as e:
                 logger.error(f"Ошибка при выборке батча диалогов для задачи #{task_id}: {e}")
@@ -1079,6 +1085,7 @@ async def process_mailing_tasks():
                     async with semaphore:
                         # Каждому кандидату своя сессия для изоляции транзакций
                         async with SessionLocal() as local_db:
+                            logger.info("Обработка диалога транзакцию открыли")
                             try:
                                 # 1. Загружаем настройки и диалог с блокировкой строки
                                 # Блокируем AppSettings, чтобы конкурентные задачи не списали баланс в минус
@@ -1086,7 +1093,7 @@ async def process_mailing_tasks():
                                     select(AppSettings).filter_by(id=1).with_for_update()
                                 )
                                 settings = settings_res.scalar_one_or_none()
-                                
+                                logger.info("Получили сеттинги")
                                 stmt_d = (
                                     select(Dialogue)
                                     .options(selectinload(Dialogue.recruiter))
@@ -1095,7 +1102,7 @@ async def process_mailing_tasks():
                                 )
                                 d_res = await local_db.execute(stmt_d)
                                 dialogue = d_res.scalar_one_or_none()
-                                
+                                logger.info("Получили диалог")
                                 if not dialogue or not settings:
                                     return None
 
@@ -1173,6 +1180,7 @@ async def process_mailing_tasks():
                                     MESSAGES_SENT_TOTAL.inc()
                                     
                                     await local_db.commit()
+                                    logger.info("Завершили транзакацию одного иалога")
                                     return {
                                         "result": "sent",
                                         "dialogue_id": d_id,
@@ -1216,11 +1224,13 @@ async def process_mailing_tasks():
 
                 # 6. ЗАПУСК ПАРАЛЛЕЛЬНОЙ ПАЧКИ
                 # Передаем task_id и task_message_text (сохраненные ранее в памяти)
+                logger.info("Запускаем обработку каждого диалога")
                 tasks_to_run = [process_single_candidate(d_id, task_id, task_message_text) for d_id in batch_dialogue_ids]
                 results = await asyncio.gather(*tasks_to_run)
 
                 # 7. ОБНОВЛЕНИЕ СТАТИСТИКИ ЗАДАЧИ (В новой короткой сессии)
                 async with SessionLocal() as stats_db:
+                    logger.info("Транзакция статитстии")
                     try:
                         # Фильтруем результаты (пропускаем None и строки типа "out_of_funds")
                         valid_results = [r for r in results if isinstance(r, dict)]
@@ -1271,6 +1281,7 @@ async def process_mailing_tasks():
                             )
 
                         await stats_db.commit()
+                        logger.info("Закрыли транзакцию статы")
                         
                         logger.info(
                             f"[MailingTask #{task_id}] Пачка обработана: {len(batch_dialogue_ids)} диалогов. "
