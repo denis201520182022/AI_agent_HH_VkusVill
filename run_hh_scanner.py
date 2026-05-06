@@ -289,23 +289,23 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
             #     f"Диалоги ({transferred_count} шт.) перенесены в общий пул."
             # )
         # --- МАССОВОЕ ОБНОВЛЕНИЕ ДИАЛОГОВ (БЫСТРО И В КОНЦЕ) ---
-        # if vacancies_to_transfer:
-        #     await db.execute(
-        #         update(Dialogue)
-        #         .where(Dialogue.vacancy_id.in_(vacancies_to_transfer))
-        #         .values(recruiter_id=current_recruiter.id)
-        #         .execution_options(synchronize_session=False)
-        #     )
-        #     rec_logger.info(f"Передано диалогов для {len(vacancies_to_transfer)} вакансий")
+        if vacancies_to_transfer:
+            await db.execute(
+                update(Dialogue)
+                .where(Dialogue.vacancy_id.in_(vacancies_to_transfer))
+                .values(recruiter_id=current_recruiter.id)
+                .execution_options(synchronize_session=False)
+            )
+            rec_logger.info(f"Передано диалогов для {len(vacancies_to_transfer)} вакансий")
 
-        # if vacancies_to_release:
-        #     await db.execute(
-        #         update(Dialogue)
-        #         .where(Dialogue.vacancy_id.in_(vacancies_to_release))
-        #         .values(recruiter_id=None)
-        #         .execution_options(synchronize_session=False)
-        #     )
-        #     rec_logger.info(f"Освобождено диалогов для {len(vacancies_to_release)} вакансий")
+        if vacancies_to_release:
+            await db.execute(
+                update(Dialogue)
+                .where(Dialogue.vacancy_id.in_(vacancies_to_release))
+                .values(recruiter_id=None)
+                .execution_options(synchronize_session=False)
+            )
+            rec_logger.info(f"Освобождено диалогов для {len(vacancies_to_release)} вакансий")
         # ------------------------------------------------------
 
         current_recruiter.vacancies_last_synced_at = now

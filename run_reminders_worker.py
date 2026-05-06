@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from decimal import Decimal
 import difflib
 import re
+from sqlalchemy import update
 from hr_bot.utils.analytics import log_analytics_event
 from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.redis_lock import close_redis 
@@ -893,6 +894,41 @@ async def run_reminders_cycle(target_recruiter_ids=None):
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 async def process_mailing_tasks():
     """
     Фоновая задача для обработки массовых рассылок (MailingTask).
@@ -1012,7 +1048,7 @@ async def process_mailing_tasks():
                         async with SessionLocal() as local_db:
                             try:
                                 # Подгружаем диалог и настройки внутри сессии
-                                settings_res = await local_db.execute(select(AppSettings).filter_by(id=1).with_for_update())
+                                settings_res = await local_db.execute(select(AppSettings).filter_by(id=1))
                                 settings = settings_res.scalar_one_or_none()
                                 stmt_d = select(Dialogue).options(selectinload(Dialogue.recruiter)).filter(Dialogue.id == d_id).with_for_update(skip_locked=True)
                                 d_res = await local_db.execute(stmt_d)
@@ -1071,8 +1107,14 @@ async def process_mailing_tasks():
                                 status = await hh_api.send_message(dialogue.recruiter, local_db, dialogue.hh_response_id, task.message_text)
                                 
                                 if status == 200:
-                                    settings.balance_outbound -= cost
-                                    settings.total_spent_reactivation += cost
+                                    await local_db.execute(
+                                        update(AppSettings)
+                                        .where(AppSettings.id == 1)
+                                        .values(
+                                            balance_outbound=AppSettings.balance_outbound - cost,
+                                            total_spent_reactivation=AppSettings.total_spent_reactivation + cost
+                                        )
+                                    )
                                     
                                     dialogue.current_mode = 'reactivation'
                                     dialogue.status = 'in_progress'
@@ -1107,7 +1149,7 @@ async def process_mailing_tasks():
                                         "hh_response_id": dialogue.hh_response_id,
                                         "reason": "vacancy_closed_or_resume_not_found"
                                     }
-                                
+                                local_db.rollback()
                                 return {
                                     "result": "error",
                                     "dialogue_id": d_id,  # используем d_id, т.к. dialogue может не загрузиться
@@ -1135,11 +1177,8 @@ async def process_mailing_tasks():
                 skipped_count = sum(1 for r in valid_results if r["result"] == "skipped")
                 error_count = sum(1 for r in valid_results if r["result"] == "error")
                 
-                # Снова лочим задачу, чтобы обновить общие счетчики
-                stmt_task = select(MailingTask).filter(MailingTask.id == task.id).with_for_update()
-                res_task = await db.execute(stmt_task)
-                current_task = res_task.scalar_one()
                 
+                current_task = await db.get(MailingTask, task.id, with_for_update=True)
                 # Инкрементим счётчики
                 current_task.processed_count += len(valid_results)  # всего обработано в этой пачке
                 current_task.messages_sent += sent_count
@@ -1157,6 +1196,7 @@ async def process_mailing_tasks():
                     )
                 
                 # Суммируем затраты (только за успешные отправки)
+
                 cost_per_one = (await db.execute(select(AppSettings.cost_per_reactivation))).scalar() or Decimal('5.00')
                 current_task.total_cost = (current_task.total_cost or Decimal('0.00')) + (sent_count * cost_per_one)
 
@@ -1189,6 +1229,46 @@ async def process_mailing_tasks():
 
         # Маленькая пауза между пачками, чтобы не перегружать CPU
         await asyncio.sleep(5)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 # --- ИСПРАВЛЕНИЕ: Убрали лишний отступ у main (вынесли из предыдущей функции) ---
