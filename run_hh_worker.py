@@ -40,6 +40,7 @@ from hr_bot.utils.redis_lock import acquire_lock, release_lock
 from hr_bot.services.llm_handler import cleanup, LlmValidationError
 from sqlalchemy import func, select, delete, update
 from hr_bot.services import interview_reminder_manager
+from hr_bot.services import sbor_google_service # <--- НОВЫЙ ИМПОРТ ДЛЯ СБОРЩИКОВ
 from hr_bot.utils.metrics import start_metrics_server, E2E_RESPONSE_LATENCY, MESSAGES_SENT_TOTAL
 from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
 # ... остальные импорты
@@ -70,6 +71,22 @@ MODEL_PRICING = {
         "output": 10.000,
     }
 }
+
+# Ключевые слова для "сборочных" вакансий (сборщик, комплектовщик и т.д.)
+PICKER_KEYWORDS = [
+    'сборщик', 
+    'сканировщик', 
+    'комплектовщик', 
+    'упаковщик', 
+    'кассир-комплектовщик'
+]
+
+def _is_picker_vacancy(vacancy_title: str) -> bool:
+    """
+    Проверяет, является ли вакансия 'сборочной' (сборщик, комплектовщик и т.д.).
+    """
+    title_lower = (vacancy_title or "").lower()
+    return any(word in title_lower for word in PICKER_KEYWORDS)
 
 def _format_timestamp_to_msk(timestamp_str: str) -> str:
     """
@@ -555,6 +572,14 @@ def _find_relevant_vacancy(prompt_library: dict, vacancy_title: str, vacancy_cit
         "Отвечай на вопросы кандидата на основе общей информации из FAQ."
     )
 
+def _is_sbor_vacancy(vacancy_title: str) -> bool:
+    """
+    Проверяет, является ли вакансия 'сборочной' (для работы с Google Таблицей).
+    """
+    title_lower = (vacancy_title or "").lower()
+    picker_keywords = ['сборщик', 'сканировщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик']
+    return any(word in title_lower for word in picker_keywords)
+
 def _generate_calendar_context() -> str:
     """
     Генерирует текстовый блок с календарем и правилами работы с датами.
@@ -811,7 +836,7 @@ def _generate_calendar_context_2() -> str:
 
     return calendar_context
 
-def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str, vacancy_title: str) -> str:
+async def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str, vacancy_title: str) -> str:
     """Собирает динамический системный промпт из блоков библиотеки (упрощенная версия с единым FAQ)."""
 
     required_blocks = ['#ROLE_AND_STYLE#']
@@ -829,7 +854,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     
     # Список 2: Сборщики для Питера (идут в #ADRESS_SPB_1#)
     sborshik_vacancies = [
-        'сборщик', 'комплектовщик', 'упаковщик'
+        'сборщик', 'комплектовщик', 'упаковщик', 'сканировщик', 'кассир-комплектовщик'
     ]
 
     is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
@@ -865,30 +890,39 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         'scheduling_spb_day': ['#SCHEDULING_ALGORITHM#'],
         'scheduling_spb_time': ['#SCHEDULING_ALGORITHM#'],
         'interview_scheduled_spb': ['#SCHEDULING_ALGORITHM#'],
+        
+        'init_scheduling_sbor': ['#SCHEDULING_ALGORITHM#'],
+        'scheduling_sbor_day': ['#SCHEDULING_ALGORITHM#'],
+        'scheduling_sbor_time': ['#SCHEDULING_ALGORITHM#'],
+        'interview_scheduled_sbor': ['#SCHEDULING_ALGORITHM#'],
+        'post_qualification_chat_sbor': ['#SCHEDULING_ALGORITHM#'],
+        
         'forwarded_to_researcher': ['#POSTCVALTWO#'],
     }
     required_blocks.extend(state_specific_blocks.get(dialogue_state, []))
 
-    if dialogue_state in ['forwarded_to_researcher', 'post_qualification_chat', 'awaiting_questions', 'initial_processing', 'call_later']:
+    if dialogue_state in ['forwarded_to_researcher', 'post_qualification_chat', 'post_qualification_chat_sbor', 'awaiting_questions', 'initial_processing', 'call_later']:
         required_blocks.append('#FAQ#')
 
     final_block_keys = list(dict.fromkeys(required_blocks))
 
     prompt_pieces = [prompt_library.get(key, '') for key in final_block_keys]
     
-    
-
-    # +++ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ +++
     # Определяем состояния, для которых нужен календарь
-    SCHEDULING_STATES = ['init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'post_qualification_chat', 'interview_scheduled_spb']
+    SCHEDULING_STATES = [
+        'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'post_qualification_chat', 'interview_scheduled_spb',
+        'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'post_qualification_chat_sbor', 'interview_scheduled_sbor'
+    ]
 
     # Если текущее состояние требует календаря, генерируем и добавляем его
     if dialogue_state in SCHEDULING_STATES:
-        calendar_block = _generate_calendar_context_2()
+        if _is_sbor_vacancy(vacancy_title):
+            calendar_block = await sbor_google_service.get_calendar_context()
+        else:
+            calendar_block = _generate_calendar_context_2()
         prompt_pieces.append(calendar_block)
-    # +++ КОНЕЦ ИЗМЕНЕНИЯ +++
 
-    POST_QUALIFICATION_STATES = ['interview_scheduled_spb', 'post_qualification_chat']
+    POST_QUALIFICATION_STATES = ['interview_scheduled_spb', 'post_qualification_chat', 'interview_scheduled_sbor', 'post_qualification_chat_sbor']
     
     if dialogue_state in POST_QUALIFICATION_STATES:
         post_qual_block = prompt_library.get('#POSTCVAL#', '')
@@ -1643,6 +1677,11 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             'scheduling_spb_day',
             'scheduling_spb_time',
             'interview_scheduled_spb',
+            'init_scheduling_sbor',
+            'scheduling_sbor_day',
+            'scheduling_sbor_time',
+            'interview_scheduled_sbor',
+            'post_qualification_chat_sbor',
             'forwarded_to_researcher',
             'qualification_failed',
             'declined_vacancy',
