@@ -122,7 +122,7 @@ async def get_access_token(recruiter: TrackedRecruiter, db: AsyncSession) -> str
             recruiter.access_token = tokens["access_token"]
             if "refresh_token" in tokens:
                 recruiter.refresh_token = tokens["refresh_token"]
-            recruiter.token_expires_at = now + datetime.timedelta(seconds=tokens["expires_in"] - 300)
+            recruiter.token_expires_at = now + datetime.timedelta(seconds=tokens["expires_in"])
             recruiter.is_auth_active = True
             db.add(recruiter)
             # ИЗМЕНЕНИЕ: await db.commit() вместо await asyncio.to_thread(db.commit)
