@@ -9,6 +9,8 @@ import random
 from hr_bot.services import hh_api_real
 from dotenv import load_dotenv
 from sqlalchemy.ext.asyncio import AsyncSession
+from hr_bot.services import knowledge_base
+from hr_bot.services import llm_handler
 from sqlalchemy import func, select
 import datetime
 from sqlalchemy.orm import selectinload
@@ -27,8 +29,7 @@ from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, TrackedRecruiter, AppSettings, InactiveNotificationQueue, RejectedNotificationQueue, InterviewReminder, LlmUsageLog, DeclinedInterviewNotificationQueue, InterviewFollowup, RescheduledNotificationQueue
 from hr_bot.services import hh_api_real as hh_api
-from hr_bot.services import knowledge_base
-from hr_bot.services import llm_handler
+from hr_bot.services import sbor_google_service
 from hr_bot.db import statistics_manager
 from hr_bot.utils.metrics import start_metrics_server
 from hr_bot.utils.pii_masker import extract_and_mask_pii
@@ -36,6 +37,7 @@ from hr_bot.utils.system_notifier import send_system_alert
 from hr_bot.utils.resh_in_code import check_candidate_eligibility, is_candidate_profile_complete
 import signal
 import sys
+from hr_bot.services import sbor_google_service
 from hr_bot.utils.redis_lock import acquire_lock, release_lock
 from hr_bot.services.llm_handler import cleanup, LlmValidationError
 from sqlalchemy import func, select, delete, update
@@ -45,6 +47,18 @@ from sqlalchemy import func, select, delete, and_, case, literal # <--- Доба
 # ... остальные импорты
 
 logger = logging.getLogger(__name__)
+
+def is_collector_vacancy(vacancy_title: str) -> bool:
+    """
+    Проверяет, является ли вакансия 'сборщиком' на основе ключевых слов.
+    """
+    if not vacancy_title:
+        return False
+    
+    title_low = vacancy_title.lower()
+    keywords = ['сборщик', 'сканировщик', 'комплектовщик', 'упаковщик']
+    
+    return any(word in title_low for word in keywords)
 
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 13, 11, 0, 0, tzinfo=datetime.timezone.utc)
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 16, 13, 56, 0, tzinfo=datetime.timezone.utc)
@@ -811,7 +825,7 @@ def _generate_calendar_context_2() -> str:
 
     return calendar_context
 
-def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str, vacancy_title: str) -> str:
+def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str, vacancy_title: str, interview_address: str = None) -> str:
     """Собирает динамический системный промпт из блоков библиотеки (упрощенная версия с единым FAQ)."""
 
     required_blocks = ['#ROLE_AND_STYLE#']
@@ -827,13 +841,8 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         'уборщик', 'уборщица', 'помошник повара'
     ]
     
-    # Список 2: Сборщики для Питера (идут в #ADRESS_SPB_1#)
-    sborshik_vacancies = [
-        'сборщик', 'комплектовщик', 'упаковщик'
-    ]
-
     is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
-    is_sborshik_vacancy = any(phrase in current_title_lower for phrase in sborshik_vacancies)
+    is_sborshik_vacancy = is_collector_vacancy(vacancy_title)
 
     if not is_spb_city or is_excluded_vacancy:
         # Если не Питер ИЛИ это исключение (повар и т.д.)
@@ -865,11 +874,20 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         'scheduling_spb_day': ['#SCHEDULING_ALGORITHM#'],
         'scheduling_spb_time': ['#SCHEDULING_ALGORITHM#'],
         'interview_scheduled_spb': ['#SCHEDULING_ALGORITHM#'],
+
+        'scheduling_sbor_metro': ['#METRO#'],
+        'init_scheduling_sbor': ['#SCHEDULING_ALGORITHM_SBOR#'],
+        'scheduling_sbor_day': ['#SCHEDULING_ALGORITHM_SBOR#'],
+        'scheduling_sbor_time': ['#SCHEDULING_ALGORITHM_SBOR#'],
+        'interview_scheduled_sbor': ['#SCHEDULING_ALGORITHM_SBOR#'],
+        
+
+
         'forwarded_to_researcher': ['#POSTCVALTWO#'],
     }
     required_blocks.extend(state_specific_blocks.get(dialogue_state, []))
 
-    if dialogue_state in ['forwarded_to_researcher', 'post_qualification_chat', 'awaiting_questions', 'initial_processing', 'call_later']:
+    if dialogue_state in ['forwarded_to_researcher', 'post_qualification_chat', 'post_qualification_chat_sbor', 'awaiting_questions', 'initial_processing', 'call_later']:
         required_blocks.append('#FAQ#')
 
     final_block_keys = list(dict.fromkeys(required_blocks))
@@ -880,8 +898,10 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 
     # +++ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ +++
     # Определяем состояния, для которых нужен календарь
-    SCHEDULING_STATES = ['init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'post_qualification_chat', 'interview_scheduled_spb']
-
+    SCHEDULING_STATES = [
+        'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'post_qualification_chat', 'interview_scheduled_spb',
+        'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'post_qualification_chat_sbor', 'interview_scheduled_sbor'
+    ]
     # Если текущее состояние требует календаря, генерируем и добавляем его
     if dialogue_state in SCHEDULING_STATES:
         calendar_block = _generate_calendar_context_2()
@@ -894,6 +914,10 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         post_qual_block = prompt_library.get('#POSTCVAL#', '')
         if post_qual_block:
             prompt_pieces.append(post_qual_block)
+    elif dialogue_state in ['interview_scheduled_sbor', 'post_qualification_chat_sbor']:
+        post_qual_sbor_block = prompt_library.get('#POSTCVAL_SBOR#', '')
+        if post_qual_sbor_block:
+            prompt_pieces.append(post_qual_sbor_block)
 
     vacancy_context = (
         "[CRITICAL CONTEXT] Ниже представлено описание вакансии той, на которую откликнулся кандидат. "
@@ -909,7 +933,11 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     # --- ГЛОБАЛЬНАЯ ЗАМЕНА ПЛЕЙСХОЛДЕРА АДРЕСА ---
     # Заменяем [адрес вакансии] на реальные данные из БД
     final_prompt = full_prompt_text.replace("[адрес вакансии]", full_address or city_name)
-
+    # НОВАЯ ЗАМЕНА для сборщиков
+    # Логика: если interview_address передан (это адрес из диалога), берем его. 
+    # Если нет — берем стандартный full_address.
+    target_interview_addr = interview_address or full_address or city_name
+    final_prompt = final_prompt.replace("[Адрес_собеса_сборщики]", target_interview_addr)
     return final_prompt
 
 async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruiter: TrackedRecruiter, prompt_library: dict, ctx_logger):
@@ -1090,7 +1118,14 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         dialogue.is_followup = False
         # dialogue.current_mode = 'standard'
         dialogue.need_follow_up_resheduled_sent = True
-        dialogue.dialogue_state = 'init_scheduling_spb' # Было .state (исправлено)
+        if is_collector_vacancy(dialogue.vacancy.title):
+            # Если сборщик — идем по пути sbor
+            dialogue.dialogue_state = 'init_scheduling_sbor'
+        else:
+            # Если стандартная вакансия СПб
+            dialogue.dialogue_state = 'init_scheduling_spb'
+            
+ 
         # 2. Сохраняем реальные сообщения КАНДИДАТА в историю
         # (Мы не добавляем сюда системную команду, чтобы избежать дублей в следующем цикле)
         dialogue.history = (current_history + user_entries_to_history)
@@ -1098,7 +1133,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
         system_command = {
             'message_id': f'sys_cmd_reschedule_{time.time()}',
             'role': 'user',
-            'content': '[SYSTEM COMMAND] Кандидат хочет перенести собеседование (пришел из Follow-up). Начни запись на собеседование в Санкт-Петербурге (предложи выбрать день).'
+            'content': '[SYSTEM COMMAND] Кандидат хочет перенести собеседование (пришел из Follow-up). Начни запись на собеседование в (предложи выбрать день).'
         }
         
         # 4. Кладем команду в очередь и обновляем время
@@ -1647,6 +1682,16 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             'qualification_failed',
             'declined_vacancy',
             'declined_interview'
+
+            # --- НОВЫЕ СТАТУСЫ ---
+            'scheduling_sbor_metro',
+            'init_scheduling_sbor',
+            'scheduling_sbor_day',
+            'scheduling_sbor_time',
+            'interview_scheduled_sbor',
+            'post_qualification_chat_sbor',
+            # ---------------------
+
         }
 
         bot_response_text = llm_response.get("response_text")
@@ -1691,11 +1736,61 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
 
+        # --- [START] ОБРАБОТКА ВЫБОРА МЕТРО (СЦЕНАРИЙ СБОРЩИК) ---
+        if new_state == 'scheduling_sbor_metro':
+            metro_station = extracted_data.get("metro")
+            
+            if metro_station:
+                ctx_logger.info(f"[{dialogue.hh_response_id}] LLM извлекла метро: {metro_station}. Проверяю доступность...")
+                
+                # Ищем адрес и проверяем слоты одной функцией
+                found_address = await sbor_google_service.check_metro_availability(metro_station)
 
+                # Сохраняем текущий прогресс истории
+                current_history = list(dialogue.history) if dialogue.history else []
+                dialogue.history = (current_history + user_entries_to_history)[-350:]
+
+                if found_address:
+                    # СТАНЦИЯ ЕСТЬ
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Станция '{metro_station}' доступна. Переход к записи.")
+                    
+                    dialogue.metro_station = metro_station # Сохраняем станцию в диалог
+                    dialogue.selected_address = found_address
+                    dialogue.dialogue_state = 'init_scheduling_sbor'
+                    
+                    system_command = {
+                        'message_id': f'sys_cmd_metro_ok_{time.time()}',
+                        'role': 'user',
+                        'content': (
+                            f"[SYSTEM COMMAND] Станция метро '{metro_station}' подтверждена как доступная. "
+                            "Теперь начни запись на собеседование: предложи кандидату выбрать дату (день недели), используя календарь."
+                        )
+                    }
+                else:
+                    # СТАНЦИИ НЕТ
+                    ctx_logger.warning(f"[{dialogue.hh_response_id}] Станция '{metro_station}' недоступна.")
+                    
+                    dialogue.dialogue_state = 'scheduling_sbor_metro'
+                    system_command = {
+                        'message_id': f'sys_cmd_metro_fail_{time.time()}',
+                        'role': 'user',
+                        'content': (
+                            f"[SYSTEM COMMAND] К сожалению, на станции метро '{metro_station}' сейчас нет вакантных мест. "
+                            "Сообщи об этом кандидату вежливо и попроси его выбрать другую станцию метро, которая ему удобна."
+                        )
+                    }
+
+                # Отправляем на перегенерацию
+                dialogue.pending_messages = [system_command]
+                dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                await db.commit()
+                ctx_logger.info(f"[{dialogue.hh_response_id}] Метро обработано. Направлено на перегенерацию.")
+                return 
+        # --- [END] ОБРАБОТКА ВЫБОРА МЕТРО ---
 
         # [RESCHEDULE PROTECTION] Отмена напоминаний при начале переноса
         # =====================================================================
-        if new_state == 'init_scheduling_spb' and dialogue.interview_datetime_utc is not None:
+        if new_state in ['init_scheduling_spb', 'init_scheduling_sbor'] and dialogue.interview_datetime_utc is not None:
             ctx_logger.info(
                 f"[{dialogue.hh_response_id}] Обнаружено начало процесса переноса. "
                 f"Отменяю все активные напоминания и фоллоу-апы (старое время: {dialogue.interview_datetime_utc}).",
@@ -1729,8 +1824,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ (для Time Selection и Final Booking)
         # =====================================================================
         # Список состояний, в которых нам критично важно, чтобы дата была верной
-        DATE_CRITICAL_STATES = ['init_scheduling_spb','scheduling_spb_day','scheduling_spb_time', 'interview_scheduled_spb']
-
+        DATE_CRITICAL_STATES = [
+            'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb',
+            'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'interview_scheduled_sbor'
+        ]
         if new_state in DATE_CRITICAL_STATES:
             interview_date = extracted_data.get("interview_date")
             interview_time = extracted_data.get("interview_time")
@@ -1897,34 +1994,40 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     correct_weekday = weekdays_ru[weekday_idx]
 
                     # Определяем категорию вакансии
-                    warehouse_keywords = [
-                        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
-                        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
-                    ]
-                    current_title_low = (dialogue.vacancy.title or "").lower()
-                    current_city_low = (dialogue.vacancy.city or "").lower()
-                    
-                    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
-                    is_spb = any(city in current_city_low for city in target_cities)
-                    is_warehouse = any(word in current_title_low for word in warehouse_keywords)
+                    is_warehouse = is_collector_vacancy(dialogue.vacancy.title)
+                    slots = []
 
-                    # 3. Определяем базовые слоты по регламенту
-                    if weekday_idx == 6 or is_holiday:  # Добавили проверку на 23 февраля
-                        slots = []
-                    elif weekday_idx == 5:  # Суббота
-                        slots = ["14:00"]
-                    else:  # Будни
-                        if is_spb and is_warehouse:
-                            slots = ["10:00", "12:00", "15:00", "16:00"]
-                        else:
-                            slots = ["10:00", "12:00", "16:00"]
+                    if is_warehouse:
+                        # --- ЛОГИКА ДЛЯ СБОРЩИКОВ: ЗАПРОС СЛОТОВ ИЗ GOOGLE ---
+                        target_address = dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address')
+                        target_city = dialogue.vacancy.city or "Санкт-Петербург"
+                        
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Запрос слотов из Google для сборщика. Дата: {interview_date}, Адрес: {target_address}")
+                        
+                        slots = await sbor_google_service.get_available_slots(
+                            date_str=interview_date,
+                            city=target_city,
+                            address=target_address
+                        )
+                    else:
+                        # --- СТАНДАРТНАЯ ЛОГИКА (ХАРДКОД) ---
+                        current_city_low = (dialogue.vacancy.city or "").lower()
+                        target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                        is_spb = any(city in current_city_low for city in target_cities)
+
+                        if weekday_idx == 6 or is_holiday:
+                            slots = []
+                        elif weekday_idx == 5:  # Суббота
+                            slots = ["14:00"]
+                        else:  # Будни
+                            if is_spb:
+                                slots = ["10:00", "12:00", "15:00", "16:00"]
+                            else:
+                                slots = ["10:00", "12:00", "16:00"]
 
                     # --- ЛОГИКА ФИЛЬТРАЦИИ ДЛЯ "СЕГОДНЯ" ---
                     if interview_date == today_str and slots:
-                        # Оставляем только те слоты, которые минимум на 1 час позже текущего времени
-                        # (Чтобы у кандидата было время доехать)
                         slots = [s for s in slots if int(s.split(':')[0]) > current_hour]
-                    # ---------------------------------------
 
                     # 4. Формируем текст инструкции
                     if is_holiday:
@@ -1932,17 +2035,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             f"[SYSTEM COMMAND] Внимание!!! {interview_date} — это праздничный день!!! "
                             f"В праздничные дни офисы закрыты и собеседования не проводятся. Запись невозможна. Предложи другой день."
                         )
-
                     elif weekday_idx == 6:
-                    
                         hint_content = (
                             f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
                             f"По воскресеньям собеседования не проводятся, запись невозможна. Предложи другой день."
                         )
-                    elif not slots: # Если это сегодня и все слоты уже прошли
+                    elif not slots:
                         hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! Сегодня ({interview_date}) запись на собеседование уже окончена (текущее время {now_msk.strftime('%H:%M')}). "
-                            f"Запись на сегодня невозможна. Предложи кандидату выбрать другой день (например, завтра или в ближайший будний день)."
+                            f"[SYSTEM COMMAND] Внимание!!! На дату {interview_date} ({correct_weekday}) нет доступных слотов для записи. "
+                            f"Предложи кандидату выбрать другой день (например, завтра или в ближайший будний день)."
                         )
                     else:
                         slots_str = ", ".join(slots)
@@ -1959,17 +2060,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                     if not already_hinted:
                         ctx_logger.info(f"[{dialogue.hh_response_id}] Добавляю регламент дня: {interview_date} (Свободно: {slots})")
-                        
                         hint_cmd = {
                             'message_id': f'sys_hint_{time.time()}',
                             'role': 'user',
                             'content': hint_content
                         }
-                        
                         dialogue.history = (dialogue.history or []) + [hint_cmd]
                         dialogue.pending_messages = user_entries_to_history 
                         dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                        
                         await db.commit()
                         return 
                 except Exception as e:
@@ -1979,57 +2077,52 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # [START] ШАГ 3: ЖЕСТКАЯ ВАЛИДАЦИЯ ВРЕМЕНИ (TIME ENFORCEMENT)
         # =====================================================================
         if new_state in DATE_CRITICAL_STATES:
-            
-
             # Проверяем время только если и дата, и время уже извлечены моделью
             if interview_date and interview_time:
                 try:
-                    # 1. Снова вычисляем доступные слоты для этой даты (синхронно с логикой Hint)
                     now_msk = datetime.datetime.now(SPB_TIMEZONE)
                     today_str = now_msk.strftime('%Y-%m-%d')
                     current_hour = now_msk.hour
 
                     v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
                     weekday_idx = v_date_obj.weekday()
-                    
-                    # Логика определения слотов (повторяем для точности проверки)
-                    warehouse_keywords = [
-                        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
-                        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
-                    ]
-                    is_warehouse = any(word in (dialogue.vacancy.title or "").lower() for word in warehouse_keywords)
                     holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
-                    is_holiday = (v_date_obj.month, v_date_obj.day) in holidays # <--- НОВАЯ СТРОКА
-                    if weekday_idx == 6 or is_holiday:
-                        allowed_slots = []
-                    elif weekday_idx == 5: # Сб
-                        allowed_slots = ["14:00"]
-                    else: # Будни
-                        # Используем ту же логику СПб/Мурино/Кудрово, что и выше
-                        target_cities = ['санкт-петербург', 'мурино', 'кудрово']
-                        is_spb_area = any(city in (dialogue.vacancy.city or "").lower() for city in target_cities)
-                        allowed_slots = ["10:00", "12:00", "15:00", "16:00"] if (is_spb_area and is_warehouse) else ["10:00", "12:00", "16:00"]
+                    is_holiday = (v_date_obj.month, v_date_obj.day) in holidays
+                    
+                    is_warehouse = is_collector_vacancy(dialogue.vacancy.title)
+                    allowed_slots = []
+
+                    if is_warehouse:
+                        # Повторный запрос слотов из Google для валидации
+                        target_address = dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address')
+                        target_city = dialogue.vacancy.city or "Санкт-Петербург"
+                        allowed_slots = await sbor_google_service.get_available_slots(interview_date, target_city, target_address)
+                    else:
+                        if weekday_idx == 6 or is_holiday:
+                            allowed_slots = []
+                        elif weekday_idx == 5: # Сб
+                            allowed_slots = ["14:00"]
+                        else: # Будни
+                            current_city_low = (dialogue.vacancy.city or "").lower()
+                            target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                            is_spb_area = any(city in current_city_low for city in target_cities)
+                            allowed_slots = ["10:00", "12:00", "15:00", "16:00"] if is_spb_area else ["10:00", "12:00", "16:00"]
 
                     # Фильтр для "сегодня"
                     if interview_date == today_str:
                         allowed_slots = [s for s in allowed_slots if int(s.split(':')[0]) > current_hour]
 
-                    # 2. СРАВНЕНИЕ: Проверяем, входит ли время от LLM в список разрешенных
-                    # Мы используем .strip() и проверяем вхождение, чтобы избежать ошибок формата (например "10:00" vs "10:00 ")
                     clean_time = interview_time.strip()
-                    
                     if clean_time not in allowed_slots:
                         ctx_logger.warning(f"🚨 МОДЕЛЬ ОШИБЛАСЬ СО ВРЕМЕНЕМ! Выбрано: {clean_time}, Доступно: {allowed_slots}")
 
-                        # Формируем текст ошибки
                         if not allowed_slots:
-                            
                             if is_holiday:
                                 error_msg = f"{interview_date} — праздничный день, офисы закрыты, собеседования не проводятся."
                             elif weekday_idx == 6:
                                 error_msg = f"По воскресеньям ({interview_date}) собеседования не проводятся."
                             else:
-                                error_msg = f"На сегодня ({interview_date}) запись уже окончена."
+                                error_msg = f"На дату ({interview_date}) запись сейчас невозможна (нет свободных слотов)."
                         else:
                             error_msg = f"На дату {interview_date} доступно только время: {', '.join(allowed_slots)}. Слот {clean_time} недоступен."
 
@@ -2039,18 +2132,16 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             'content': (
                                 f"[SYSTEM COMMAND] {error_msg} "
                                 f"Предложи выбрать из доступных слотов: {', '.join(allowed_slots) if allowed_slots else 'другой день'}."
-                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_time' в JSON на null, пока кандидат не выберет корректный вариант. Когда кандидат определится со временем, верни его в поле 'interview_time'."
+                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_time' в JSON на null, пока кандидат не выберет корректный вариант."
                             )
                         }
 
-                        # Сохраняем историю (включая сообщения юзера из этой итерации!) и отправляем на перегенерацию
                         dialogue.history = (dialogue.history or []) + user_entries_to_history + [time_corr_cmd]
-                        dialogue.pending_messages = user_entries_to_history + [time_corr_cmd]# Чтобы LLM видела, на что она отвечает
+                        dialogue.pending_messages = user_entries_to_history + [time_corr_cmd]
                         dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                        
                         await db.commit()
                         ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление времени: {clean_time} -> {allowed_slots}")
-                        return # <--- ПРЕРЫВАЕМ и перегенерируем ответ
+                        return 
 
                 except Exception as e:
                     ctx_logger.error(f"Ошибка в этапе жесткой валидации времени: {e}")
@@ -2070,6 +2161,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             # --- 1. ОБРАБОТКА ВОЗРАСТА ---
             raw_age = extracted_data.get("age")
+            raw_metro = extracted_data.get("metro")
+            if raw_metro:
+                # Сохраняем, только если оно еще не заполнено или изменилось
+                if not dialogue.metro_station or dialogue.metro_station.lower() != raw_metro.lower():
+                    dialogue.metro_station = raw_metro
+                    ctx_logger.debug(
+                        f"[{dialogue.hh_response_id}] Станция метро '{raw_metro}' сохранена в БД.",
+                        extra={"action": "metro_saved"}
+                    )
             if raw_age:
                 # Разрешенные стейты для записи возраста
                 allowed_age_states = ['awaiting_age', 'clarifying_anything']
@@ -2113,6 +2213,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         f"[{dialogue.hh_response_id}] Игнорируем гражданство от LLM, так как стейт '{current_state_at_update}' это запрещает.",
                         extra={"action": "citizenship_update_blocked_by_state"}
                     )
+
+            
             # if extracted_data.get("citizenship"):
             #     dialogue.candidate.citizenship = extracted_data["citizenship"]
             # if extracted_data.get("city"):
@@ -2412,79 +2514,173 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     extra={"action": "qualification_passed_by_code"}
                 )
 
-                # Проверяем город
-                city_lower = (dialogue.vacancy.city or "").lower()
-                # --- ИЗМЕНЕНИЕ: Добавлены Мурино и Кудрово ---
-                target_cities = ['санкт-петербург', 'мурино', 'кудрово']
-                is_spb = any(x in city_lower for x in target_cities)
-                # ---------------------------------------------
+                # 1. ПЕРВООЧЕРЕДНАЯ ПРОВЕРКА: СБОРЩИК ИЛИ НЕТ
+                # 1. ПЕРВООЧЕРЕДНАЯ ПРОВЕРКА: СБОРЩИК ИЛИ НЕТ
+                # 1. ПЕРВООЧЕРЕДНАЯ ПРОВЕРКА: СБОРЩИК ИЛИ НЕТ
+                if is_collector_vacancy(dialogue.vacancy.title):
+                    ctx_logger.info(
+                        f"[{dialogue.hh_response_id}] Сценарий СБОР: проверка адреса и города.",
+                        extra={"action": "collector_scenario_check"}
+                    )
 
-                if not is_spb:
-                    # --- 2.1 НЕ СПБ (Регионы) ---
-                    new_state = 'forwarded_to_researcher'
-                    bot_response_text = """Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."""
-                    # Логика перемещения в папку 'interview' и смены статуса на 'qualified' сработает ниже
+                    vacancy_info = dialogue.vacancy.extracted_info or {}
+                    full_address_str = vacancy_info.get('full_address', '')
+                    
+                    # Проверка на наличие цифр в адресе (номер дома)
+                    has_house_number = bool(re.search(r'\d', full_address_str))
+                    is_detailed_address = has_house_number and len(full_address_str) > 10
 
+                    # Определяем, является ли город Питером/областью
+                    city_lower = (dialogue.vacancy.city or "").lower()
+                    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                    is_spb_area = any(x in city_lower for x in target_cities)
+
+                    if is_detailed_address:
+                        # СЦЕНАРИЙ А: Адрес есть -> Начинаем запись (независимо от города)
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Адрес найден. Переход в init_scheduling_sbor.")
+                        
+                        current_history = list(dialogue.history) if dialogue.history else []
+                        dialogue.history = (current_history + user_entries_to_history)[-350:]
+                        
+                        dialogue.dialogue_state = 'init_scheduling_sbor'
+                        system_command = {
+                            'message_id': f'sys_cmd_sbor_init_{time.time()}',
+                            'role': 'user',
+                            'content': '[SYSTEM COMMAND] Кандидат прошел квалификацию. Начни запись на собеседование (предложи выбрать день).'
+                        }
+                        dialogue.pending_messages = [system_command]
+                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        await db.commit()
+                        return
+
+                    elif is_spb_area:
+                        # СЦЕНАРИЙ Б: Адреса нет, но это Питер -> Спрашиваем метро
+
+
+                        # ПРОВЕРКА: Если метро уже заполнено в БД
+                        if dialogue.metro_station:
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Метро уже известно ({dialogue.metro_station}). Пропускаю опрос метро.")
+                            
+                            # Сразу проверяем доступность этого метро в Google Таблицах
+                            found_address = await sbor_google_service.check_metro_availability(dialogue.metro_station)
+                            
+                            current_history = list(dialogue.history) if dialogue.history else []
+                            dialogue.history = (current_history + user_entries_to_history)[-350:]
+
+                            if found_address:
+                                dialogue.selected_address = found_address
+                                dialogue.dialogue_state = 'init_scheduling_sbor'
+                                cmd_content = f"[SYSTEM COMMAND] Кандидат прошел квалификацию. Станция метро {dialogue.metro_station} уже известна и подтверждена. Начни запись на собеседование (предложи день)."
+                            else:
+                                # Если метро в базе было, но слотов там нет
+                                dialogue.dialogue_state = 'scheduling_sbor_metro'
+                                cmd_content = f"[SYSTEM COMMAND] Кандидат прошел квалификацию. Ранее указанная станция {dialogue.metro_station} сейчас недоступна. Попроси кандидата выбрать ДРУГУЮ станцию метро."
+                            
+                            dialogue.pending_messages = [{'message_id': f'sys_metro_skip_{time.time()}', 'role': 'user', 'content': cmd_content}]
+                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                            await db.commit()
+                            return
+
+                        else:
+
+
+                                
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Питер без адреса. Переход в scheduling_sbor_metro.")
+                            
+                            current_history = list(dialogue.history) if dialogue.history else []
+                            dialogue.history = (current_history + user_entries_to_history)[-350:]
+
+                            dialogue.dialogue_state = 'scheduling_sbor_metro'
+                            system_command = {
+                                'message_id': f'sys_cmd_sbor_metro_{time.time()}',
+                                'role': 'user',
+                                'content': (
+                                    "[SYSTEM COMMAND] Кандидат прошел квалификацию. Для записи на собеседование тебе нужно вежливо спросить у кандидата, самую удобную для него станцию метро. 'Спасибо за предоставленные данные, теперь давайте запишем Вас на собеседование. Назовите, пожалуйста, самую удобную для Вас станцию метро. Не адрес, не улицу, не район, а именно метро?' "
+                                )
+                            }
+                            dialogue.pending_messages = [system_command]
+                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                            await db.commit()
+                            return
+
+                    else:
+                        # СЦЕНАРИЙ В: Адреса нет и это РЕГИОН -> Перевод на рекрутера (как стандартный не-СПб)
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Региональный сборщик без адреса -> Перевод на рекрутера.")
+                        new_state = 'forwarded_to_researcher'
+                        bot_response_text = "Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."
+                        # Здесь НЕТ return, управление перейдет ниже к блоку квалификации и отправки сообщения
 
 
                 else:
+                    # 2. СТАРЫЙ СЦЕНАРИЙ (Питер / Регионы)
+                    city_lower = (dialogue.vacancy.city or "").lower()
+                    # --- ИЗМЕНЕНИЕ: Добавлены Мурино и Кудрово ---
+                    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                    is_spb = any(x in city_lower for x in target_cities)
+                    # ---------------------------------------------
 
-                    current_title_lower = (vacancy_title or "").lower()
-
-                    # Список фраз, которые ищем в названии
-                    # Список фраз, которые ищем в названии (для этих вакансий в СПб автоматическая запись не предлагается)
-                    excluded_vacancies = [
-                        'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
-                        'уборщик', 'уборщица', 'помошник повара',
-                        'сборщик онлайн заказов', 'сборщик заказов', 'сканировщик qr-кодов', 
-                        'сканировщик', 'сборщик', 'комплектовщик', 'упаковщик', 'кассир-комплектовщик'
-                    ]
-                    # Проверяем, входит ли хоть одна фраза из списка в название вакансии
-                    if any(phrase in current_title_lower for phrase in excluded_vacancies):
-                        ctx_logger.info(
-                            f"[{dialogue.hh_response_id}] Вакансия '{vacancy_title}' (СПб) переведена на рекрутера (исключение).",
-                            extra={"action": "spb_vacancy_excluded"}
-                        )
+                    if not is_spb:
+                        # --- 2.1 НЕ СПБ (Регионы) ---
                         new_state = 'forwarded_to_researcher'
-                        bot_response_text = "Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."
+                        bot_response_text = """Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."""
+                        # Логика перемещения в папку 'interview' и смены статуса на 'qualified' сработает ниже
 
                     else:
-                        # --- 2.2 СПБ (Запись на собеседование) ---
-                        ctx_logger.info(
-                            f"[{dialogue.hh_response_id}] Город СПб. Кандидат подходит. Добавляю команду для LLM на запись.",
-                            extra={"action": "spb_scheduling_start"}
-                        )
+                        current_title_lower = (vacancy_title or "").lower()
+
+                        # Список фраз, которые ищем в названии
+                        # Список фраз, которые ищем в названии (для этих вакансий в СПб автоматическая запись не предлагается)
+                        excluded_vacancies = [
+                            'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
+                            'уборщик', 'уборщица', 'помошник повара'
+                            # 'сборщик' и т.д. убраны отсюда, так как они теперь обрабатываются выше
+                        ]
+                        # Проверяем, входит ли хоть одна фраза из списка в название вакансии
+                        if any(phrase in current_title_lower for phrase in excluded_vacancies):
+                            ctx_logger.info(
+                                f"[{dialogue.hh_response_id}] Вакансия '{vacancy_title}' (СПб) переведена на рекрутера (исключение).",
+                                extra={"action": "spb_vacancy_excluded"}
+                            )
+                            new_state = 'forwarded_to_researcher'
+                            bot_response_text = "Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."
+
+                        else:
+                            # --- 2.2 СПБ (Запись на собеседование) ---
+                            ctx_logger.info(
+                                f"[{dialogue.hh_response_id}] Город СПб. Кандидат подходит. Добавляю команду для LLM на запись.",
+                                extra={"action": "spb_scheduling_start"}
+                            )
 
 
-                        # 2. ВАЖНО: Нам нужно сохранить текущие ответы пользователя в историю прямо сейчас.
-                        # Так как мы прерываем цикл (return), стандартное сохранение истории в конце функции не сработает.
-                        # Если этого не сделать, бот "забудет", что кандидат только что ответил про возраст/гражданство.
-                        current_history = list(dialogue.history) if dialogue.history else []
-                        # user_entries_to_history мы сформировали в начале функции
-                        dialogue.history = (current_history + user_entries_to_history)[-350:]
+                            # 2. ВАЖНО: Нам нужно сохранить текущие ответы пользователя в историю прямо сейчас.
+                            # Так как мы прерываем цикл (return), стандартное сохранение истории в конце функции не сработает.
+                            # Если этого не сделать, бот "забудет", что кандидат только что ответил про возраст/гражданство.
+                            current_history = list(dialogue.history) if dialogue.history else []
+                            # user_entries_to_history мы сформировали в начале функции
+                            dialogue.history = (current_history + user_entries_to_history)[-350:]
 
-                        # 3. Формируем скрытую команду для LLM
-                        # Используем role='system' или 'user' с пометкой, чтобы направить LLM.
-                        system_command = {
-                            'message_id': f'sys_cmd_{time.time()}',
-                            'role': 'user',
-                            'content': '[SYSTEM COMMAND] Кандидат прошел квалификацию. Начни запись на собеседование в Санкт-Петербурге (предложи выбрать день).'
-                        }
+                            # 3. Формируем скрытую команду для LLM
+                            # Используем role='system' или 'user' с пометкой, чтобы направить LLM.
+                            system_command = {
+                                'message_id': f'sys_cmd_{time.time()}',
+                                'role': 'user',
+                                'content': '[SYSTEM COMMAND] Кандидат прошел квалификацию. Начни запись на собеседование в Санкт-Петербурге (предложи выбрать день).'
+                            }
 
-                        # 4. Кладем команду в pending_messages
-                        # Мы перезаписываем очередь, убирая оттуда сообщения пользователя (они уже в истории)
-                        # и оставляя только нашу команду.
-                        dialogue.pending_messages = [system_command]
-                        dialogue.dialogue_state = 'init_scheduling_spb'
-                        # 5. Обновляем время (last_updated), чтобы воркер подхватил диалог в следующем цикле мгновенно
-                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                            # 4. Кладем команду в pending_messages
+                            # Мы перезаписываем очередь, убирая оттуда сообщения пользователя (они уже в истории)
+                            # и оставляя только нашу команду.
+                            dialogue.pending_messages = [system_command]
+                            dialogue.dialogue_state = 'init_scheduling_spb'
+                            # 5. Обновляем время (last_updated), чтобы воркер подхватил диалог в следующем цикле мгновенно
+                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
 
-                        # 6. Сохраняем и ПРЕРЫВАЕМ текущую обработку.
-                        # Мы не отправляем сообщение bot_response_text из этого цикла, так как ждем,
-                        # что LLM сгенерирует приглашение в ответ на нашу команду.
+                            # 6. Сохраняем и ПРЕРЫВАЕМ текущую обработку.
+                            # Мы не отправляем сообщение bot_response_text из этого цикла, так как ждем,
+                            # что LLM сгенерирует приглашение в ответ на нашу команду.
 
-                        await db.commit()
-                        return
+                            await db.commit()
+                            return
         elif (dialogue.status not in ['qualified', 'rejected'] and  new_state in ['qualification_complete']
     #and dialogue.dialogue_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']  # <-- ДОБАВИТЬ
     #and new_state not in ['scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb', 'init_scheduling_spb']
@@ -2553,10 +2749,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 )
         # --------------------------------------------------
 
-        if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status == 'qualified':
+        if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb', 'interview_scheduled_sbor'] and dialogue.status == 'qualified':
             
             
-            if new_state == 'interview_scheduled_spb':
+            if new_state in ['interview_scheduled_spb', 'interview_scheduled_sbor']:
                 interview_date = extracted_data.get("interview_date")
                 interview_time = extracted_data.get("interview_time")
 
@@ -2579,6 +2775,33 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             f"[{dialogue.hh_response_id}] 🔄 Обнаружен перенос собеседования. "
                             f"Было: {stored_date_str} {stored_time_str}. Стало: {interview_date} {interview_time}."
                         )
+                        # --- ЛОГИКА GOOGLE ТАБЛИЦ ДЛЯ СБОРЩИКОВ ---
+                        if is_collector_vacancy(dialogue.vacancy.title):
+                            try:
+                                # А. Отменяем старое бронирование
+                                ctx_logger.info(f"[{dialogue.hh_response_id}] Google: Отмена старого слота ({stored_date_str} {stored_time_str})")
+                                await sbor_google_service.change_slot_status(
+                                    hh_id=dialogue.hh_response_id,
+                                    date_str=stored_date_str,
+                                    time_str=stored_time_str,
+                                    new_status="Отменено (перенос)"
+                                )
+                                
+                                # Б. Бронируем новое время
+                                ctx_logger.info(f"[{dialogue.hh_response_id}] Google: Бронирование нового слота ({interview_date} {interview_time})")
+                                await sbor_google_service.book_slot(
+                                    hh_id=dialogue.hh_response_id,
+                                    name=dialogue.candidate.full_name or "Имя не указано",
+                                    phone=dialogue.candidate.phone_number or "Телефон не указан",
+                                    date_str=interview_date,
+                                    time_str=interview_time,
+                                    city=dialogue.vacancy.city or "Санкт-Петербург",
+                                    address=dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address', "Адрес не определен"),
+                                    vacancy=dialogue.vacancy.title
+                                )
+                            except Exception as e:
+                                ctx_logger.error(f"[{dialogue.hh_response_id}] Ошибка при обновлении Google Таблиц при переносе: {e}")
+                        # ------------------------------------------
 
                         # 1. Если это перенос после Follow-up (по флагу) -> RescheduledNotificationQueue
                         if dialogue.need_follow_up_resheduled_sent:
@@ -2602,8 +2825,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                                 db.add(new_resched_alert)
 
                             dialogue.need_follow_up_resheduled_sent = False
-                            dialogue.dialogue_state = 'post_qualification_chat'
-                            new_state = 'post_qualification_chat'
+                            if is_collector_vacancy(dialogue.vacancy.title):
+                                dialogue.dialogue_state = 'post_qualification_chat_sbor'
+                                new_state = 'post_qualification_chat_sbor'
+                            else:
+                                dialogue.dialogue_state = 'post_qualification_chat'
+                                new_state = 'post_qualification_chat'
                             ctx_logger.info(f"[{dialogue.hh_response_id}] Счетчик переносов увеличен: {dialogue.reschedule_count}")
                             dialogue.reschedule_count = (dialogue.reschedule_count or 0) + 1
                     
@@ -2628,8 +2855,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                                 )
                                 
                                 db.add(reschedule_alert)
-                            dialogue.dialogue_state = 'post_qualification_chat'
-                            new_state = 'post_qualification_chat'
+                            if is_collector_vacancy(dialogue.vacancy.title):
+                                dialogue.dialogue_state = 'post_qualification_chat_sbor'
+                                new_state = 'post_qualification_chat_sbor'
+                            else:
+                                dialogue.dialogue_state = 'post_qualification_chat'
+                                new_state = 'post_qualification_chat'
 
                         # --- !!! ВАЖНОЕ ДОБАВЛЕНИЕ !!! ---
                         # Перезаписываем напоминания на новое время
@@ -2643,8 +2874,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             )
                         # ---------------------------------
 
-                        dialogue.dialogue_state = 'post_qualification_chat'
-                        new_state = 'post_qualification_chat'
+                        if is_collector_vacancy(dialogue.vacancy.title):
+                            dialogue.dialogue_state = 'post_qualification_chat_sbor'
+                            new_state = 'post_qualification_chat_sbor'
+                        else:
+                            dialogue.dialogue_state = 'post_qualification_chat'
+                            new_state = 'post_qualification_chat'
 
                     else:
                         # Дата НЕ изменилась (кандидат просто подтвердил то же самое или задал вопрос)
@@ -2654,8 +2889,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         )
                     
                         # Всегда переводим в чат поддержки после обработки (даже если дата не менялась)
-                        dialogue.dialogue_state = 'post_qualification_chat'
-                        new_state = 'post_qualification_chat'    
+                        if is_collector_vacancy(dialogue.vacancy.title):
+                            dialogue.dialogue_state = 'post_qualification_chat_sbor'
+                            new_state = 'post_qualification_chat_sbor'
+                        else:
+                            dialogue.dialogue_state = 'post_qualification_chat'
+                            new_state = 'post_qualification_chat'   
                         # [END] ОБРАБОТКА ПЕРЕНОСА
                 
                 
@@ -2671,8 +2910,32 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             interview_time_str=interview_time,
                             db_session=db
                         )
-                        dialogue.dialogue_state = 'post_qualification_chat' 
-                        new_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                        # --- НОВЫЙ БЛОК: ЗАПИСЬ В GOOGLE ТАБЛИЦУ ДЛЯ СБОРЩИКА ---
+                        if new_state == 'interview_scheduled_sbor':
+                            try:
+                                ctx_logger.info(f"[{dialogue.hh_response_id}] Отправляю данные первичной записи в Google Таблицу...")
+                                booking_success = await sbor_google_service.book_slot(
+                                    hh_id=dialogue.hh_response_id,
+                                    name=dialogue.candidate.full_name or "Имя не указано",
+                                    phone=dialogue.candidate.phone_number or "Телефон не указан",
+                                    date_str=interview_date,
+                                    time_str=interview_time,
+                                    city=dialogue.vacancy.city or "Санкт-Петербург",
+                                    address=dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address', "Адрес не определен"),
+                                    vacancy=dialogue.vacancy.title
+                                )
+                                if not booking_success:
+                                    ctx_logger.error(f"[{dialogue.hh_response_id}] Ошибка при записи в Google Таблицу.")
+                            except Exception as e:
+                                ctx_logger.error(f"[{dialogue.hh_response_id}] Критический сбой при вызове book_slot: {e}")
+                        # ------------------------------------------------------
+
+                        if is_collector_vacancy(dialogue.vacancy.title):
+                            dialogue.dialogue_state = 'post_qualification_chat_sbor'
+                            new_state = 'post_qualification_chat_sbor'
+                        else:
+                            dialogue.dialogue_state = 'post_qualification_chat'
+                            new_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
                         
                     else:
                         ctx_logger.error(
@@ -2682,23 +2945,27 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         # --- КОНЕЦ ДОБАВЛЕНИЯ ---
 
-        if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb'] and dialogue.status != 'qualified':
-            dialogue.status = 'qualified'
-            await log_analytics_event(db, dialogue, 'interview_assigned')
-            # ------------------------------------------------------
-            await statistics_manager.update_stats(db, dialogue.vacancy_id, qualified=1)
+        if new_state in ['forwarded_to_researcher', 'interview_scheduled_spb', 'interview_scheduled_sbor']:
+            if dialogue.status != 'qualified':
+                dialogue.status = 'qualified'
+                # ------------------------------------------------------
+                await statistics_manager.update_stats(db, dialogue.vacancy_id, qualified=1)
 
-            # Проверка существования уведомления (оптимизированная)
-            exists_query = select(func.count()).select_from(NotificationQueue).filter_by(
-                candidate_id=dialogue.candidate.id,
-                status='pending'
-            )
-            result = await db.execute(exists_query)
+                # Проверка существования уведомления (оптимизированная)
+                exists_query = select(func.count()).select_from(NotificationQueue).filter_by(
+                    candidate_id=dialogue.candidate.id,
+                    status='pending'
+                )
+                result = await db.execute(exists_query)
 
-            if result.scalar() == 0:
-                db.add(NotificationQueue(candidate_id=dialogue.candidate.id, status='pending'))
+                if result.scalar() == 0:
+                    db.add(NotificationQueue(candidate_id=dialogue.candidate.id, status='pending'))
 
-            ctx_logger.info(f"Candidate {dialogue.hh_response_id} qualified 🟢. Moving to 'interview'.")
+                ctx_logger.info(f"Candidate {dialogue.hh_response_id} qualified 🟢. Moving to 'interview'.")
+
+            # ЗАПИСЫВАЕМ СОБЫТИЕ В АНАЛИТИКУ (теперь с проверкой дублей по дате!)
+            # Это позволяет учитывать переносы как новые записи в воронке дожимов
+            await log_analytics_event(db, dialogue, 'interview_assigned', check_duplicates=True)
 
             api_move_start = time.monotonic()
             await hh_api.move_response_to_folder(recruiter, db, dialogue.hh_response_id, 'interview')
@@ -2708,7 +2975,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             )
 
             # --- ДОБАВИТЬ ЭТОТ БЛОК КОДА ---
-            if new_state == 'interview_scheduled_spb':
+            if new_state in ['interview_scheduled_spb', 'interview_scheduled_sbor']:
                 interview_date = extracted_data.get("interview_date")
                 interview_time = extracted_data.get("interview_time")
 
@@ -2725,8 +2992,31 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         interview_time_str=interview_time,
                         db_session=db
                     )
-                    dialogue.dialogue_state = 'post_qualification_chat'
-                    new_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
+                    # --- НОВЫЙ БЛОК: ЗАПИСЬ В GOOGLE ТАБЛИЦУ ДЛЯ СБОРЩИКА ---
+                    if new_state == 'interview_scheduled_sbor':
+                        try:
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Отправляю данные записи в Google Таблицу (Сборщик)...")
+                            booking_success = await sbor_google_service.book_slot(
+                                hh_id=dialogue.hh_response_id,
+                                name=dialogue.candidate.full_name or "Имя не указано",
+                                phone=dialogue.candidate.phone_number or "Телефон не указан",
+                                date_str=interview_date,
+                                time_str=interview_time,
+                                city=dialogue.vacancy.city or "Санкт-Петербург",
+                                address=dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address', "Адрес не определен"),
+                                vacancy=dialogue.vacancy.title
+                            )
+                            if not booking_success:
+                                ctx_logger.error(f"[{dialogue.hh_response_id}] Ошибка при записи в Google Таблицу.")
+                        except Exception as e:
+                            ctx_logger.error(f"[{dialogue.hh_response_id}] Критический сбой при вызове book_slot: {e}")
+                    # ------------------------------------------------------
+                    if new_state == 'interview_scheduled_sbor':
+                        dialogue.dialogue_state = 'post_qualification_chat_sbor'
+                        new_state = 'post_qualification_chat_sbor'
+                    else:
+                        dialogue.dialogue_state = 'post_qualification_chat'
+                        new_state = 'post_qualification_chat'  # Переходим в пост-квалификационный чат после планирования
                     
                 else:
                     ctx_logger.error(
@@ -2877,6 +3167,21 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             dialogue.status = 'rejected'
             # --- ДОБАВЛЕННЫЙ БЛОК: Отмена напоминаний при отказе ---
             if new_state == 'declined_interview':
+                # --- ЛОГИКА ОТМЕНЫ В GOOGLE ТАБЛИЦАХ ДЛЯ СБОРЩИКОВ ---
+                if is_collector_vacancy(dialogue.vacancy.title) and dialogue.interview_datetime_utc:
+                    try:
+                        stored_msk_dt = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE)
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Google: Полная отмена записи ({stored_msk_dt.strftime('%Y-%m-%d %H:%M')})")
+                        
+                        await sbor_google_service.change_slot_status(
+                            hh_id=dialogue.hh_response_id,
+                            date_str=stored_msk_dt.strftime('%Y-%m-%d'),
+                            time_str=stored_msk_dt.strftime('%H:%M'),
+                            new_status="Отменено кандидатом"
+                        )
+                    except Exception as e:
+                        ctx_logger.error(f"[{dialogue.hh_response_id}] Ошибка при отмене записи в Google Таблицах: {e}")
+                # -----------------------------------------------------
                 
                 await db.execute(
                     update(InterviewReminder)

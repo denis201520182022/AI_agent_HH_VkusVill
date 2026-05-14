@@ -13,34 +13,31 @@ SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 async def log_analytics_event(db: AsyncSession, dialogue: Dialogue, event_type: str, check_duplicates: bool = False):
     """
     Универсальная функция для записи любого события воронки.
-    
-    Поддерживаемые типы (standard): 
-    'response_created', 'user_reply', 'interview_assigned', 
-    'rejected_by_bot', 'refusal_by_user', 'timed_out'
-
-    Поддерживаемые типы (reactivation):
-    'reactivation_sent', 'user_reply', 'interview_assigned', 
-    'rejected_by_bot', 'refusal_by_user', 'timed_out'
-
-    Поддерживаемые типы (followup):
-    'followup_sent', 'followup_reply', 'followup_rescheduled', 
-    'followup_success', 'followup_refusal', 'followup_no_show'
-    
-    :param check_duplicates: Если True, проверяет, было ли такое событие у этого диалога 
-                             В ТЕКУЩЕМ РЕЖИМЕ (и по той же задаче рассылки).
     """
     try:
+        # 0. Снимок даты собеседования (если она есть в диалоге на момент события)
+        # Мы выносим это в начало, чтобы использовать в проверке дубликатов
+        current_interview_date = None
+        if dialogue.interview_datetime_utc:
+            current_interview_date = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE).date()
+
         # 1. Защита от дублей
-        # Проверяем по тройке: диалог + тип события + режим (и задача рассылки, если она есть)
+        # Проверяем по набору: диалог + тип события + режим + дата собеса
         if check_duplicates:
-            stmt = select(AnalyticsEvent.id).filter(
-                and_(
-                    AnalyticsEvent.dialogue_id == dialogue.id,
-                    AnalyticsEvent.event_type == event_type,
-                    AnalyticsEvent.mode == dialogue.current_mode,
-                    AnalyticsEvent.mailing_task_id == dialogue.active_mailing_task_id
-                )
-            ).limit(1)
+            filters = [
+                AnalyticsEvent.dialogue_id == dialogue.id,
+                AnalyticsEvent.event_type == event_type,
+                AnalyticsEvent.mode == dialogue.current_mode,
+                AnalyticsEvent.mailing_task_id == dialogue.active_mailing_task_id
+            ]
+            
+            # Если у события есть дата собеседования, она становится частью "уникального ключа"
+            if current_interview_date:
+                filters.append(AnalyticsEvent.interview_date == current_interview_date)
+            else:
+                filters.append(AnalyticsEvent.interview_date == None)
+
+            stmt = select(AnalyticsEvent.id).filter(and_(*filters)).limit(1)
             
             result = await db.execute(stmt)
             if result.scalar():
@@ -59,11 +56,6 @@ async def log_analytics_event(db: AsyncSession, dialogue: Dialogue, event_type: 
             candidate = await db.get(Candidate, dialogue.candidate_id) if dialogue.candidate_id else None
             if candidate and candidate.city:
                 city_val = candidate.city
-
-        # 3. Снимок даты собеседования (если она есть в диалоге на момент события)
-        current_interview_date = None
-        if dialogue.interview_datetime_utc:
-            current_interview_date = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE).date()
 
         # 4. Создаем запись события
         event = AnalyticsEvent(

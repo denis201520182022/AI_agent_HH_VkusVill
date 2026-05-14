@@ -151,6 +151,8 @@ class Dialogue(Base):
     response_created_at = Column(DateTime(timezone=True), nullable=True)
     
     interview_datetime_utc = Column(DateTime(timezone=True), nullable=True)
+    metro_station = Column(String(255), nullable=True) 
+    selected_address = Column(String(500), nullable=True) # Полученный адрес (ул. Ленина, 10)
     is_followup = Column(Boolean, default=False, server_default='false')
     need_follow_up_resheduled_sent = Column(Boolean, default=False, server_default='false')
     interview_result = Column(String(50), nullable=True) 
