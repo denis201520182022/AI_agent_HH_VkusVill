@@ -1846,62 +1846,81 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             metro_station = extracted_data.get("metro")
             
             if metro_station:
-                ctx_logger.info(f"[{dialogue.hh_response_id}] LLM извлекла метро: {metro_station}. Проверяю доступность...")
+                ctx_logger.info(f"[METRO_FLOW] LLM извлекла станцию: '{metro_station}'")
+                # --- [НОВОЕ] ЗАЩИТА ОТ ЦИКЛА ---
+                # Проверяем, нет ли в ПОСЛЕДНИХ сообщениях истории команды об отказе по ЭТОЙ ЖЕ станции
+                last_fail_msg = f"возле станции метро '{metro_station}' конкретно сейчас нет вакантных мест"
+                is_already_failed = any(last_fail_msg in (m.get('content', '') or '') for m in (dialogue.history or [])[-3:])
                 
-                # Ищем адрес и проверяем слоты одной функцией
-                found_address = await sbor_google_service.check_metro_availability(metro_station)
-
-                # --- [НОВОЕ] ФИЛЬТРАЦИЯ ИСТОРИИ ---
-                # Убираем из списка на сохранение старые системные команды, связанные с метро
-                clean_user_entries = []
-                for entry in user_entries_to_history:
-                    content = entry.get('content', '')
-                    if isinstance(content, str) and content.startswith("[SYSTEM COMMAND]") and ("метро" in content.lower() or "станция" in content.lower()):
-                        ctx_logger.debug("Обнаружена старая команда по метро. Удаляем из очереди на сохранение в историю.")
-                        continue
-                    clean_user_entries.append(entry)
-
-                # Сохраняем историю без лишнего мусора
-                current_history = list(dialogue.history) if dialogue.history else []
-                dialogue.history = (current_history + clean_user_entries)[-350:]
-                # ----------------------------------
-
-                if found_address:
-                    # СТАНЦИЯ ЕСТЬ
-                    ctx_logger.info(f"[{dialogue.hh_response_id}] Станция '{metro_station}' доступна. Переход к записи.")
-                    
-                    dialogue.metro_station = metro_station # Сохраняем станцию в диалог
-                    dialogue.selected_address = found_address
-                    dialogue.dialogue_state = 'init_scheduling_sbor'
-                    
-                    system_command = {
-                        'message_id': f'sys_cmd_metro_ok_{time.time()}',
-                        'role': 'user',
-                        'content': (
-                            f"[SYSTEM COMMAND] Станция метро '{metro_station}' подтверждена как доступная. "
-                            "Теперь начни запись на собеседование: предложи кандидату выбрать дату (день недели), используя календарь."
-                        )
-                    }
+                if is_already_failed:
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Станция {metro_station} уже была проверена и отклонена. Пропускаю повторный запрос в Google.")
+                    # Обнуляем метро в переменной, чтобы код не пошел в проверку Гугла, 
+                    # но не прерываем выполнение, чтобы бот просто ответил текстом.
+                    metro_station = None 
                 else:
-                    # СТАНЦИИ НЕТ
-                    ctx_logger.warning(f"[{dialogue.hh_response_id}] Станция '{metro_station}' недоступна.")
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] LLM извлекла метро: {metro_station}. Проверяю доступность...")
                     
-                    dialogue.dialogue_state = 'scheduling_sbor_metro'
-                    system_command = {
-                        'message_id': f'sys_cmd_metro_fail_{time.time()}',
-                        'role': 'user',
-                        'content': (
-                            f"[SYSTEM COMMAND] К сожалению, возле станции метро '{metro_station}' конкретно сейчас нет вакантных мест. "
-                            "Сообщи об этом кандидату вежливо и попроси его выбрать другую станцию метро, которая ему удобна."
-                        )
-                    }
 
-                # Отправляем на перегенерацию
-                dialogue.pending_messages = [system_command]
-                dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                await db.commit()
-                ctx_logger.info(f"[{dialogue.hh_response_id}] Метро обработано. Команда отправлена на перегенерацию.")
-                return 
+                    # Ищем адрес и проверяем слоты одной функцией
+                    found_address = await sbor_google_service.check_metro_availability(metro_station)
+                    if found_address:
+                        ctx_logger.info(f"[METRO_FLOW] ✅ УСПЕХ: Метро '{metro_station}' подтверждено. Адрес: '{found_address}'")
+                    else:
+                        ctx_logger.warning(f"[METRO_FLOW] ❌ ОТКАЗ: Станция '{metro_station}' не найдена в базе или нет свободных мест.")
+
+                    # --- [НОВОЕ] ФИЛЬТРАЦИЯ ИСТОРИИ ---
+                    # Убираем из списка на сохранение старые системные команды, связанные с метро
+                    clean_user_entries = []
+                    for entry in user_entries_to_history:
+                        content = entry.get('content', '')
+                        if isinstance(content, str) and content.startswith("[SYSTEM COMMAND]") and ("метро" in content.lower() or "станция" in content.lower()):
+                            ctx_logger.debug("Обнаружена старая команда по метро. Удаляем из очереди на сохранение в историю.")
+                            continue
+                        clean_user_entries.append(entry)
+
+                    # Сохраняем историю без лишнего мусора
+                    current_history = list(dialogue.history) if dialogue.history else []
+                    dialogue.history = (current_history + clean_user_entries)[-350:]
+                    # ----------------------------------
+
+                    if found_address:
+                        # СТАНЦИЯ ЕСТЬ
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Станция '{metro_station}' доступна. Переход к записи.")
+                        
+                        dialogue.metro_station = metro_station # Сохраняем станцию в диалог
+                        dialogue.selected_address = found_address
+                        dialogue.dialogue_state = 'init_scheduling_sbor'
+                        
+                        system_command = {
+                            'message_id': f'sys_cmd_metro_ok_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM COMMAND] Станция метро '{metro_station}' подтверждена как доступная. "
+                                "Теперь начни запись на собеседование: предложи кандидату выбрать дату (день недели), используя календарь."
+                            )
+                        }
+                    else:
+                        # СТАНЦИИ НЕТ
+                        ctx_logger.warning(f"[{dialogue.hh_response_id}] Станция '{metro_station}' недоступна.")
+                        
+                        dialogue.dialogue_state = 'scheduling_sbor_metro'
+                        system_command = {
+                            'message_id': f'sys_cmd_metro_fail_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                f"[SYSTEM COMMAND] К сожалению, возле станции метро '{metro_station}' конкретно сейчас нет вакантных мест. "
+                                f"1. Сообщи об этом кандидату вежливо и попроси его выбрать другую станцию метро. "
+                                f"2. ОБЯЗАТЕЛЬНО установи поле 'metro' в JSON в значение null или пустую строку, " # <--- ДОБАВИЛИ ЭТО
+                                f"так как {metro_station} больше не рассматривается."
+                            )
+                        }
+
+                    # Отправляем на перегенерацию
+                    dialogue.pending_messages = [system_command]
+                    dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                    await db.commit()
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Метро обработано. Команда отправлена на перегенерацию.")
+                    return 
         # --- [END] ОБРАБОТКА ВЫБОРА МЕТРО ---
 
         # [RESCHEDULE PROTECTION] Отмена напоминаний при начале переноса
@@ -2119,12 +2138,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         target_city = dialogue.vacancy.city or "Санкт-Петербург"
                         
                         ctx_logger.info(f"[{dialogue.hh_response_id}] Запрос слотов из Google для сборщика. Дата: {interview_date}, Адрес: {target_address}")
-                        
+                        ctx_logger.info(f"[SLOTS_FLOW] Сборщик. Запрос свободных времен. Дата: {interview_date}, Адрес: {target_address}")
                         slots = await sbor_google_service.get_available_slots(
                             date_str=interview_date,
                             city=target_city,
                             address=target_address
                         )
+                        ctx_logger.info(f"[SLOTS_FLOW] Найдено времен в Google: {slots}")
                     else:
                         # --- СТАНДАРТНАЯ ЛОГИКА (ХАРДКОД) ---
                         current_city_low = (dialogue.vacancy.city or "").lower()
