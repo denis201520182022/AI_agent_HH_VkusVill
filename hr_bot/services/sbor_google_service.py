@@ -23,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 # --- КОНФИГУРАЦИЯ ---
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SBOR_ID")
-SHEET_NAME_CALENDAR = os.getenv("SBOR_SHEET_NAME", "Календарь_8н")
-SHEET_NAME_RECORDS = os.getenv("SBOR_SHEET_NAME", "Записи")
-SHEET_NAME_METRO = os.getenv("SBOR_METRO_SHEET_NAME", "Метро")
+SHEET_NAME_CALENDAR = os.getenv("SHEET_NAME_CALENDAR", "Календарь_8н")
+SHEET_NAME_RECORDS = os.getenv("SHEET_NAME_RECORDS", "Записи")
+SHEET_NAME_METRO = os.getenv("SHEET_NAME_METRO", "Метро")
 CREDENTIALS_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "credentials.json")
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
