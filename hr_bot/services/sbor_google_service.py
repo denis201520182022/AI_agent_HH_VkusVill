@@ -287,7 +287,7 @@ def _check_metro_availability_sync(metro_name: str) -> Optional[str]:
         logger.info(f"[GOOGLE] Станции '{metro_name}' соответствует адрес: '{target_address}'. Проверяю наличие свободных слотов...")
         # 2. Проверяем наличие СВОБОДНЫХ и АКТУАЛЬНЫХ слотов
         # 2. Проверяем наличие СВОБОДНЫХ и АКТУАЛЬНЫХ слотов
-        calendar_range = f"'{SHEET_NAME_CALENDAR}'!A:J"
+        calendar_range = f"'{SHEET_NAME_CALENDAR}'!A:K"
         cal_result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, 
             range=calendar_range
@@ -299,7 +299,7 @@ def _check_metro_availability_sync(metro_name: str) -> Optional[str]:
         
         slots_count = 0
         for row in cal_rows[1:]:
-            if len(row) < 10: continue
+            if len(row) < 11: continue
             
             row_date_str = row[0].strip() 
             row_address = normalize_string(row[4]) 
