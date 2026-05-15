@@ -1505,6 +1505,99 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # *************************************************************************************************************************************
         # КОНЕЦ СПЕЦИАЛЬНОЙ ОБРАБОТКИ ДЛЯ AWAITING_CITIZENSHIP
         # *************************************************************************************************************************************
+        # *************************************************************************************************************************************
+        # СПЕЦИАЛЬНАЯ ОБРАБОТКА ДЛЯ METRO EXTRACTION (СЦЕНАРИЙ СБОРЩИК)
+        # *************************************************************************************************************************************
+        # Запускаем только если мы в состоянии выбора метро и в очереди есть новые сообщения
+        if dialogue.dialogue_state == "scheduling_sbor_metro" and pending_messages:
+            # Проверяем, не является ли первое сообщение уже системной командой (чтобы избежать рекурсии)
+            first_msg = pending_messages[0].get('content', '') if isinstance(pending_messages[0], dict) else str(pending_messages[0])
+            
+            if not first_msg.startswith("[SYSTEM COMMAND]"):
+                ctx_logger.info(f"[{dialogue.hh_response_id}] Запуск выделенного анализатора метро...")
+                
+                all_pending_content = "\n".join([pm.get('content', '') if isinstance(pm, dict) else str(pm) for pm in pending_messages])
+                
+                metro_analysis_prompt = (
+                    "Ты — эксперт по географии Санкт-Петербурга. Твоя задача — найти в сообщении пользователя название станции метро.\n\n"
+                    "ПРАВИЛА:\n"
+                    "1. Если кандидат назвал метро или понятный ориентир (например, 'Ветеранов' вместо 'Проспект Ветеранов'), верни 'found': 'yes'.\n"
+                    "2. В поле 'metro_station' запиши ПОЛНОЕ официальное название станции на русском языке.\n"
+                    
+                    "3. Если в сообщении НЕТ названия метро (например, кандидат задает вопрос), верни 'found': 'no'.\n"
+                    "4. Игнорируй названия городов, улиц и районов, если они не являются названиями станций.\n\n"
+                    "Ответ СТРОГО в формате JSON:\n"
+                    "{\n"
+                    "  \"found\": \"yes\" или \"no\",\n"
+                    "  \"metro_station\": \"Название\" или null\n"
+                    "}"
+                )
+
+                metro_attempts = []
+                try:
+                    llm_metro_response = await llm_handler.get_bot_response(
+                        system_prompt=metro_analysis_prompt,
+                        dialogue_history=[], # Работаем только с текущим контекстом
+                        user_message=all_pending_content,
+                        current_datetime_utc=datetime.datetime.now(datetime.timezone.utc),
+                        attempt_tracker=metro_attempts,
+                        skip_instructions=True,
+                        extra_context=log_context
+                    )
+
+                    if llm_metro_response:
+                        # Логируем токены и стоимость
+                        await _log_llm_usage(db, dialogue, "Metro_Extraction", llm_metro_response.get("usage_stats"))
+                        if len(metro_attempts) > 1:
+                            for i in range(len(metro_attempts) - 1):
+                                await _log_llm_usage(db, dialogue, f"Metro_Extraction (RETRY #{i+1})")
+
+                        parsed_metro = llm_metro_response.get('parsed_response', {})
+                        
+                        if parsed_metro.get("found") == "yes" and parsed_metro.get("metro_station"):
+                            station = parsed_metro.get("metro_station")
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Анализатор нашел метро: {station}")
+
+                            # Формируем команду, которая ПРИНУДИТ основную модель заполнить JSON
+                            system_command = {
+                                'message_id': f'sys_cmd_metro_force_{time.time()}',
+                                'role': 'user',
+                                'content': (
+                                    f"[SYSTEM COMMAND] Кандидат выбрал станцию метро '{station}'. "
+                                    f"Ты ОБЯЗАН: 1. Установить в extracted_data.metro значение '{station}'. "
+                                    f"2. В new_state установить scheduling_sbor_metro."
+                                )
+                            }
+
+                            # Перед выходом сохраняем текущие сообщения в историю, чтобы они не пропали
+                            # Формируем временные записи истории (без маскировки для простоты, она сработает позже)
+                            temp_user_entries = []
+                            for pm in pending_messages:
+                                temp_user_entries.append({
+                                    'message_id': pm.get('message_id', f'temp_{time.time()}'),
+                                    'role': 'user',
+                                    'content': pm.get('content', '') if isinstance(pm, dict) else str(pm),
+                                    'timestamp_msk': pm.get('timestamp_msk', 'время не определено')
+                                })
+                            
+                            dialogue.history = (dialogue.history or []) + temp_user_entries
+                            dialogue.pending_messages = [system_command]
+                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                            
+                            await db.commit()
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Направлено на обработку с принудительным метро.")
+                            return # Перезапускаем цикл воркера для этого диалога
+
+                except Exception as metro_err:
+                    # Если допзапрос упал — не блокируем диалог, пусть основная модель попробует сама
+                    ctx_logger.error(f"[{dialogue.hh_response_id}] Ошибка анализатора метро: {metro_err}")
+                    for i in range(len(metro_attempts)):
+                        await _log_llm_usage(db, dialogue, f"Metro_Extraction (FAILED #{i+1}: {type(metro_err).__name__})")
+
+        # *************************************************************************************************************************************
+        # КОНЕЦ СПЕЦИАЛЬНОЙ ОБРАБОТКИ ДЛЯ METRO EXTRACTION
+        # *************************************************************************************************************************************
+        
         # Обработка сообщений
         user_entries_to_history = []
         all_masked_content = []
@@ -1703,13 +1796,25 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
         # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
+        # --- [START] ВАЛИДАЦИЯ СТАТУСА ---
         if new_state not in ALLOWED_STATES:
             ctx_logger.error(
                 f"[{dialogue.hh_response_id}] CRITICAL: LLM hallucinated invalid state: '{new_state}'.",
                 extra={"action": "invalid_state_detected", "invalid_state": new_state}
             )
             
-            # 1. Формируем текст замечания для модели
+            # 1. Проверяем: не была ли входящая «реплика» уже системной командой об ошибке?
+            # Если да — мы удаляем её из списка на сохранение, чтобы история не пухла.
+            clean_user_entries = []
+            for entry in user_entries_to_history:
+                content = entry.get('content', '')
+                # Если сообщение начинается как системная команда об ошибке стейта — игнорируем его
+                if isinstance(content, str) and "[SYSTEM COMMAND] В твоем последнем ответе произошла техническая ошибка" in content:
+                    ctx_logger.debug("Обнаружена повторная галлюцинация. Удаляем старую команду из очереди на сохранение в историю.")
+                    continue
+                clean_user_entries.append(entry)
+
+            # 2. Формируем текст новой команды
             hallucination_corr_cmd = {
                 'message_id': f'sys_state_hallucination_{time.time()}',
                 'role': 'user',
@@ -1722,17 +1827,17 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 )
             }
 
-            # 2. Сохраняем историю (чтобы бот видел, на что он отвечал) 
-            # и добавляем системную команду в очередь (pending_messages)
-            dialogue.history = (dialogue.history or []) + user_entries_to_history
+            # 3. Сохраняем только РЕАЛЬНУЮ историю (без старых команд)
+            dialogue.history = (dialogue.history or []) + clean_user_entries
+            
+            # 4. Кладем новую команду в пендинг
             dialogue.pending_messages = [hallucination_corr_cmd]
             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
 
-            # 3. Фиксируем изменения в базе и выходим. 
-            # В следующем цикле воркер придет с этой командой к LLM.
             await db.commit()
-            ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление галлюцинации стейта: {new_state}")
+            ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление галлюцинации стейта (команды не накоплены): {new_state}")
             return 
+        # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
         
         # --- [END] ВАЛИДАЦИЯ СТАТУСА ---
 
@@ -1746,9 +1851,20 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 # Ищем адрес и проверяем слоты одной функцией
                 found_address = await sbor_google_service.check_metro_availability(metro_station)
 
-                # Сохраняем текущий прогресс истории
+                # --- [НОВОЕ] ФИЛЬТРАЦИЯ ИСТОРИИ ---
+                # Убираем из списка на сохранение старые системные команды, связанные с метро
+                clean_user_entries = []
+                for entry in user_entries_to_history:
+                    content = entry.get('content', '')
+                    if isinstance(content, str) and content.startswith("[SYSTEM COMMAND]") and ("метро" in content.lower() or "станция" in content.lower()):
+                        ctx_logger.debug("Обнаружена старая команда по метро. Удаляем из очереди на сохранение в историю.")
+                        continue
+                    clean_user_entries.append(entry)
+
+                # Сохраняем историю без лишнего мусора
                 current_history = list(dialogue.history) if dialogue.history else []
-                dialogue.history = (current_history + user_entries_to_history)[-350:]
+                dialogue.history = (current_history + clean_user_entries)[-350:]
+                # ----------------------------------
 
                 if found_address:
                     # СТАНЦИЯ ЕСТЬ
@@ -1775,7 +1891,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         'message_id': f'sys_cmd_metro_fail_{time.time()}',
                         'role': 'user',
                         'content': (
-                            f"[SYSTEM COMMAND] К сожалению, на станции метро '{metro_station}' сейчас нет вакантных мест. "
+                            f"[SYSTEM COMMAND] К сожалению, возле станции метро '{metro_station}' конкретно сейчас нет вакантных мест. "
                             "Сообщи об этом кандидату вежливо и попроси его выбрать другую станцию метро, которая ему удобна."
                         )
                     }
@@ -1784,7 +1900,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 dialogue.pending_messages = [system_command]
                 dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
                 await db.commit()
-                ctx_logger.info(f"[{dialogue.hh_response_id}] Метро обработано. Направлено на перегенерацию.")
+                ctx_logger.info(f"[{dialogue.hh_response_id}] Метро обработано. Команда отправлена на перегенерацию.")
                 return 
         # --- [END] ОБРАБОТКА ВЫБОРА МЕТРО ---
 
