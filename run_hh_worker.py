@@ -829,30 +829,34 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     """Собирает динамический системный промпт из блоков библиотеки (упрощенная версия с единым FAQ)."""
 
     required_blocks = ['#ROLE_AND_STYLE#']
-    # --- ЛОГИКА ВЫБОРА БЛОКА АДРЕСА ---
-    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
-    is_spb_city = any(city in (city_name or "").lower() for city in target_cities)
-    
-    current_title_lower = (vacancy_title or "").lower()
 
-    # Список 1: Исключения для Питера (идут в #ADRESS_OTHER#)
-    excluded_vacancies = [
-        'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
-        'уборщик', 'уборщица', 'помошник повара'
+
+    SCHEDULING_STATES_2 = [
+        'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb',
+        'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'scheduling_sbor_metro', 'interview_scheduled_sbor'
     ]
-    
-    is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
-    is_sborshik_vacancy = is_collector_vacancy(vacancy_title)
 
-    if not is_spb_city or is_excluded_vacancy:
-        # Если не Питер ИЛИ это исключение (повар и т.д.)
-        required_blocks.append('#ADRESS_OTHER#')
-    elif is_sborshik_vacancy:
-        # Если Питер И это сборщик/комплектовщик/упаковщик
-        required_blocks.append('#ADRESS_SPB_1#')
-    else:
-        # Если Питер И любая другая вакансия (например, продавец)
-        required_blocks.append('#ADRESS_SPB_2#')
+    if dialogue_state not in SCHEDULING_STATES_2:
+        target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+        is_spb_city = any(city in (city_name or "").lower() for city in target_cities)
+        
+        current_title_lower = (vacancy_title or "").lower()
+
+        # Список 1: Исключения для Питера
+        excluded_vacancies = [
+            'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
+            'уборщик', 'уборщица', 'помошник повара'
+        ]
+        
+        is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
+        is_sborshik_vacancy = is_collector_vacancy(vacancy_title)
+
+        if not is_spb_city or is_excluded_vacancy:
+            required_blocks.append('#ADRESS_OTHER#')
+        elif is_sborshik_vacancy:
+            required_blocks.append('#ADRESS_SPB_1#')
+        else:
+            required_blocks.append('#ADRESS_SPB_2#')
     # --------------------------------------------------------------
     state_specific_blocks = {
         'initial_processing': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
@@ -1895,8 +1899,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             'message_id': f'sys_cmd_metro_ok_{time.time()}',
                             'role': 'user',
                             'content': (
-                                f"[SYSTEM COMMAND] Станция метро '{metro_station}' подтверждена как доступная. "
-                                "Теперь начни запись на собеседование: предложи кандидату выбрать дату (день недели), используя календарь."
+                                f"[SYSTEM COMMAND] Станция метро '{metro_station}' подтверждена. "
+                                f"За этой станцией закреплен конкретный адрес: '{found_address}'. "
+                                f"Твои действия: "
+                                f"1. Обязательно назови кандидату этот адрес: '{found_address}'. "
+                                f"2. Скажи, что запись на собеседование будет именно туда. "
+                                f"3. Предложи кандидату выбрать удобный день для проведения собеседования."
+                                
                             )
                         }
                     else:
