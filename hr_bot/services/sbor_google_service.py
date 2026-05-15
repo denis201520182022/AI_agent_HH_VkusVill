@@ -96,9 +96,9 @@ def _get_available_slots_sync(date_str: str, city: str, address: str) -> List[st
             
             row_date = row[0].strip()
             row_city = normalize_string(row[2])
-            row_address = normalize_string(row[3])
-            row_time = row[4].strip()
-            row_status = row[9].strip()
+            row_address = normalize_string(row[4])
+            row_time = row[5].strip()
+            row_status = row[10].strip()
 
             if row_date == target_date and norm_city == row_city:
                 if (norm_address in row_address) or (row_address in norm_address):
@@ -247,7 +247,7 @@ def _change_status_sync(hh_id: str, date_str: str, time_str: str, new_status: st
     except Exception as e:
         logger.error(f"[GOOGLE_STATUS] ❌ ОШИБКА при смене статуса для {hh_id}: {e}", exc_info=True)
         raise
-    
+
 
 
 async def check_metro_availability(metro_name: str) -> Optional[str]:
@@ -302,8 +302,8 @@ def _check_metro_availability_sync(metro_name: str) -> Optional[str]:
             if len(row) < 10: continue
             
             row_date_str = row[0].strip() 
-            row_address = normalize_string(row[3]) 
-            row_status = row[9].strip()
+            row_address = normalize_string(row[4]) 
+            row_status = row[10].strip()
 
             try:
                 row_date_obj = datetime.strptime(row_date_str, '%d.%m.%Y').date()
