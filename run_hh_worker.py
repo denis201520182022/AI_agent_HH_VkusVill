@@ -1681,7 +1681,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             'forwarded_to_researcher',
             'qualification_failed',
             'declined_vacancy',
-            'declined_interview'
+            'declined_interview',
 
             # --- НОВЫЕ СТАТУСЫ ---
             'scheduling_sbor_metro',
