@@ -35,8 +35,8 @@ def check_candidate_eligibility(candidate, vacancy_title: str) -> bool:
     # Устанавливаем верхний порог возраста
     max_age = 42 if is_picker else 58
 
-    # 2. ПРОВЕРКА ВОЗРАСТА (18 - max_age включительно)
-    if not (18 <= candidate.age <= max_age):
+    # 2. ПРОВЕРКА ВОЗРАСТА (14 - max_age включительно)
+    if not (14 <= candidate.age <= max_age):
         return False
     
     # 3. ПРОВЕРКА ГРАЖДАНСТВА (оставляем без изменений)
