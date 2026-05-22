@@ -1670,7 +1670,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 content = msg.get('content', '')
                 if msg.get('role') == 'user' and '[SYSTEM COMMAND]' in content and 'найдено несколько адресов' in content.lower():
                     # Извлекаем список адресов (всё что после двоеточия до конца сообщения или до следующей секции)
-                    import re
+                    
                     match = re.search(r"доступных для собеседования:\n(.*?)(?:\n\n Сообщи об этом|$)", content, re.DOTALL)
                     if match:
                         metro_addresses_context = match.group(1).strip()
@@ -2070,7 +2070,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 last_content = str(last_msg.get("content", ""))
 
                 if last_msg.get("role") == "user" and "[SYSTEM COMMAND]" in last_content:
-                    import re
+                    
                     target_date_match = re.search(r"interview_date' в JSON на '(\d{4}-\d{2}-\d{2})'", last_content)
                     target_null = "interview_date' в JSON на null" in last_content
 
