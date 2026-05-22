@@ -1979,7 +1979,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         # --- [END] ОБРАБОТКА ВЫБОРА МЕТРО ---
 
         # --- [НОВОЕ] ОБРАБОТКА ВЫБОРА АДРЕСА (СЦЕНАРИЙ СБОРЩИК) ---
-        if new_state == 'scheduling_sbor_address_choice' and dialogue.selected_address:
+        if new_state == 'scheduling_sbor_address_choice' and extracted_data.get('address'):
              ctx_logger.info(f"[{dialogue.hh_response_id}] Адрес выбран ({dialogue.selected_address}). Переход к записи.")
              dialogue.dialogue_state = 'init_scheduling_sbor'
              
