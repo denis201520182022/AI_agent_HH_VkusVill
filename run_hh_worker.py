@@ -825,7 +825,7 @@ def _generate_calendar_context_2() -> str:
 
     return calendar_context
 
-def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str, vacancy_title: str, interview_address: str = None) -> str:
+def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_message: str, vacancy_description: str, city_name: str, full_address: str, vacancy_title: str, interview_address: str = None, metro_addresses: str = None) -> str:
     """Собирает динамический системный промпт из блоков библиотеки (упрощенная версия с единым FAQ)."""
 
     required_blocks = ['#ROLE_AND_STYLE#']
@@ -833,7 +833,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 
     SCHEDULING_STATES_2 = [
         'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb',
-        'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'scheduling_sbor_metro', 'interview_scheduled_sbor'
+        'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'scheduling_sbor_metro', 'scheduling_sbor_address_choice', 'interview_scheduled_sbor'
     ]
 
     if dialogue_state not in SCHEDULING_STATES_2:
@@ -841,22 +841,25 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         is_spb_city = any(city in (city_name or "").lower() for city in target_cities)
         
         current_title_lower = (vacancy_title or "").lower()
-
-        # Список 1: Исключения для Питера
-        excluded_vacancies = [
-            'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
-            'уборщик', 'уборщица', 'помошник повара'
-        ]
-        
-        is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
         is_sborshik_vacancy = is_collector_vacancy(vacancy_title)
 
-        if not is_spb_city or is_excluded_vacancy:
-            required_blocks.append('#ADRESS_OTHER#')
-        elif is_sborshik_vacancy:
-            required_blocks.append('#ADRESS_SPB_1#')
+        if is_sborshik_vacancy:
+            if is_spb_city:
+                required_blocks.append('#ADRESS_SBOR_SPB#')
+            else:
+                required_blocks.append('#ADRESS_SBOR_REGIONS#')
         else:
-            required_blocks.append('#ADRESS_SPB_2#')
+            # Список 1: Исключения для Питера
+            excluded_vacancies = [
+                'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
+                'уборщик', 'уборщица', 'помошник повара'
+            ]
+            is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
+
+            if not is_spb_city or is_excluded_vacancy:
+                required_blocks.append('#ADRESS_OTHER#')
+            else:
+                required_blocks.append('#ADRESS_SPB#')
     # --------------------------------------------------------------
     state_specific_blocks = {
         'initial_processing': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
@@ -880,6 +883,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
         'interview_scheduled_spb': ['#SCHEDULING_ALGORITHM#'],
 
         'scheduling_sbor_metro': ['#METRO#'],
+        'scheduling_sbor_address_choice': ['#ADDRESS_CHOICE#'],
         'init_scheduling_sbor': ['#SCHEDULING_ALGORITHM_SBOR#'],
         'scheduling_sbor_day': ['#SCHEDULING_ALGORITHM_SBOR#'],
         'scheduling_sbor_time': ['#SCHEDULING_ALGORITHM_SBOR#'],
@@ -937,6 +941,11 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     # --- ГЛОБАЛЬНАЯ ЗАМЕНА ПЛЕЙСХОЛДЕРА АДРЕСА ---
     # Заменяем [адрес вакансии] на реальные данные из БД
     final_prompt = full_prompt_text.replace("[адрес вакансии]", full_address or city_name)
+    
+    # 4. Заменяем [Metro_Adress] для выбора адреса (Сборщики)
+    if metro_addresses:
+        final_prompt = final_prompt.replace("[Metro_Adress]", metro_addresses)
+
     # НОВАЯ ЗАМЕНА для сборщиков
     # Логика: если interview_address передан (это адрес из диалога), берем его. 
     # Если нет — берем стандартный full_address.
@@ -1653,6 +1662,21 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         vacancy_title = dialogue.vacancy.title 
         vacancy_city = dialogue.vacancy.city or "город не указан"
 
+        # --- [НОВОЕ] Подготовка списка адресов для плейсхолдера (Сборщики) ---
+        metro_addresses_context = None
+        if dialogue.dialogue_state == 'scheduling_sbor_address_choice':
+            # Ищем в истории последнюю системную команду со списком адресов
+            for msg in reversed(dialogue.history or []):
+                content = msg.get('content', '')
+                if msg.get('role') == 'user' and '[SYSTEM COMMAND]' in content and 'найдено несколько адресов' in content.lower():
+                    # Извлекаем список адресов (всё что после двоеточия до конца сообщения или до следующей секции)
+                    import re
+                    match = re.search(r"доступных для собеседования:\n(.*?)(?:\n\n Сообщи об этом|$)", content, re.DOTALL)
+                    if match:
+                        metro_addresses_context = match.group(1).strip()
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Из истории извлечен список адресов для плейсхолдера.")
+                        break
+
         # 2. Передаем всё в сборщик промпта
         system_prompt = _assemble_dynamic_prompt(
             prompt_library=prompt_library,
@@ -1661,7 +1685,9 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             vacancy_description=relevant_vacancy_desc,
             city_name=vacancy_city,    
             full_address=full_address,
-            vacancy_title=vacancy_title  # <--- ДОБАВЛЕНО
+            vacancy_title=vacancy_title,
+            interview_address=dialogue.selected_address,
+            metro_addresses=metro_addresses_context
         )
 
         # Переменные vacancy_title и vacancy_city теперь объявлены и не вызовут ошибку тут:
@@ -1783,6 +1809,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
             # --- НОВЫЕ СТАТУСЫ ---
             'scheduling_sbor_metro',
+            'scheduling_sbor_address_choice',
+            'scheduling_sbor_address_choice',
             'init_scheduling_sbor',
             'scheduling_sbor_day',
             'scheduling_sbor_time',
@@ -1866,10 +1894,11 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     ctx_logger.info(f"[{dialogue.hh_response_id}] LLM извлекла метро: {metro_station}. Проверяю доступность...")
                     
 
-                    # Ищем адрес и проверяем слоты одной функцией
-                    found_address = await sbor_google_service.check_metro_availability(metro_station)
-                    if found_address:
-                        ctx_logger.info(f"[METRO_FLOW] ✅ УСПЕХ: Метро '{metro_station}' подтверждено. Адрес: '{found_address}'")
+                    # Ищем адреса и проверяем слоты
+                    found_addresses = await sbor_google_service.check_metro_availability(metro_station)
+                    
+                    if found_addresses:
+                        ctx_logger.info(f"[METRO_FLOW] ✅ УСПЕХ: Метро '{metro_station}' подтверждено. Найдено адресов: {len(found_addresses)}")
                     else:
                         ctx_logger.warning(f"[METRO_FLOW] ❌ ОТКАЗ: Станция '{metro_station}' не найдена в базе или нет свободных мест.")
 
@@ -1888,27 +1917,43 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     dialogue.history = (current_history + clean_user_entries)[-350:]
                     # ----------------------------------
 
-                    if found_address:
+                    if found_addresses:
                         # СТАНЦИЯ ЕСТЬ
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Станция '{metro_station}' доступна. Переход к записи.")
-                        
                         dialogue.metro_station = metro_station # Сохраняем станцию в диалог
-                        dialogue.selected_address = found_address
-                        dialogue.dialogue_state = 'init_scheduling_sbor'
                         
-                        system_command = {
-                            'message_id': f'sys_cmd_metro_ok_{time.time()}',
-                            'role': 'user',
-                            'content': (
-                                f"[SYSTEM COMMAND] Станция метро '{metro_station}' подтверждена. "
-                                f"За этой станцией закреплен конкретный адрес: '{found_address}'. "
-                                f"Твои действия: "
-                                f"1. Обязательно назови кандидату этот адрес: '{found_address}'. "
-                                f"2. Скажи, что запись на собеседование будет именно туда. "
-                                f"3. Предложи кандидату выбрать удобный день для проведения собеседования."
+                        if len(found_addresses) == 1:
+                            addr = found_addresses[0]
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Найден 1 адрес: '{addr}'. Переход к записи.")
+                            dialogue.selected_address = addr
+                            dialogue.dialogue_state = 'init_scheduling_sbor'
+                            
+                            system_command = {
+                                'message_id': f'sys_cmd_metro_ok_{time.time()}',
+                                'role': 'user',
+                                'content': (
+                                    f"[SYSTEM COMMAND] Станция метро '{metro_station}' подтверждена. "
+                                    f"За этой станцией закреплен конкретный адрес: '{addr}'. "
+                                    f"Твои действия: "
+                                    f"1. Обязательно назови кандидату этот адрес: '{addr}'. "
+                                    f"2. Скажи, что запись на собеседование будет именно туда. "
+                                    f"3. Предложи кандидату выбрать удобный день для проведения собеседования."
+                                )
+                            }
+                        else:
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Найдено несколько адресов ({len(found_addresses)}). Переход к выбору.")
+                            dialogue.dialogue_state = 'scheduling_sbor_address_choice'
+                            
+                            addr_list_str = "\n".join([f"{i+1}. {a}" for i, a in enumerate(found_addresses)])
+                            system_command = {
+                                'message_id': f'sys_cmd_metro_choice_{time.time()}',
+                                'role': 'user',
+                                'content': (
+                                    f"[SYSTEM COMMAND] Для станции метро '{metro_station}' найдено несколько адресов доступных для собеседования:\n{addr_list_str}\n\n"
                                 
-                            )
-                        }
+                                    " Сообщи об этом кандидату и вежливо попроси его выбрать наиболее удобный адрес для собеседования.\n"
+                                    
+                                )
+                            }
                     else:
                         # СТАНЦИИ НЕТ
                         ctx_logger.warning(f"[{dialogue.hh_response_id}] Станция '{metro_station}' недоступна.")
@@ -1932,6 +1977,31 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     ctx_logger.info(f"[{dialogue.hh_response_id}] Метро обработано. Команда отправлена на перегенерацию.")
                     return 
         # --- [END] ОБРАБОТКА ВЫБОРА МЕТРО ---
+
+        # --- [НОВОЕ] ОБРАБОТКА ВЫБОРА АДРЕСА (СЦЕНАРИЙ СБОРЩИК) ---
+        if new_state == 'scheduling_sbor_address_choice' and dialogue.selected_address:
+             ctx_logger.info(f"[{dialogue.hh_response_id}] Адрес выбран ({dialogue.selected_address}). Переход к записи.")
+             dialogue.dialogue_state = 'init_scheduling_sbor'
+             
+             system_command = {
+                 'message_id': f'sys_cmd_addr_done_{time.time()}',
+                 'role': 'user',
+                 'content': (
+                     f"[SYSTEM COMMAND] Кандидат выбрал адрес для собеседования: '{dialogue.selected_address}'. "
+                     "Теперь тебе нужно начать процесс записи на собеседование именно по этому адресу. "
+                      
+                     "1. Подтверди кандидату, выбранный адрес "
+                     "2. Предложи кандидату выбрать удобный день для проведения собеседования."
+                 )
+             }
+             
+             # Отправляем на перегенерацию
+             dialogue.pending_messages = [system_command]
+             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+             await db.commit()
+             ctx_logger.info(f"[{dialogue.hh_response_id}] Переход к записи после выбора адреса выполнен.")
+             return
+        # ----------------------------------------------------------
 
         # [RESCHEDULE PROTECTION] Отмена напоминаний при начале переноса
         # =====================================================================
@@ -1965,14 +2035,15 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             )
 
         
+                # =====================================================================
+        # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ И ВРЕМЕНИ (РЕФАКТОРИНГ V3 - TOTAL CONTROL)
         # =====================================================================
-        # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ (для Time Selection и Final Booking)
-        # =====================================================================
-        # Список состояний, в которых нам критично важно, чтобы дата была верной
+        import datetime
         DATE_CRITICAL_STATES = [
             'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb',
             'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'interview_scheduled_sbor'
         ]
+        
         if new_state in DATE_CRITICAL_STATES:
             interview_date = extracted_data.get("interview_date")
             interview_time = extracted_data.get("interview_time")
@@ -1980,256 +2051,136 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             TIME_KEYWORDS = [
                 "сегодня", "завтра", "послезавтра", "понедельник", "вторник", "сред", "четверг", 
                 "пятниц", "суббот", "воскресен", "январ", "феврал", "март", "апрел", "май", "июн", 
-                "июл", "август", "сентябр", "октябр", "ноябр", "декабр", "число", "время", "числа"
+                "июл", "август", "сентябр", "октябр", "ноябр", "декабр", "вчера", "число", "время", "числа",
+                "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12", "13", "14", "15", 
+                "16", "17", "18", "19", "20", "21", "22", "23", "24", "25", "26", "27", "28", "29", "30", "31",
+                "первого", "второго", "третьего", "четвертого", "пятого", "шестого", "седьмого", "восьмого", "девятого", "десятого",
+                "одиннадцатого", "двенадцатого", "тринадцатого", "четырнадцатого", "пятнадцатого", "шестнадцатого", "семнадцатого", 
+                "восемнадцатого", "девятнадцатого", "двадцатого", "тридцатого"
             ]
-            # Проверяем, есть ли маркеры времени в ответе бота или сообщении юзера
             bot_text_low = (bot_response_text or "").lower()
             user_text_low = combined_masked_message.lower()
-            
             has_time_keywords = any(kw in bot_text_low or kw in user_text_low for kw in TIME_KEYWORDS)
 
-            # Входим в блок, если есть дата в JSON ИЛИ если в тексте обсуждают время
             if interview_date or has_time_keywords:
+                
+                # --- 1. ПРОВЕРКА ИСПОЛНЕНИЯ (is_obeyed) ---
+                is_obeyed = False
+                last_msg = dialogue.history[-1] if dialogue.history else {}
+                last_content = str(last_msg.get("content", ""))
 
-                # --- ШАГ 1: ВАЛИДАЦИЯ ДАТЫ (АУДИТ) ---
-                # Сначала проверяем, ту ли вообще дату выбрала модель
-                # ---------------------------------------------------------
-                already_stored_date_str = None
-                if dialogue.interview_datetime_utc:
-                    # Конвертируем UTC из базы в дату МСК для корректного сравнения
-                    already_stored_date_str = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE).strftime('%Y-%m-%d')
-                
-                # [FIX START] --- Умная логика запуска аудита ---
-                run_audit = True # По умолчанию проверяем
-                
-                # Если даты совпадают, проверяем, не пытается ли пользователь сменить дату текстом
-                if already_stored_date_str == interview_date:
-                    # Слова-триггеры, указывающие на обсуждение времени
-                    time_triggers = [
-                        "завтра", "послезавтра", "сегодня", 
-                        "понедельник", "вторник", "сред", "четверг", "пятниц", "суббот", "воскресен"
-                        
-                    ]
-                    # Берем последнее сообщение пользователя
-                    last_user_msg = combined_masked_message.lower()
+                if last_msg.get("role") == "user" and "[SYSTEM COMMAND]" in last_content:
+                    import re
+                    target_date_match = re.search(r"interview_date' в JSON на '(\d{4}-\d{2}-\d{2})'", last_content)
+                    target_null = "interview_date' в JSON на null" in last_content
+
+                    if target_date_match and interview_date == target_date_match.group(1):
+                        is_obeyed = True
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] ✅ Дата подтверждена: бот установил {interview_date} по приказу.")
+                    elif target_null and (interview_date is None or interview_date == ""):
+                        is_obeyed = True
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] ✅ Дата подтверждена: бот занулил её по приказу.")
+
+                # --- 2. ЦИКЛ АУДИТА И ПРИНУЖДЕНИЯ ---
+                if not is_obeyed:
+                    already_stored_date_str = None
+                    if dialogue.interview_datetime_utc:
+                        already_stored_date_str = dialogue.interview_datetime_utc.astimezone(SPB_TIMEZONE).strftime('%Y-%m-%d')
                     
-                    # Если в тексте НЕТ слов о времени, то верим совпадению дат и пропускаем аудит (экономим $)
-                    if not any(trigger in last_user_msg for trigger in time_triggers):
-                        ctx_logger.info(
-                            f"[{dialogue.hh_response_id}] Дата {interview_date} совпадает с БД и нет новых триггеров времени. Пропуск аудита.",
-                            extra={"action": "skip_audit_date_match"}
-                        )
+                    run_audit = True
+                    if already_stored_date_str == interview_date and not has_time_keywords:
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Дата стабильна. Пропуск аудита.")
                         run_audit = False
-                    else:
-                         ctx_logger.info(
-                            f"[{dialogue.hh_response_id}] Дата совпадает, но в тексте найдены временные триггеры ('завтра' и т.п.). ПРИНУДИТЕЛЬНЫЙ АУДИТ.",
-                            extra={"action": "force_audit_due_to_keywords"}
-                        )
-                # [FIX END] -------------------------------------
-                
-                if run_audit:
-                    ctx_logger.info(f"[{dialogue.hh_response_id}] Проверка даты аудитором (в состоянии {new_state}): {interview_date}")
+                        verified_date = interview_date
+                        audit_reason = "Стабильность (совпадение с БД)"
                     
-                    cal_context = _generate_calendar_context_2()
-                    # История: старая + то, что юзер прислал сейчас
-                    full_hist = (dialogue.history or []) + user_entries_to_history
-                    
-                    verified_date_res = await _verify_date_audit(db, dialogue, recruiter, pending_messages, interview_date, full_hist, cal_context, log_context)
-                    if verified_date_res[0] is None:
-                        return # Сбой LLM, выходим (очередь уже очищена в _handle_llm_failure)
-                    verified_date, audit_reason = verified_date_res
-
-                    # СРАВНИВАЕМ
-                    if verified_date != interview_date and verified_date != "none":
-                        ctx_logger.warning(f"🚨 ОБНАРУЖЕНА ГАЛЛЮЦИНАЦИЯ! LLM: {interview_date}, Аудитор: {verified_date}")
-
-                        # --- ВЫЧИСЛЯЕМ ДЕНЬ НЕДЕЛИ ---
-                        try:
-                            v_date_obj = datetime.datetime.strptime(verified_date, '%Y-%m-%d')
-                            weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-                            weekday_idx = v_date_obj.weekday()
-                            v_weekday = weekdays_ru[weekday_idx]
-                            
-                            # Проверка на праздники (Feb 23 и т.д.) и Воскресенье ПРЯМО ЗДЕСЬ
-                            holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
-                            is_holiday = (v_date_obj.month, v_date_obj.day) in holidays
-                            is_sunday = (weekday_idx == 6)
-                            
-                        except Exception:
-                            v_weekday = "указанный день"
-                            is_feb_23 = False
-                            is_sunday = False
-
-                        # Отправляем алерт в ТГ
-                        user_text_now = " ".join(all_masked_content)
-                        full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist])
+                    if run_audit:
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Запуск Аудитора...")
+                        cal_context = _generate_calendar_context_2()
+                        clean_hist_for_audit = [m for m in (dialogue.history or []) if not str(m.get("content", "")).startswith("[SYSTEM")]
+                        full_hist_for_audit = clean_hist_for_audit + user_entries_to_history
                         
-                        await send_date_conflict_alert(
-                            dialogue_id=dialogue.id,
-                            hh_response_id=dialogue.hh_response_id,
-                            user_said=user_text_now,
-                            llm_suggested=interview_date,
-                            verified_date=f"{verified_date} ({v_weekday})",
-                            history_text=full_hist_text,
-                            reasoning=audit_reason
-                        )
+                        verified_date_res = await _verify_date_audit(db, dialogue, recruiter, pending_messages, interview_date, full_hist_for_audit, cal_context, log_context)
+                        if verified_date_res[0] is None: return 
+                        verified_date, audit_reason = verified_date_res
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Вердикт аудита: {verified_date}")
 
-                        # ФОРМИРУЕМ ТЕКСТ КОМАНДЫ (Разрешение конфликта)
-                        correction_content = "" # Инициализация
-                        
-                        if is_sunday or is_holiday:
-                            reason_msg = "это воскресенье" if is_sunday else "это праздничный день"
-                            
-                            correction_content = (
-                                f"[SYSTEM COMMAND] Ты ошибся в интерпретации. Пользователь имел в виду {verified_date} ({v_weekday}), но {reason_msg}, когда собеседования НЕ проводятся. "
-                                f"1. ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на null (убери дату совсем). "
-                                f"2. В ответе вежливо объясни кандидату, что {reason_msg}, и предложи выбрать другой день."
-                            )
-                            ctx_logger.info(f"[{dialogue.hh_response_id}] Аудит: Пользователь выбрал запрещенный день ({v_weekday}). Требую сброс даты.")
-                            
+                    # --- 3. ФОРМИРОВАНИЕ КОМАНДЫ (Вердикты) ---
+                    if verified_date and verified_date != "none":
+                        v_date_obj = datetime.datetime.strptime(verified_date, '%Y-%m-%d')
+                        weekday_idx = v_date_obj.weekday()
+                        weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
+                        v_weekday = weekdays_ru[weekday_idx]
+                        holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
+                        is_holiday = (v_date_obj.month, v_date_obj.day) in holidays
+
+                        is_warehouse = is_collector_vacancy(dialogue.vacancy.title)
+                        slots = []
+                        if is_warehouse:
+                            target_address = dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address')
+                            target_city = dialogue.vacancy.city or "Санкт-Петербург"
+                            slots = await sbor_google_service.get_available_slots(verified_date, target_city, target_address)
                         else:
-                            # СЦЕНАРИЙ: Аудитор нашел дату, она РАЗРЕШЕНА.
-                            # Мы говорим модели: "Исправь JSON на правильную дату".
-                            correction_content = (
-                                f"[SYSTEM COMMAND] В прошлом шаге ты ошибся и предложил дату {interview_date}. "
-                                f"На самом деле пользователь выбрал {v_weekday} ({verified_date}) согласно календарю. "
-                                f"Сгенерируй ответ заново, подтвердив ПРАВИЛЬНУЮ дату ({v_weekday}, {verified_date}). "
-                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_date' в JSON на '{verified_date}'."
+                            if not (weekday_idx == 6 or is_holiday):
+                                if weekday_idx == 5: slots = ["14:00"]
+                                else:
+                                    current_city_low = (dialogue.vacancy.city or "").lower()
+                                    is_spb = any(city in current_city_low for city in ['санкт-петербург', 'мурино', 'кудрово'])
+                                    slots = ["10:00", "12:00", "15:00", "16:00"] if is_spb else ["10:00", "12:00", "16:00"]
+                        
+                        now_msk = datetime.datetime.now(SPB_TIMEZONE)
+                        if verified_date == now_msk.strftime('%Y-%m-%d'):
+                            slots = [s for s in slots if int(s.split(':')[0]) > now_msk.hour]
+
+                        is_day_off = (weekday_idx == 6 or is_holiday)
+                        is_full = not slots and not is_day_off
+                        is_hallucination = (verified_date != interview_date)
+                        slots_str = ", ".join(slots) if slots else "другой день"
+
+                        cmd_content = None
+                        if is_day_off:
+                            reason = "воскресенье" if weekday_idx == 6 else "праздничный день"
+                            cmd_content = (
+                                f"[SYSTEM COMMAND] Внимание!!! {verified_date} ({v_weekday}) — это {reason}, когда офисы закрыты. "
+                                f"ОБЯЗАТЕЛЬНО установи 'interview_date' в JSON на null. "
+                                f"Вежливо объясни кандидату, что в этот день мы не работаем, и предложи выбрать другой день."
                             )
-                            ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление даты ({v_weekday}).")
+                        elif is_full:
+                            cmd_content = (
+                                f"[SYSTEM COMMAND] Внимание!!! На {verified_date} ({v_weekday}) все слоты уже заняты. "
+                                f"ОБЯЗАТЕЛЬНО установи 'interview_date' в JSON на null. "
+                                f"Предложи кандидату выбрать другой день (завтра или в ближайший будний)."
+                            )
+                        elif is_hallucination:
+                            cmd_content = (
+                                f"[SYSTEM COMMAND] ОШИБКА: Ты предложила {interview_date}, но пользователь выбрал {v_weekday} ({verified_date}). "
+                                f"Доступные слоты: {slots_str}. "
+                                f"Подтверди ПРАВИЛЬНУЮ дату и ОБЯЗАТЕЛЬНО установи 'interview_date' в JSON на '{verified_date}'."
+                            )
+                            full_hist_text = "\n".join([f"{m.get('role')}: {m.get('content')}" for m in full_hist_for_audit])
+                            await send_date_conflict_alert(dialogue.id, dialogue.hh_response_id, user_text_low, interview_date, f"{verified_date} ({v_weekday})", full_hist_text, audit_reason)
+                        else:
+                            # Модель права, но даем принудительное подтверждение и слоты
+                            cmd_content = (
+                                f"[SYSTEM COMMAND] Пользователь выбрал: Дата {verified_date} ({v_weekday}). "
+                                f"Доступные слоты: {slots_str}. Подтверди, что на этот день есть возможность записаться, "
+                                f"и перечисли ВСЕ доступные слоты: ({slots_str}). "
+                                f"ОБЯЗАТЕЛЬНО установи 'interview_date' в JSON на '{verified_date}'."
+                            )
 
-                        # --- !!! ВОТ ЭТОГО КУСКА НЕ ХВАТАЛО !!! ---
-                        # Создаем объект команды с правильным текстом
-                        correction_cmd = {
-                            'message_id': f'sys_date_corr_{time.time()}',
-                            'role': 'user',
-                            'content': correction_content
-                        }
-
-                        # Кладем в очередь и сохраняем историю
-                        dialogue.pending_messages = [correction_cmd]
-                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                        dialogue.history = (dialogue.history or []) + user_entries_to_history
-                        
-                        await db.commit()
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление даты ({v_weekday}).")
-                        return # <--- ПРЕРЫВАЕМ. К регламенту (времени) перейдем только когда дата будет верной.
-                    
-                    
-                    if verified_date != "none":
-                        interview_date = verified_date
-
-                # --- ШАГ 2: ПОДСКАЗКА ДНЯ НЕДЕЛИ И РЕГЛАМЕНТА (HINT) ---
-                # Если мы дошли сюда, значит дата либо подтверждена аудитом, либо уже была в БД.
-                # Теперь проверяем время для этой даты.
-                # ---------------------------------------------------------
-                # --- ШАГ 2: ПОДСКАЗКА ДНЯ НЕДЕЛИ И РЕГЛАМЕНТА (HINT) ---
-                try:
-                    # 1. Получаем текущее время в МСК для сравнения
-                    now_msk = datetime.datetime.now(SPB_TIMEZONE)
-                    today_str = now_msk.strftime('%Y-%m-%d')
-                    current_hour = now_msk.hour
-
-                    # 2. Вычисляем данные о выбранной дате
-                    v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
-                    holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
-                    is_holiday = (v_date_obj.month, v_date_obj.day) in holidays
-                    weekday_idx = v_date_obj.weekday()  # 0 = Пн, 6 = Вс
-                    weekdays_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
-                    correct_weekday = weekdays_ru[weekday_idx]
-
-                    # Определяем категорию вакансии
-                    is_warehouse = is_collector_vacancy(dialogue.vacancy.title)
-                    slots = []
-
-                    if is_warehouse:
-                        # --- ЛОГИКА ДЛЯ СБОРЩИКОВ: ЗАПРОС СЛОТОВ ИЗ GOOGLE ---
-                        target_address = dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address')
-                        target_city = dialogue.vacancy.city or "Санкт-Петербург"
-                        
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Запрос слотов из Google для сборщика. Дата: {interview_date}, Адрес: {target_address}")
-                        ctx_logger.info(f"[SLOTS_FLOW] Сборщик. Запрос свободных времен. Дата: {interview_date}, Адрес: {target_address}")
-                        slots = await sbor_google_service.get_available_slots(
-                            date_str=interview_date,
-                            city=target_city,
-                            address=target_address
-                        )
-                        ctx_logger.info(f"[SLOTS_FLOW] Найдено времен в Google: {slots}")
-                    else:
-                        # --- СТАНДАРТНАЯ ЛОГИКА (ХАРДКОД) ---
-                        current_city_low = (dialogue.vacancy.city or "").lower()
-                        target_cities = ['санкт-петербург', 'мурино', 'кудрово']
-                        is_spb = any(city in current_city_low for city in target_cities)
-
-                        if weekday_idx == 6 or is_holiday:
-                            slots = []
-                        elif weekday_idx == 5:  # Суббота
-                            slots = ["14:00"]
-                        else:  # Будни
-                            if is_spb:
-                                slots = ["10:00", "12:00", "15:00", "16:00"]
+                        if cmd_content:
+                            if last_content != cmd_content:
+                                sys_cmd = {'message_id': f'sys_date_ctrl_{time.time()}', 'role': 'user', 'content': cmd_content}
+                                dialogue.history = (dialogue.history or []) + [sys_cmd]
+                                await db.commit()
+                                ctx_logger.info(f"[{dialogue.hh_response_id}] Петля контроля: добавлена команда. Перегенерация...")
                             else:
-                                slots = ["10:00", "12:00", "16:00"]
+                                ctx_logger.warning(f"[{dialogue.hh_response_id}] Петля контроля: команда уже в истории. Форсирую перегенерацию.")
+                            return
 
-                    # --- ЛОГИКА ФИЛЬТРАЦИИ ДЛЯ "СЕГОДНЯ" ---
-                    if interview_date == today_str and slots:
-                        slots = [s for s in slots if int(s.split(':')[0]) > current_hour]
-
-                    # 4. Формируем текст инструкции
-                    if is_holiday:
-                        hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} — это праздничный день!!! "
-                            f"В праздничные дни офисы закрыты и собеседования не проводятся. Запись невозможна. Предложи другой день."
-                        )
-                    elif weekday_idx == 6:
-                        hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
-                            f"По воскресеньям собеседования не проводятся, запись невозможна. Предложи другой день."
-                        )
-                    elif not slots:
-                        hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! На дату {interview_date} ({correct_weekday}) нет доступных слотов для записи. "
-                            f"Предложи кандидату выбрать другой день (например, завтра или в ближайший будний день)."
-                        )
-                    else:
-                        slots_str = ", ".join(slots)
-                        hint_content = (
-                            f"[SYSTEM COMMAND] Внимание!!! {interview_date} это {correct_weekday}!!! "
-                            f"В этот день строго разрешены только следующие слоты: {slots_str}. "
-                            f"Ты ОБЯЗАН перечислить ВСЕ эти варианты ({slots_str}) в своем ответе, чтобы кандидат мог выбрать один из них. "
-                            f"Не выбирай время за кандидата, предоставь ему полный список доступных слотов из этой команды."
-                        )
-
-                    # 5. Проверяем историю, чтобы не зациклиться
-                    history_to_check = (dialogue.history or [])[-5:]
-                    already_hinted = any(hint_content == m.get('content') for m in history_to_check)
-
-                    if not already_hinted:
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Добавляю регламент дня: {interview_date} (Свободно: {slots})")
-                        hint_cmd = {
-                            'message_id': f'sys_hint_{time.time()}',
-                            'role': 'user',
-                            'content': hint_content
-                        }
-                        dialogue.history = (dialogue.history or []) + [hint_cmd]
-                        dialogue.pending_messages = user_entries_to_history 
-                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                        await db.commit()
-                        return 
-                except Exception as e:
-                    ctx_logger.error(f"Ошибка в этапе Hint валидации даты и регламента: {e}")
-            # Вот тут проверку времени
-        # =====================================================================
-        # [START] ШАГ 3: ЖЕСТКАЯ ВАЛИДАЦИЯ ВРЕМЕНИ (TIME ENFORCEMENT)
-        # =====================================================================
-        if new_state in DATE_CRITICAL_STATES:
-            # Проверяем время только если и дата, и время уже извлечены моделью
+            # --- 5. ЖЕСТКАЯ ВАЛИДАЦИЯ ВРЕМЕНИ ---
             if interview_date and interview_time:
                 try:
-                    now_msk = datetime.datetime.now(SPB_TIMEZONE)
-                    today_str = now_msk.strftime('%Y-%m-%d')
-                    current_hour = now_msk.hour
-
                     v_date_obj = datetime.datetime.strptime(interview_date, '%Y-%m-%d')
                     weekday_idx = v_date_obj.weekday()
                     holidays = [(2, 23), (5, 1), (5, 2), (5, 3), (5, 9), (5, 10)]
@@ -2237,64 +2188,41 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     
                     is_warehouse = is_collector_vacancy(dialogue.vacancy.title)
                     allowed_slots = []
-
                     if is_warehouse:
-                        # Повторный запрос слотов из Google для валидации
                         target_address = dialogue.selected_address or (dialogue.vacancy.extracted_info or {}).get('full_address')
                         target_city = dialogue.vacancy.city or "Санкт-Петербург"
                         allowed_slots = await sbor_google_service.get_available_slots(interview_date, target_city, target_address)
                     else:
-                        if weekday_idx == 6 or is_holiday:
-                            allowed_slots = []
-                        elif weekday_idx == 5: # Сб
-                            allowed_slots = ["14:00"]
-                        else: # Будни
-                            current_city_low = (dialogue.vacancy.city or "").lower()
-                            target_cities = ['санкт-петербург', 'мурино', 'кудрово']
-                            is_spb_area = any(city in current_city_low for city in target_cities)
-                            allowed_slots = ["10:00", "12:00", "15:00", "16:00"] if is_spb_area else ["10:00", "12:00", "16:00"]
-
-                    # Фильтр для "сегодня"
-                    if interview_date == today_str:
-                        allowed_slots = [s for s in allowed_slots if int(s.split(':')[0]) > current_hour]
-
-                    clean_time = interview_time.strip()
-                    if clean_time not in allowed_slots:
-                        ctx_logger.warning(f"🚨 МОДЕЛЬ ОШИБЛАСЬ СО ВРЕМЕНЕМ! Выбрано: {clean_time}, Доступно: {allowed_slots}")
-
-                        if not allowed_slots:
-                            if is_holiday:
-                                error_msg = f"{interview_date} — праздничный день, офисы закрыты, собеседования не проводятся."
-                            elif weekday_idx == 6:
-                                error_msg = f"По воскресеньям ({interview_date}) собеседования не проводятся."
+                        if not (weekday_idx == 6 or is_holiday):
+                            if weekday_idx == 5: allowed_slots = ["14:00"]
                             else:
-                                error_msg = f"На дату ({interview_date}) запись сейчас невозможна (нет свободных слотов)."
-                        else:
-                            error_msg = f"На дату {interview_date} доступно только время: {', '.join(allowed_slots)}. Слот {clean_time} недоступен."
+                                current_city_low = (dialogue.vacancy.city or "").lower()
+                                is_spb_area = any(city in current_city_low for city in ['санкт-петербург', 'мурино', 'кудрово'])
+                                allowed_slots = ["10:00", "12:00", "15:00", "16:00"] if is_spb_area else ["10:00", "12:00", "16:00"]
 
+                    now_msk = datetime.datetime.now(SPB_TIMEZONE)
+                    if interview_date == now_msk.strftime('%Y-%m-%d'):
+                        allowed_slots = [s for s in allowed_slots if int(s.split(':')[0]) > now_msk.hour]
+
+                    if interview_time.strip() not in allowed_slots:
+                        ctx_logger.warning(f"[{dialogue.hh_response_id}] 🚨 Ошибка времени! Выбрано: {interview_time}, Доступно: {allowed_slots}")
+                        error_msg = f"На дату {interview_date} доступно только время: {', '.join(allowed_slots) if allowed_slots else 'другой день'}."
                         time_corr_cmd = {
-                            'message_id': f'sys_time_corr_{time.time()}',
-                            'role': 'user',
-                            'content': (
-                                f"[SYSTEM COMMAND] {error_msg} "
-                                f"Предложи выбрать из доступных слотов: {', '.join(allowed_slots) if allowed_slots else 'другой день'}."
-                                f"ОБЯЗАТЕЛЬНО обнови поле 'interview_time' в JSON на null, пока кандидат не выберет корректный вариант."
-                            )
+                            'message_id': f'sys_time_err_{time.time()}', 
+                            'role': 'user', 
+                            'content': f"[SYSTEM COMMAND] {error_msg} Предложи выбрать из доступных слотов. ОБЯЗАТЕЛЬНО установи 'interview_time' in JSON на null."
                         }
-
-                        dialogue.history = (dialogue.history or []) + user_entries_to_history + [time_corr_cmd]
-                        dialogue.pending_messages = user_entries_to_history + [time_corr_cmd]
-                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        dialogue.history = (dialogue.history or []) + [time_corr_cmd]
                         await db.commit()
-                        ctx_logger.info(f"[{dialogue.hh_response_id}] Отправлено на исправление времени: {clean_time} -> {allowed_slots}")
                         return 
-
                 except Exception as e:
-                    ctx_logger.error(f"Ошибка в этапе жесткой валидации времени: {e}")
+                    ctx_logger.error(f"Ошибка в жесткой валидации времени: {e}")
 
         # =====================================================================
-        # [END] КОНЕЦ ШАГА 3
-        # =====================================================================    
+        # [END] КОНЕЦ ВАЛИДАЦИИ V3
+        # =====================================================================
+
+
         # Обновляем статус
         if dialogue.status == 'new':
             dialogue.status = 'in_progress'
@@ -2316,6 +2244,13 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         f"[{dialogue.hh_response_id}] Станция метро '{raw_metro}' сохранена в БД.",
                         extra={"action": "metro_saved"}
                     )
+
+            # --- [НОВОЕ] ОБРАБОТКА ВЫБОРА АДРЕСА (СБОРЩИК) ---
+            raw_address_choice = extracted_data.get("adress")
+            if raw_address_choice and dialogue.dialogue_state == 'scheduling_sbor_address_choice':
+                dialogue.selected_address = raw_address_choice
+                ctx_logger.info(f"[{dialogue.hh_response_id}] Адрес выбран и сохранен: {raw_address_choice}")
+
             if raw_age:
                 # Разрешенные стейты для записи возраста
                 allowed_age_states = ['awaiting_age', 'clarifying_anything']
@@ -3109,10 +3044,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 ctx_logger.info(f"Candidate {dialogue.hh_response_id} qualified 🟢. Moving to 'interview'.")
 
-            # ЗАПИСЫВАЕМ СОБЫТИЕ В АНАЛИТИКУ (теперь с проверкой дублей по дате!)
-            # Это позволяет учитывать переносы как новые записи в воронке дожимов
-            await log_analytics_event(db, dialogue, 'interview_assigned', check_duplicates=True)
-
             api_move_start = time.monotonic()
             await hh_api.move_response_to_folder(recruiter, db, dialogue.hh_response_id, 'interview')
             ctx_logger.debug(
@@ -3170,6 +3101,11 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         f"interview_date или interview_time для диалога {dialogue.id}. Напоминания не будут запланированы."
                     )
             # --- КОНЕЦ ДОБАВЛЕНИЯ ---
+
+            # ЗАПИСЫВАЕМ СОБЫТИЕ В АНАЛИТИКУ (теперь с проверкой дублей по дате!)
+            # Это позволяет учитывать переносы как новые записи в воронке дожимов
+            # ВАЖНО: Вызываем ПОСЛЕ schedule_interview_reminders, чтобы dialogue.interview_datetime_utc был заполнен!
+            await log_analytics_event(db, dialogue, 'interview_assigned', check_duplicates=True)
 
 
         elif (new_state == 'qualification_failed' or new_state == 'declined_vacancy' or new_state == 'declined_interview'):
@@ -3280,19 +3216,31 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                 if not is_real_decline:
                     # Кандидат НЕ отказался → прерываем текущую обработку
-                    system_command = {
-                        'message_id': f'sys_cmd_recheck_decline_{time.time()}',
-                        'role': 'user',
-                        'content': '[SYSTEM COMMAND] Сейчас кандидат не отказывается от вакансии и анкетирования, не ставь declined_vacancy, продолжай анкету дальше.'
-                    }
+                    cmd_content = '[SYSTEM COMMAND] Сейчас кандидат не отказывается от вакансии и анкетирования, не ставь declined_vacancy, продолжай анкету дальше.'
                     
-                    dialogue.pending_messages = (dialogue.pending_messages or []) + [system_command]
+                    # 1. Сохраняем реальные сообщения КАНДИДАТА в историю
+                    dialogue.history = (dialogue.history or []) + user_entries_to_history
+                    
+                    # 2. Считаем, сколько раз эта команда уже в истории (в последних 5 сообщениях)
+                    existing_count = sum(1 for m in (dialogue.history or [])[-5:] if m.get('content') == cmd_content)
+                    
+                    if existing_count < 3:
+                        # Переносим предыдущие системные команды из пендинга в историю (для наслоения)
+                        dialogue.history = (dialogue.history or []) + (dialogue.pending_messages or [])
+                        
+                        system_command = {
+                            'message_id': f'sys_cmd_recheck_decline_{time.time()}',
+                            'role': 'user',
+                            'content': cmd_content
+                        }
+                        # Кладем новую команду в пендинг
+                        dialogue.pending_messages = [system_command]
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Отказ не подтверждён. Команда добавлена (акцент {existing_count + 1}).")
+                    else:
+                        ctx_logger.warning(f"[{dialogue.hh_response_id}] Отказ не подтверждён. Команда уже акцентирована 3 раза, просто ретрай.")
+
                     dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
                     await db.commit()
-                    ctx_logger.info(
-                        f"[{dialogue.hh_response_id}] Отказ от вакансии НЕ подтверждён. Отложен системный запрос для повторной обработки.",
-                        extra={"action": "decline_not_confirmed"}
-                    )
                     return  # ← ВАЖНО: выходим из функции, НЕ переводя в статус 'rejected'
                 else:
                     ctx_logger.info(
@@ -3449,17 +3397,28 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 dialogue.history = (dialogue.history or []) + user_entries_to_history
 
                 # 2. Формируем корректирующую команду
-                correction_cmd = {
-                    'message_id': f'sys_empty_corr_{time.time()}',
-                    'role': 'user',
-                    'content': (
-                        f"[SYSTEM COMMAND] В своем последнем ответе ты хотел оставить пустым поле 'response_text', "
-                        f"Для состояния {new_state} ТЕКСТ ОТВЕТА ОБЯЗАТЕЛЕН."
-                    )
-                }
+                cmd_content = (
+                    f"[SYSTEM COMMAND] Сейчас поле 'response_text' обязательно должно быть заполнено, "
+                    f"Для состояния {new_state} ТЕКСТ ОТВЕТА ОБЯЗАТЕЛЕН."
+                )
 
-                # 3. Передаем команду в pending_messages
-                dialogue.pending_messages = [correction_cmd]
+                # 3. Считаем акценты (в последних 5 сообщениях истории)
+                existing_count = sum(1 for m in (dialogue.history or [])[-5:] if m.get('content') == cmd_content)
+
+                if existing_count < 3:
+                    # Переносим предыдущие системные команды из пендинга в историю (наслоение)
+                    dialogue.history = (dialogue.history or []) + (dialogue.pending_messages or [])
+                    
+                    correction_cmd = {
+                        'message_id': f'sys_empty_corr_{time.time()}',
+                        'role': 'user',
+                        'content': cmd_content
+                    }
+                    # Кладем новую команду в пендинг
+                    dialogue.pending_messages = [correction_cmd]
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Пустой ответ. Команда добавлена (акцент {existing_count + 1}).")
+                else:
+                    ctx_logger.warning(f"[{dialogue.hh_response_id}] Пустой ответ. Команда уже акцентирована 3 раза, просто ретрай.")
                 
                 # 4. Обновляем время, чтобы воркер сразу подхватил диалог снова
                 dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)

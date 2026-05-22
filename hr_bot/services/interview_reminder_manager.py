@@ -157,13 +157,13 @@ async def schedule_interview_reminders(
     # Только если это время в будущем (или совсем немного в прошлом, что допустимо для воркера)
     # Но для надежности планируем всегда, воркер разберется.
     
-    new_followup = InterviewFollowup(
-        dialogue_id=dialogue_id,
-        step=1,
-        scheduled_time_utc=followup_time_utc,
-        status='pending'
-    )
-    db_session.add(new_followup)
+    # new_followup = InterviewFollowup(
+    #     dialogue_id=dialogue_id,
+    #     step=1,
+    #     scheduled_time_utc=followup_time_utc,
+    #     status='pending'
+    # )
+    # db_session.add(new_followup)
     
     logger.info(f"Запланирован Follow-up (шаг 1) для {hh_response_id} на {followup_time_utc.isoformat()} (UTC).")
 

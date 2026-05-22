@@ -1356,7 +1356,7 @@ async def main(target_recruiter_ids=None):
     # Она обрабатывает ОБЩУЮ очередь, поэтому фильтрация по рекрутерам ей не обязательна,
     # но благодаря skip_locked воркеры поделят задачи между собой.
     interview_task = asyncio.create_task(check_and_send_interview_reminders())
-    followup_task = asyncio.create_task(check_and_send_followups())
+    # followup_task = asyncio.create_task(check_and_send_followups())
     mailing_task = asyncio.create_task(process_mailing_tasks())
     try:
         while not shutdown_requested:

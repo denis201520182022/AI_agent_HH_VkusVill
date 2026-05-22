@@ -425,29 +425,24 @@ def _build_reactivation_7day_stats_content(db_session: Session) -> Text:
                 if d.has_reply:
                     replied_count += 1
                     
-                    # --- САМОИСКЛЮЧАЮЩАЯ ВОРОНКА (ПРИОРИТЕТЫ) ---
-                    # ПРИОРИТЕТ 2: Собеседование (Записаны)
-                    # Попадет сюда, только если не было отказа
-                    if d.has_interview:
-                        success_count += 1
-                    # ПРИОРИТЕТ 1: Любой отказ (Самый жесткий финал)
-                    # Если есть и отказ, и собес - считаем в отказ по твоей логике
-                    elif d.has_user_ref:
-                        refusal_user_count += 1
-                    elif d.has_bot_rej:
-                        refusal_bot_count += 1
-                    
-                    
-                    
-                    # ПРИОРИТЕТ 3: Снова уснули (Timed Out)
-                    # Попадет сюда, если не было ни отказа, ни собеса, но сработал таймаут
-                    elif d.has_timeout:
-                        timeout_count += 1
-                    
-                    # ПРИОРИТЕТ 4: В работе
-                    # Ответил, но еще не дошел ни до одного из финальных статусов выше
-                    else:
-                        in_progress_count += 1
+                # --- САМОИСКЛЮЧАЮЩАЯ ВОРОНКА (ПРИОРИТЕТЫ) ---
+                # Теперь считаем результаты НЕЗАВИСИМО от того, был ли пойман флаг has_reply,
+                # так как КД мог быть переведен в финал альтернативным путем.
+                
+                # ПРИОРИТЕТ 2: Собеседование (Записаны)
+                if d.has_interview:
+                    success_count += 1
+                # ПРИОРИТЕТ 1: Любой отказ (Самый жесткий финал)
+                elif d.has_user_ref:
+                    refusal_user_count += 1
+                elif d.has_bot_rej:
+                    refusal_bot_count += 1
+                # ПРИОРИТЕТ 3: Снова уснули (Timed Out)
+                elif d.has_timeout:
+                    timeout_count += 1
+                # ПРИОРИТЕТ 4: В работе (если был ответ)
+                elif d.has_reply:
+                    in_progress_count += 1
 
             # Конверсия из "Отправлено" в "Ответ"
             conv_reply = round((replied_count / sent_total * 100), 1) if sent_total > 0 else 0
@@ -513,7 +508,8 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
     query = db.query(
         AnalyticsEvent.dialogue_id,
         AnalyticsEvent.mailing_task_id,
-        cast(AnalyticsEvent.created_at, Date).label('task_date'),
+        # Дату рассылки берем как дату события 'reactivation_sent' в этой группе
+        func.min(cast(AnalyticsEvent.created_at, Date)).label('task_date'),
         TrackedRecruiter.name.label('recruiter_name'),
         Vacancy.city.label('city'),
         Vacancy.title.label('vacancy_title'),
@@ -533,7 +529,6 @@ async def generate_reactivation_excel(message: Message, start_date: date, end_da
     ).group_by(
         AnalyticsEvent.dialogue_id, 
         AnalyticsEvent.mailing_task_id,
-        'task_date',
         TrackedRecruiter.name, 
         Vacancy.city, 
         Vacancy.title

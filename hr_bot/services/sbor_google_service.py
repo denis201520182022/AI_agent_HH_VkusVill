@@ -250,23 +250,23 @@ def _change_status_sync(hh_id: str, date_str: str, time_str: str, new_status: st
 
 
 
-async def check_metro_availability(metro_name: str) -> Optional[str]:
+async def check_metro_availability(metro_name: str) -> List[str]:
     """
-    Проверяет наличие станции в базе и наличие свободных слотов для привязанного к ней адреса.
-    Возвращает строку с адресом или None.
+    Проверяет наличие станции в базе и наличие свободных слотов для всех привязанных к ней адресов.
+    Возвращает список адресов, у которых есть свободные слоты.
     """
     return await asyncio.to_thread(_check_metro_availability_sync, metro_name)
 
 
 @google_retry
-def _check_metro_availability_sync(metro_name: str) -> Optional[str]:
-    """Синхронная логика поиска метро с расширенным дебаг-логированием."""
+def _check_metro_availability_sync(metro_name: str) -> List[str]:
+    """Синхронная логика поиска метро с возвратом всех доступных адресов."""
     try:
         service = get_service()
         norm_metro_input = normalize_string(metro_name)
         logger.info(f"[GOOGLE] === ПРОВЕРКА МЕТРО: '{metro_name}' ===")
         
-        # 1. Справочник Метро -> Адрес
+        # 1. Справочник Метро -> Адреса (их может быть несколько)
         metro_range = f"'{SHEET_NAME_METRO}'!A:B"
         metro_result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, 
@@ -274,21 +274,21 @@ def _check_metro_availability_sync(metro_name: str) -> Optional[str]:
         ).execute()
         
         metro_rows = metro_result.get('values', [])
-        target_address = None
+        target_addresses = []
         for row in metro_rows:
             if len(row) < 2: continue
             if normalize_string(row[0]) == norm_metro_input:
-                target_address = row[1].strip()
-                break
+                addr = row[1].strip()
+                if addr and addr not in target_addresses:
+                    target_addresses.append(addr)
         
-        if not target_address:
+        if not target_addresses:
             logger.warning(f"[GOOGLE] Станция '{metro_name}' не найдена в листе Метро.")
-            return None
+            return []
 
-        norm_target_address = normalize_string(target_address)
-        logger.info(f"[GOOGLE] Нашелся адрес: '{target_address}' (нормализован: '{norm_target_address}')")
+        logger.info(f"[GOOGLE] Найдено потенциальных адресов ({len(target_addresses)}): {target_addresses}")
 
-        # 2. Поиск в Календаре
+        # 2. Чтение всего Календаря один раз
         calendar_range = f"'{SHEET_NAME_CALENDAR}'!A:K"
         cal_result = service.spreadsheets().values().get(
             spreadsheetId=SPREADSHEET_ID, 
@@ -298,61 +298,50 @@ def _check_metro_availability_sync(metro_name: str) -> Optional[str]:
         cal_rows = cal_result.get('values', [])
         today = datetime.now().date()
         
-        slots_count = 0
-        checked_rows_with_address = 0
+        # Словарь для подсчета слотов по каждому адресу
+        address_slots = {addr: 0 for addr in target_addresses}
+        norm_target_addresses = {addr: normalize_string(addr) for addr in target_addresses}
 
         for i, row in enumerate(cal_rows[1:], start=2):
-            # Если в строке нет даже колонки с адресом (E - индекс 4)
-            if len(row) < 5:
-                continue
+            if len(row) < 5: continue
             
             row_address = normalize_string(row[4])
             
-            # Если адрес в строке совпадает с нашим целевым
-            if (norm_target_address in row_address) or (row_address in norm_target_address):
-                checked_rows_with_address += 1
-                
-                # Извлекаем данные для проверки
-                row_date_str = row[0].strip()
-                # Статус берем по индексу 10 (колонка K), если она есть. Если нет - пустая строка.
-                raw_status = row[10].strip() if len(row) >= 11 else "ОТСУТСТВУЕТ"
-                row_status_norm = normalize_string(raw_status)
-                
-                # ЛОГ ДЛЯ КАЖДОЙ ПОДОЗРИТЕЛЬНОЙ СТРОКИ
-                # Поможет увидеть: "2026.06.01", Статус: "свободно", Длина строки: 11
-                logger.info(
-                    f"[DEBUG_ROW] Строка {i}: Дата='{row_date_str}', "
-                    f"Статус='{raw_status}', RowLen={len(row)}"
-                )
+            # Проверяем, относится ли строка к одному из наших адресов
+            matched_addr = None
+            for original_addr, norm_addr in norm_target_addresses.items():
+                if (norm_addr in row_address) or (row_address in norm_addr):
+                    matched_addr = original_addr
+                    break
+            
+            if not matched_addr:
+                continue
 
-                try:
-                    row_date_obj = datetime.strptime(row_date_str, '%d.%m.%Y').date()
-                    
-                    # Условия:
-                    date_ok = row_date_obj >= today
-                    status_ok = row_status_norm == "свободно"
-                    
-                    if date_ok and status_ok:
-                        slots_count += 1
-                    else:
-                        # Если адрес совпал, но условия не прошли - пишем почему
-                        reasons = []
-                        if not date_ok: reasons.append(f"дата в прошлом ({row_date_obj})")
-                        if not status_ok: reasons.append(f"статус не 'свободно' (вижу '{row_status_norm}')")
-                        logger.info(f"   └─ Скип строки {i}: {', '.join(reasons)}")
+            # Проверка условий (Дата и Статус)
+            row_date_str = row[0].strip()
+            raw_status = row[10].strip() if len(row) >= 11 else ""
+            row_status_norm = normalize_string(raw_status)
 
-                except Exception as parse_err:
-                    logger.error(f"   └─ Ошибка парсинга даты в строке {i} ('{row_date_str}'): {parse_err}")
+            try:
+                row_date_obj = datetime.strptime(row_date_str, '%d.%m.%Y').date()
+                if row_date_obj >= today and row_status_norm == "свободно":
+                    address_slots[matched_addr] += 1
+            except Exception:
+                continue
+
+        # Формируем список адресов, где есть хотя бы один слот
+        final_addresses = [addr for addr, count in address_slots.items() if count > 0]
         
-        if slots_count > 0:
-            logger.info(f"[GOOGLE] ✅ УСПЕХ: Найдено {slots_count} слотов для '{target_address}'.")
-            return target_address
+        if final_addresses:
+            logger.info(f"[GOOGLE] ✅ УСПЕХ: Найдено адресов со слотами: {len(final_addresses)}")
+            return final_addresses
         
-        logger.warning(
-            f"[GOOGLE] ❌ ОТКАЗ: Адрес найден в {checked_rows_with_address} строках календаря, "
-            f"но ни одна не прошла проверку (Дата >= {today} и Статус == 'Свободно')."
-        )
-        return None
+        logger.warning(f"[GOOGLE] ❌ ОТКАЗ: Для станции '{metro_name}' найдены адреса, но в календаре нет свободных слотов.")
+        return []
+
+    except Exception as e:
+        logger.error(f"[GOOGLE] Критическая ошибка при проверке метро: {e}", exc_info=True)
+        return []
 
     except Exception as e:
         logger.error(f"[GOOGLE] Критическая ошибка: {e}", exc_info=True)
