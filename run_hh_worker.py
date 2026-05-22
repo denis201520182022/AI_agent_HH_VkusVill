@@ -2038,7 +2038,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                 # =====================================================================
         # [START] УНИВЕРСАЛЬНАЯ ВАЛИДАЦИЯ ДАТЫ И ВРЕМЕНИ (РЕФАКТОРИНГ V3 - TOTAL CONTROL)
         # =====================================================================
-        import datetime
+        
         DATE_CRITICAL_STATES = [
             'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'interview_scheduled_spb',
             'init_scheduling_sbor', 'scheduling_sbor_day', 'scheduling_sbor_time', 'interview_scheduled_sbor'
