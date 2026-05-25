@@ -96,9 +96,9 @@ def _get_available_slots_sync(date_str: str, city: str, address: str) -> List[st
         # Счетчики для прозрачности
         stats = {
             "total": len(rows) - 1 if len(rows) > 0 else 0,
-            "date_mismatch": 0,
             "city_mismatch": 0,
             "address_mismatch": 0,
+            "date_mismatch": 0,
             "not_free": 0,
             "ok": 0
         }
@@ -115,18 +115,22 @@ def _get_available_slots_sync(date_str: str, city: str, address: str) -> List[st
             row_time = row[5].strip()
             row_status = row[10].strip()
 
-            if row_date != target_date:
-                stats["date_mismatch"] += 1
-                continue
-            
+            # 1. Город
             if norm_city != row_city:
                 stats["city_mismatch"] += 1
                 continue
-                
+
+            # 2. Адрес
             if not ((norm_address in row_address) or (row_address in norm_address)):
                 stats["address_mismatch"] += 1
                 continue
+
+            # 3. Дата
+            if row_date != target_date:
+                stats["date_mismatch"] += 1
+                continue
                 
+            # 4. Статус
             if normalize_string(row_status) != "свободно":
                 stats["not_free"] += 1
                 continue
@@ -137,8 +141,8 @@ def _get_available_slots_sync(date_str: str, city: str, address: str) -> List[st
         res = sorted(list(set(available_times)))
         logger.info(
             f"[GOOGLE] Результат поиска на {target_date}: {len(res)} слотов. "
-            f"(Всего строк={stats['total']}, не та дата={stats['date_mismatch']}, "
-            f"не тот город={stats['city_mismatch']}, не тот адрес={stats['address_mismatch']}, "
+            f"(Всего строк={stats['total']}, не тот город={stats['city_mismatch']}, "
+            f"не тот адрес={stats['address_mismatch']}, не та дата={stats['date_mismatch']}, "
             f"занято={stats['not_free']})"
         )
         return res
