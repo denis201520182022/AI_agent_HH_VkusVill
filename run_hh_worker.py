@@ -35,6 +35,7 @@ from hr_bot.utils.metrics import start_metrics_server
 from hr_bot.utils.pii_masker import extract_and_mask_pii
 from hr_bot.utils.system_notifier import send_system_alert
 from hr_bot.utils.resh_in_code import check_candidate_eligibility, is_candidate_profile_complete
+from hr_bot.utils.fuzzy_matcher import match_metro, match_address
 import signal
 import sys
 from hr_bot.services import sbor_google_service
@@ -2237,6 +2238,12 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             raw_age = extracted_data.get("age")
             raw_metro = extracted_data.get("metro")
             if raw_metro:
+                # --- [НОВОЕ] FUZZY MATCHING МЕТРО ---
+                matched_metro_name = await match_metro(raw_metro, dialogue.id, dialogue.hh_response_id)
+                if matched_metro_name:
+                    raw_metro = matched_metro_name
+                # -----------------------------------
+                
                 # Сохраняем, только если оно еще не заполнено или изменилось
                 if not dialogue.metro_station or dialogue.metro_station.lower() != raw_metro.lower():
                     dialogue.metro_station = raw_metro
@@ -2248,6 +2255,14 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # --- [НОВОЕ] ОБРАБОТКА ВЫБОРА АДРЕСА (СБОРЩИК) ---
             raw_address_choice = extracted_data.get("adress")
             if raw_address_choice and dialogue.dialogue_state == 'scheduling_sbor_address_choice':
+                # --- [НОВОЕ] FUZZY MATCHING АДРЕСА ---
+                if dialogue.metro_station:
+                    valid_addresses = await sbor_google_service.check_metro_availability(dialogue.metro_station)
+                    if valid_addresses:
+                        matched_addr = await match_address(raw_address_choice, valid_addresses, dialogue.id, dialogue.hh_response_id)
+                        if matched_addr:
+                            raw_address_choice = matched_addr
+                # ------------------------------------
                 dialogue.selected_address = raw_address_choice
                 ctx_logger.info(f"[{dialogue.hh_response_id}] Адрес выбран и сохранен: {raw_address_choice}")
 
