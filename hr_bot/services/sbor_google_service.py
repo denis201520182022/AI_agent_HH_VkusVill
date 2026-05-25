@@ -43,9 +43,12 @@ def get_service():
     return build('sheets', 'v4', credentials=creds, cache_discovery=False)
 
 def normalize_string(s: str) -> str:
-    """Очистка строк для надежного сравнения."""
+    """Очистка строк для надежного сравнения (удаление пробелов, запятых, точек)."""
     if not s: return ""
-    return " ".join(str(s).lower().strip().split())
+    res = str(s).lower()
+    for char in [" ", ",", "."]:
+        res = res.replace(char, "")
+    return res
 
 def get_ru_weekday(date_obj: datetime) -> str:
     """Преобразование дня недели в формат таблицы."""
