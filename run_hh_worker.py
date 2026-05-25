@@ -846,22 +846,21 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 
         if is_sborshik_vacancy:
             if is_spb_city:
-                required_blocks.append('#ADRESS_SBOR_SPB#')
+                required_blocks.append('#ADDRESS_SBOR_SPB#')
             else:
-                required_blocks.append('#ADRESS_SBOR_REGIONS#')
+                required_blocks.append('#ADDRESS_SBOR_REGIONS#')
         else:
             # Список 1: Исключения для Питера
             excluded_vacancies = [
-                'повар-пекарь', 'повар неполный день', 'повар', 'бариста', 
+                'повар-пекарь', 'повар неполный день', 'повар', 'бариста',
                 'уборщик', 'уборщица', 'помошник повара'
             ]
             is_excluded_vacancy = any(phrase in current_title_lower for phrase in excluded_vacancies)
 
             if not is_spb_city or is_excluded_vacancy:
-                required_blocks.append('#ADRESS_OTHER#')
+                required_blocks.append('#ADDRESS_OTHER#')
             else:
-                required_blocks.append('#ADRESS_SPB#')
-    # --------------------------------------------------------------
+                required_blocks.append('#ADDRESS_SPB#')    # --------------------------------------------------------------
     state_specific_blocks = {
         'initial_processing': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
         'awaiting_questions': ['#QUALIFICATION_RULES#', '#DECLINED_VAC#'],
@@ -943,9 +942,9 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     # Заменяем [адрес вакансии] на реальные данные из БД
     final_prompt = full_prompt_text.replace("[адрес вакансии]", full_address or city_name)
     
-    # 4. Заменяем [Metro_Adress] для выбора адреса (Сборщики)
+    # 4. Заменяем [Metro_Address] для выбора адреса (Сборщики)
     if metro_addresses:
-        final_prompt = final_prompt.replace("[Metro_Adress]", metro_addresses)
+        final_prompt = final_prompt.replace("[Metro_Address]", metro_addresses)
 
     # НОВАЯ ЗАМЕНА для сборщиков
     # Логика: если interview_address передан (это адрес из диалога), берем его. 
@@ -1823,7 +1822,38 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         bot_response_text = llm_response.get("response_text")
         new_state = llm_response.get("new_state", "error_state")
-        extracted_data = llm_response.get("extracted_data")
+        extracted_data = llm_response.get("extracted_data") or {}
+
+        # --- [НОВОЕ] ПРЕ-ВАЛИДАЦИЯ EXTRACTED_DATA (Fuzzy Match Metro & Address) ---
+        # Мы делаем это ДО обработки состояний, чтобы логика ниже работала с чистыми данными
+        if extracted_data:
+            # 1. Унификация ключа address (теперь всегда address)
+            if "adress" in extracted_data:
+                # Если в JSON пришло 'adress', переносим в 'address'
+                val = extracted_data.pop("adress")
+                if "address" not in extracted_data:
+                    extracted_data["address"] = val
+
+            # 2. Метро
+            raw_metro = extracted_data.get("metro")
+            if raw_metro:
+                matched_metro = await match_metro(raw_metro, dialogue.id, dialogue.hh_response_id)
+                if matched_metro:
+                    extracted_data["metro"] = matched_metro
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Metro fuzzy matched: '{raw_metro}' -> '{matched_metro}'")
+
+            # 3. Адрес (проверяем уже только ключ 'address' после унификации)
+            raw_address = extracted_data.get("address")
+            if raw_address and (dialogue.dialogue_state == 'scheduling_sbor_address_choice' or new_state == 'scheduling_sbor_address_choice'):
+                # Нам нужны доступные адреса для этой станции, чтобы сравнить
+                current_metro = extracted_data.get("metro") or dialogue.metro_station
+                if current_metro:
+                    valid_addresses = await sbor_google_service.check_metro_availability(current_metro)
+                    if valid_addresses:
+                        matched_addr = await match_address(raw_address, valid_addresses, dialogue.id, dialogue.hh_response_id)
+                        if matched_addr:
+                            extracted_data["address"] = matched_addr
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Address fuzzy matched: '{raw_address}' -> '{matched_addr}'")
 
 
 
@@ -1944,7 +1974,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             ctx_logger.info(f"[{dialogue.hh_response_id}] Найдено несколько адресов ({len(found_addresses)}). Переход к выбору.")
                             dialogue.dialogue_state = 'scheduling_sbor_address_choice'
                             
-                            addr_list_str = "\n".join([f"{i+1}. {a}" for i, a in enumerate(found_addresses)])
+                            # Убираем нумерацию, чтобы LLM не возвращала номер вместе с адресом
+                            addr_list_str = "\n".join([f"- {a}" for a in found_addresses])
                             system_command = {
                                 'message_id': f'sys_cmd_metro_choice_{time.time()}',
                                 'role': 'user',
@@ -2238,12 +2269,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             raw_age = extracted_data.get("age")
             raw_metro = extracted_data.get("metro")
             if raw_metro:
-                # --- [НОВОЕ] FUZZY MATCHING МЕТРО ---
-                matched_metro_name = await match_metro(raw_metro, dialogue.id, dialogue.hh_response_id)
-                if matched_metro_name:
-                    raw_metro = matched_metro_name
-                # -----------------------------------
-                
                 # Сохраняем, только если оно еще не заполнено или изменилось
                 if not dialogue.metro_station or dialogue.metro_station.lower() != raw_metro.lower():
                     dialogue.metro_station = raw_metro
@@ -2253,16 +2278,8 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     )
 
             # --- [НОВОЕ] ОБРАБОТКА ВЫБОРА АДРЕСА (СБОРЩИК) ---
-            raw_address_choice = extracted_data.get("adress")
+            raw_address_choice = extracted_data.get("address")
             if raw_address_choice and dialogue.dialogue_state == 'scheduling_sbor_address_choice':
-                # --- [НОВОЕ] FUZZY MATCHING АДРЕСА ---
-                if dialogue.metro_station:
-                    valid_addresses = await sbor_google_service.check_metro_availability(dialogue.metro_station)
-                    if valid_addresses:
-                        matched_addr = await match_address(raw_address_choice, valid_addresses, dialogue.id, dialogue.hh_response_id)
-                        if matched_addr:
-                            raw_address_choice = matched_addr
-                # ------------------------------------
                 dialogue.selected_address = raw_address_choice
                 ctx_logger.info(f"[{dialogue.hh_response_id}] Адрес выбран и сохранен: {raw_address_choice}")
 
