@@ -87,12 +87,27 @@ def _get_available_slots_sync(date_str: str, city: str, address: str) -> List[st
         ).execute()
         
         rows = result.get('values', [])
+        logger.debug(f"[GOOGLE] Получено {len(rows)} строк из листа '{SHEET_NAME_CALENDAR}'")
+        
         available_times = []
         norm_city = normalize_string(city)
         norm_address = normalize_string(address)
 
+        # Счетчики для прозрачности
+        stats = {
+            "total": len(rows) - 1 if len(rows) > 0 else 0,
+            "date_mismatch": 0,
+            "city_mismatch": 0,
+            "address_mismatch": 0,
+            "not_free": 0,
+            "ok": 0
+        }
+
         for row in rows[1:]:
-            if len(row) < 10: continue
+            if len(row) < 11: 
+                # Пропускаем неполные строки (нужно минимум до колонки K, индекс 10)
+                if stats["total"] > 0: stats["total"] -= 1
+                continue
             
             row_date = row[0].strip()
             row_city = normalize_string(row[2])
@@ -100,13 +115,32 @@ def _get_available_slots_sync(date_str: str, city: str, address: str) -> List[st
             row_time = row[5].strip()
             row_status = row[10].strip()
 
-            if row_date == target_date and norm_city == row_city:
-                if (norm_address in row_address) or (row_address in norm_address):
-                    if row_status == "Свободно":
-                        available_times.append(row_time)
+            if row_date != target_date:
+                stats["date_mismatch"] += 1
+                continue
+            
+            if norm_city != row_city:
+                stats["city_mismatch"] += 1
+                continue
+                
+            if not ((norm_address in row_address) or (row_address in norm_address)):
+                stats["address_mismatch"] += 1
+                continue
+                
+            if normalize_string(row_status) != "свободно":
+                stats["not_free"] += 1
+                continue
+
+            stats["ok"] += 1
+            available_times.append(row_time)
 
         res = sorted(list(set(available_times)))
-        logger.info(f"[GOOGLE] Результат поиска слотов на {target_date}: {res if res else 'НИЧЕГО НЕ НАЙДЕНО'}")
+        logger.info(
+            f"[GOOGLE] Результат поиска на {target_date}: {len(res)} слотов. "
+            f"(Всего строк={stats['total']}, не та дата={stats['date_mismatch']}, "
+            f"не тот город={stats['city_mismatch']}, не тот адрес={stats['address_mismatch']}, "
+            f"занято={stats['not_free']})"
+        )
         return res
     except Exception as e:
         logger.error(f"[GOOGLE] Ошибка при чтении слотов: {e}")
@@ -302,8 +336,19 @@ def _check_metro_availability_sync(metro_name: str) -> List[str]:
         address_slots = {addr: 0 for addr in target_addresses}
         norm_target_addresses = {addr: normalize_string(addr) for addr in target_addresses}
 
+        # Счетчики для прозрачности
+        metro_stats = {
+            "total_rows": len(cal_rows) - 1 if len(cal_rows) > 0 else 0,
+            "address_match": 0,
+            "past_date": 0,
+            "not_free": 0,
+            "valid_slots": 0
+        }
+
         for i, row in enumerate(cal_rows[1:], start=2):
-            if len(row) < 5: continue
+            if len(row) < 5: 
+                if metro_stats["total_rows"] > 0: metro_stats["total_rows"] -= 1
+                continue
             
             row_address = normalize_string(row[4])
             
@@ -317,6 +362,8 @@ def _check_metro_availability_sync(metro_name: str) -> List[str]:
             if not matched_addr:
                 continue
 
+            metro_stats["address_match"] += 1
+
             # Проверка условий (Дата и Статус)
             row_date_str = row[0].strip()
             raw_status = row[10].strip() if len(row) >= 11 else ""
@@ -324,16 +371,35 @@ def _check_metro_availability_sync(metro_name: str) -> List[str]:
 
             try:
                 row_date_obj = datetime.strptime(row_date_str, '%d.%m.%Y').date()
-                if row_date_obj >= today and row_status_norm == "свободно":
-                    address_slots[matched_addr] += 1
+                if row_date_obj < today:
+                    metro_stats["past_date"] += 1
+                    continue
+                
+                if row_status_norm != "свободно":
+                    metro_stats["not_free"] += 1
+                    continue
+                
+                address_slots[matched_addr] += 1
+                metro_stats["valid_slots"] += 1
             except Exception:
                 continue
 
         # Формируем список адресов, где есть хотя бы один слот
         final_addresses = [addr for addr, count in address_slots.items() if count > 0]
         
+        # Детальный отчет по адресам
+        addr_report = ", ".join([f"{addr}: {count}" for addr, count in address_slots.items()])
+        
+        logger.info(
+            f"[GOOGLE] Метро '{metro_name}': обработано {metro_stats['total_rows']} строк. "
+            f"Совпало адресов: {metro_stats['address_match']}, "
+            f"из них: в прошлом={metro_stats['past_date']}, занято={metro_stats['not_free']}. "
+            f"Всего слотов: {metro_stats['valid_slots']}. "
+            f"Детали: [{addr_report}]"
+        )
+
         if final_addresses:
-            logger.info(f"[GOOGLE] ✅ УСПЕХ: Найдено адресов со слотами: {len(final_addresses)}")
+            logger.info(f"[GOOGLE] ✅ УСПЕХ: Найдено адресов со слотами: {len(final_addresses)} -> {final_addresses}")
             return final_addresses
         
         logger.warning(f"[GOOGLE] ❌ ОТКАЗ: Для станции '{metro_name}' найдены адреса, но в календаре нет свободных слотов.")

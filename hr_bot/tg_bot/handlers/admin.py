@@ -318,7 +318,8 @@ async def process_del_user_id(message: Message, state: FSMContext, db_session: S
 # --- 3. УПРАВЛЕНИЕ РЕКРУТЕРАМИ ---
 @router.message(F.text == "👨‍💼 Управление рекрутерами")
 async def recruiter_management_menu(message: Message, db_session: Session):
-    recruiters = db_session.query(TrackedRecruiter).all()
+    # Показываем только тех, у кого активный статус
+    recruiters = db_session.query(TrackedRecruiter).filter(TrackedRecruiter.is_auth_active == True).all()
 
     content_parts = [Bold("👨‍💼 Отслеживаемые рекрутеры:"), "\n\n"]
     if not recruiters:
@@ -678,12 +679,17 @@ async def process_del_recruiter_id(message: Message, state: FSMContext, db_sessi
         return
 
     deleted_name = recruiter_to_delete.name
-    db_session.delete(recruiter_to_delete)
+    
+    # Вместо удаления — деактивируем (Soft Delete)
+    recruiter_to_delete.is_auth_active = False
+    recruiter_to_delete.refresh_token = None
+    recruiter_to_delete.access_token = "Не активный старый"
+    
     db_session.commit()
     await state.clear()
-    logger.info(f"Админ {message.from_user.id} удалил рекрутера {recruiter_id}")
+    logger.info(f"Админ {message.from_user.id} деактивировал рекрутера {recruiter_id}")
 
-    content = Text("✅ Рекрутер ", Bold(deleted_name), " (ID: ", Code(recruiter_id), ") удален.")
+    content = Text("✅ Рекрутер ", Bold(deleted_name), " (ID: ", Code(recruiter_id), ") деактивирован и скрыт.")
     await message.answer(**content.as_kwargs())
 
 
