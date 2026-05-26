@@ -838,7 +838,7 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     ]
 
     if dialogue_state not in SCHEDULING_STATES_2:
-        target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+        target_cities = ['санкт-петербург', 'мурино', 'кудрово', 'сестрорецк', 'тельмана']
         is_spb_city = any(city in (city_name or "").lower() for city in target_cities)
         
         current_title_lower = (vacancy_title or "").lower()
@@ -2157,7 +2157,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                                 if weekday_idx == 5: slots = ["14:00"]
                                 else:
                                     current_city_low = (dialogue.vacancy.city or "").lower()
-                                    is_spb = any(city in current_city_low for city in ['санкт-петербург', 'мурино', 'кудрово'])
+                                    is_spb = any(city in current_city_low for city in ['санкт-петербург', 'мурино', 'кудрово', 'сестрорецк', 'тельмана'])
                                     slots = ["10:00", "12:00", "15:00", "16:00"] if is_spb else ["10:00", "12:00", "16:00"]
                         
                         now_msk = datetime.datetime.now(SPB_TIMEZONE)
@@ -2229,7 +2229,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             if weekday_idx == 5: allowed_slots = ["14:00"]
                             else:
                                 current_city_low = (dialogue.vacancy.city or "").lower()
-                                is_spb_area = any(city in current_city_low for city in ['санкт-петербург', 'мурино', 'кудрово'])
+                                is_spb_area = any(city in current_city_low for city in ['санкт-петербург', 'мурино', 'кудрово', 'сестрорецк', 'тельмана'])
                                 allowed_slots = ["10:00", "12:00", "15:00", "16:00"] if is_spb_area else ["10:00", "12:00", "16:00"]
 
                     now_msk = datetime.datetime.now(SPB_TIMEZONE)
@@ -2268,7 +2268,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # --- 1. ОБРАБОТКА ВОЗРАСТА ---
             raw_age = extracted_data.get("age")
             raw_metro = extracted_data.get("metro")
-            if raw_metro:
+            if raw_metro and current_state_at_update == 'scheduling_sbor_metro':
                 # Сохраняем, только если оно еще не заполнено или изменилось
                 if not dialogue.metro_station or dialogue.metro_station.lower() != raw_metro.lower():
                     dialogue.metro_station = raw_metro
@@ -2627,10 +2627,18 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     extra={"action": "qualification_passed_by_code"}
                 )
 
+                # --- НОВАЯ ВЕТКА: Возраст от 14 до 17 лет включительно ---
+                # Если кандидат подходит по остальным параметрам, но он несовершеннолетний (14-17),
+                # то всегда отправляем фиксированную фразу и переводим на рекрутера, независимо от города.
+                cand_age = dialogue.candidate.age
+                if cand_age is not None and 14 <= cand_age < 18:
+                    ctx_logger.info(f"[{dialogue.hh_response_id}] Кандидат 14-17 лет ({cand_age}). Перевод на рекрутера.")
+                    new_state = 'forwarded_to_researcher'
+                    bot_response_text = "Спасибо! Я передам Вашу заявку нашим коллегам. Мы свяжемся с Вами в рабочее время, чтобы согласовать время собеседования."
+                    # Продолжаем выполнение, чтобы ниже сработал блок смены статуса на 'qualified' и отправки сообщения
+                
                 # 1. ПЕРВООЧЕРЕДНАЯ ПРОВЕРКА: СБОРЩИК ИЛИ НЕТ
-                # 1. ПЕРВООЧЕРЕДНАЯ ПРОВЕРКА: СБОРЩИК ИЛИ НЕТ
-                # 1. ПЕРВООЧЕРЕДНАЯ ПРОВЕРКА: СБОРЩИК ИЛИ НЕТ
-                if is_collector_vacancy(dialogue.vacancy.title):
+                elif is_collector_vacancy(dialogue.vacancy.title):
                     ctx_logger.info(
                         f"[{dialogue.hh_response_id}] Сценарий СБОР: проверка адреса и города.",
                         extra={"action": "collector_scenario_check"}
@@ -2645,7 +2653,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
                     # Определяем, является ли город Питером/областью
                     city_lower = (dialogue.vacancy.city or "").lower()
-                    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                    target_cities = ['санкт-петербург', 'мурино', 'кудрово', 'сестрорецк', 'тельмана']
                     is_spb_area = any(x in city_lower for x in target_cities)
 
                     if is_detailed_address:
@@ -2670,51 +2678,51 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                         # СЦЕНАРИЙ Б: Адреса нет, но это Питер -> Спрашиваем метро
 
 
-                        # ПРОВЕРКА: Если метро уже заполнено в БД
-                        if dialogue.metro_station:
-                            ctx_logger.info(f"[{dialogue.hh_response_id}] Метро уже известно ({dialogue.metro_station}). Пропускаю опрос метро.")
+                        # # ПРОВЕРКА: Если метро уже заполнено в БД
+                        # if dialogue.metro_station:
+                        #     ctx_logger.info(f"[{dialogue.hh_response_id}] Метро уже известно ({dialogue.metro_station}). Пропускаю опрос метро.")
                             
-                            # Сразу проверяем доступность этого метро в Google Таблицах
-                            found_address = await sbor_google_service.check_metro_availability(dialogue.metro_station)
+                        #     # Сразу проверяем доступность этого метро в Google Таблицах
+                        #     found_address = await sbor_google_service.check_metro_availability(dialogue.metro_station)
                             
-                            current_history = list(dialogue.history) if dialogue.history else []
-                            dialogue.history = (current_history + user_entries_to_history)[-350:]
+                        #     current_history = list(dialogue.history) if dialogue.history else []
+                        #     dialogue.history = (current_history + user_entries_to_history)[-350:]
 
-                            if found_address:
-                                dialogue.selected_address = found_address
-                                dialogue.dialogue_state = 'init_scheduling_sbor'
-                                cmd_content = f"[SYSTEM COMMAND] Кандидат прошел квалификацию. Станция метро {dialogue.metro_station} уже известна и подтверждена. Начни запись на собеседование (предложи день)."
-                            else:
-                                # Если метро в базе было, но слотов там нет
-                                dialogue.dialogue_state = 'scheduling_sbor_metro'
-                                cmd_content = f"[SYSTEM COMMAND] Кандидат прошел квалификацию. Ранее указанная станция {dialogue.metro_station} сейчас недоступна. Попроси кандидата выбрать ДРУГУЮ станцию метро."
+                        #     if found_address:
+                        #         dialogue.selected_address = found_address
+                        #         dialogue.dialogue_state = 'init_scheduling_sbor'
+                        #         cmd_content = f"[SYSTEM COMMAND] Кандидат прошел квалификацию. Станция метро {dialogue.metro_station} уже известна и подтверждена. Начни запись на собеседование (предложи день)."
+                        #     else:
+                        #         # Если метро в базе было, но слотов там нет
+                        #         dialogue.dialogue_state = 'scheduling_sbor_metro'
+                        #         cmd_content = f"[SYSTEM COMMAND] Кандидат прошел квалификацию. Ранее указанная станция {dialogue.metro_station} сейчас недоступна. Попроси кандидата выбрать ДРУГУЮ станцию метро."
                             
-                            dialogue.pending_messages = [{'message_id': f'sys_metro_skip_{time.time()}', 'role': 'user', 'content': cmd_content}]
-                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                            await db.commit()
-                            return
+                        #     dialogue.pending_messages = [{'message_id': f'sys_metro_skip_{time.time()}', 'role': 'user', 'content': cmd_content}]
+                        #     dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        #     await db.commit()
+                        #     return
 
-                        else:
+                        # else:
 
 
                                 
-                            ctx_logger.info(f"[{dialogue.hh_response_id}] Питер без адреса. Переход в scheduling_sbor_metro.")
-                            
-                            current_history = list(dialogue.history) if dialogue.history else []
-                            dialogue.history = (current_history + user_entries_to_history)[-350:]
+                        ctx_logger.info(f"[{dialogue.hh_response_id}] Питер без адреса. Переход в scheduling_sbor_metro.")
+                        
+                        current_history = list(dialogue.history) if dialogue.history else []
+                        dialogue.history = (current_history + user_entries_to_history)[-350:]
 
-                            dialogue.dialogue_state = 'scheduling_sbor_metro'
-                            system_command = {
-                                'message_id': f'sys_cmd_sbor_metro_{time.time()}',
-                                'role': 'user',
-                                'content': (
-                                    "[SYSTEM COMMAND] Кандидат прошел квалификацию. Для записи на собеседование тебе нужно вежливо спросить у кандидата, самую удобную для него станцию метро. 'Спасибо за предоставленные данные, теперь давайте запишем Вас на собеседование. Назовите, пожалуйста, самую удобную для Вас станцию метро. Не адрес, не улицу, не район, а именно метро?' "
-                                )
-                            }
-                            dialogue.pending_messages = [system_command]
-                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
-                            await db.commit()
-                            return
+                        dialogue.dialogue_state = 'scheduling_sbor_metro'
+                        system_command = {
+                            'message_id': f'sys_cmd_sbor_metro_{time.time()}',
+                            'role': 'user',
+                            'content': (
+                                "[SYSTEM COMMAND] Кандидат прошел квалификацию. Для записи на собеседование тебе нужно вежливо спросить у кандидата, самую удобную для него станцию метро. 'Спасибо за предоставленные данные, теперь давайте запишем Вас на собеседование. Назовите, пожалуйста, самую удобную для Вас станцию метро. Не адрес, не улицу, не район, а именно метро?' "
+                            )
+                        }
+                        dialogue.pending_messages = [system_command]
+                        dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                        await db.commit()
+                        return
 
                     else:
                         # СЦЕНАРИЙ В: Адреса нет и это РЕГИОН -> Перевод на рекрутера (как стандартный не-СПб)
@@ -2728,7 +2736,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     # 2. СТАРЫЙ СЦЕНАРИЙ (Питер / Регионы)
                     city_lower = (dialogue.vacancy.city or "").lower()
                     # --- ИЗМЕНЕНИЕ: Добавлены Мурино и Кудрово ---
-                    target_cities = ['санкт-петербург', 'мурино', 'кудрово']
+                    target_cities = ['санкт-петербург', 'мурино', 'кудрово', 'сестрорецк', 'тельмана']
                     is_spb = any(x in city_lower for x in target_cities)
                     # ---------------------------------------------
 
