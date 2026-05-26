@@ -1526,7 +1526,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Проверяем, не является ли первое сообщение уже системной командой (чтобы избежать рекурсии)
             first_msg = pending_messages[0].get('content', '') if isinstance(pending_messages[0], dict) else str(pending_messages[0])
             
-            if not first_msg.startswith("[SYSTEM COMMAND]"):
+            if not first_msg.startswith("[SYSTEM COMMAND] Кандидат выбрал"):
                 ctx_logger.info(f"[{dialogue.hh_response_id}] Запуск выделенного анализатора метро...")
                 
                 all_pending_content = "\n".join([pm.get('content', '') if isinstance(pm, dict) else str(pm) for pm in pending_messages])
@@ -1541,7 +1541,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                     "2.сли в сообщении НЕТ названия метро (например, кандидат задает вопрос), верни 'found': 'no'.\n"
                     " Помни что собеседник может опечататься в названии, или использовать сленговое название, поэтому тебе надо понять какую стануцию он имел ввиду в последний раз и вернуть ее полное название в metro_statio. \n"
                     "5.Игнорируй названия городов, улиц и районов, если ты точно уверено что это не станция метро (список станций у тебя есть, ориентируйся на него)\n"
-                    
+
                     "Ответ СТРОГО в формате JSON:\n"
                     "{\n"
                     "  \"found\": \"yes\" или \"no\",\n"
@@ -1603,6 +1603,37 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
                             await db.commit()
                             ctx_logger.info(f"[{dialogue.hh_response_id}] Направлено на обработку с принудительным метро.")
                             return # Перезапускаем цикл воркера для этого диалога
+                        
+                        else:
+                            # --- НОВОЕ: Если анализатор НЕ НАШЕЛ метро ---
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Анализатор НЕ НАШЕЛ метро в сообщении.")
+
+                            # Формируем команду: метро не определено, нужно переспросить
+                            system_command = {
+                                'message_id': f'sys_cmd_metro_not_found_{time.time()}',
+                                'role': 'user',
+                                'content': (
+                                    "[SYSTEM COMMAND] В ответе кандидата не пока не расспознана станция метро, необходимо уточнить станцию"
+                                )
+                            }
+
+                            # Сохраняем текущие сообщения в историю, чтобы они не пропали
+                            temp_user_entries = []
+                            for pm in pending_messages:
+                                temp_user_entries.append({
+                                    'message_id': pm.get('message_id', f'temp_{time.time()}'),
+                                    'role': 'user',
+                                    'content': pm.get('content', '') if isinstance(pm, dict) else str(pm),
+                                    'timestamp_msk': pm.get('timestamp_msk', 'время не определено')
+                                })
+                            
+                            dialogue.history = (dialogue.history or []) + temp_user_entries
+                            dialogue.pending_messages = [system_command]
+                            dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
+                            
+                            await db.commit()
+                            ctx_logger.info(f"[{dialogue.hh_response_id}] Направлено на переспрос метро (не найдено).")
+                            return
 
                 except Exception as metro_err:
                     # Если допзапрос упал — не блокируем диалог, пусть основная модель попробует сама
