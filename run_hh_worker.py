@@ -1526,7 +1526,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
             # Проверяем, не является ли первое сообщение уже системной командой (чтобы избежать рекурсии)
             first_msg = pending_messages[0].get('content', '') if isinstance(pending_messages[0], dict) else str(pending_messages[0])
             
-            if not first_msg.startswith("[SYSTEM COMMAND] Кандидат выбрал"):
+            if not first_msg.startswith("[SYSTEM COMMAND]"):
                 ctx_logger.info(f"[{dialogue.hh_response_id}] Запуск выделенного анализатора метро...")
                 
                 all_pending_content = "\n".join([pm.get('content', '') if isinstance(pm, dict) else str(pm) for pm in pending_messages])
