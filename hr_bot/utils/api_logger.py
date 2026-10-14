@@ -16,8 +16,6 @@ def setup_api_logger():
         api_logger.handlers.clear()
 
     formatter = logging.Formatter('%(asctime)s\n%(message)s\n' + '='*80)
-    
-    # Будем писать в файл test00.log. `mode='a'` означает 'append' - дописывать в конец.
     file_handler = logging.FileHandler(os.path.join(log_dir, 'test00.log'), mode='a', encoding='utf-8')
     file_handler.setFormatter(formatter)
     

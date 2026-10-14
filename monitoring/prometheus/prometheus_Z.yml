@@ -8,7 +8,7 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:9090']
 
-  # 2. Мониторинг твоих ботов (HH Core)
+  # 2. Мониторинг ботов (HH Core)
   - job_name: 'hh_bots'
     metrics_path: '/metrics'
     static_configs:
@@ -29,7 +29,6 @@ scrape_configs:
           - 'zz_reminders:8000'
           - 'zz_tg_bot:8000'
 
-    # Переименовываем метку instance, чтобы вместо "zz_worker_6:8000" было просто "zz_worker_6"
     relabel_configs:
       - source_labels: [__address__]
         target_label: instance

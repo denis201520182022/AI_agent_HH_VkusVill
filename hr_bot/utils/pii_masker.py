@@ -1,7 +1,6 @@
 import re
 from typing import Tuple, Optional
 
-# --- РЕГУЛЯРНЫЕ ВЫРАЖЕНИЯ (остаются без изменений) ---
 FIO_PATTERN = re.compile(
     r'\b([А-ЯЁ][а-яё]+(?:-[А-ЯЁ][а-яё]+)?)\s+([А-ЯЁ][а-яё]+)\s+(([А-ЯЁ][а-яё]+))?\b'
 )
@@ -9,7 +8,6 @@ PHONE_PATTERN = re.compile(
     r'(?:\+7|8)?[ \-.(]*(\d{3})[ \-.)]*(\d{3})[ \-.]*(\d{2})[ \-.]*(\d{2})\b'
 )
 
-# --- ИЗМЕНЕНИЕ: Используем токены для замены вместо частичной маскировки ---
 FIO_MASK_TOKEN = "[ФИО ЗАМАСКИРОВАНО]"
 PHONE_MASK_TOKEN = "[ТЕЛЕФОН ЗАМАСКИРОВАН]"
 
@@ -38,7 +36,6 @@ def extract_and_mask_pii(text: str) -> Tuple[str, Optional[str], Optional[str]]:
         else:
             extracted_phone = full_phone_digits
 
-        # --- ИЗМЕНЕНИЕ: Заменяем весь найденный номер на токен ---
         masked_text = PHONE_PATTERN.sub(PHONE_MASK_TOKEN, masked_text, count=1)
 
     # --- Извлечение и маскировка ФИО (ищем в тексте, где уже может быть замаскирован телефон) ---
@@ -47,12 +44,10 @@ def extract_and_mask_pii(text: str) -> Tuple[str, Optional[str], Optional[str]]:
         # Извлекаем полное совпадение
         extracted_fio = fio_match.group(0).strip()
         
-        # --- ИЗМЕНЕНИЕ: Заменяем все найденное ФИО на токен ---
         masked_text = FIO_PATTERN.sub(FIO_MASK_TOKEN, masked_text, count=1)
 
     return masked_text, extracted_fio, extracted_phone
 
-# --- Тесты для проверки ---
 if __name__ == '__main__':
     test_case_1 = "Мои данные: Иванов Иван Иванович, мой телефон +7 (999) 123-45-67. Прошу связаться."
     masked, fio, phone = extract_and_mask_pii(test_case_1)

@@ -2,8 +2,8 @@ x-limits-python: &python-limits
   deploy:
     resources:
       limits:
-        cpus: '0.30'    # Максимум 30% от одного ядра процессора
-        memory: 350M    # Максимум 350 МБ оперативной памяти (этого хватит для воркера)
+        cpus: '0.30'    
+        memory: 350M   
 
 x-monitoring-limits: &monitoring-limits
   deploy:
@@ -16,8 +16,8 @@ x-logging: &default-logging
   logging:
     driver: "json-file"
     options:
-      max-size: "10m"       # Максимальный размер одного файла лога
-      max-file: "3"         # Хранить только 3 последних файла (итого макс 30МБ на контейнер)
+      max-size: "10m"       
+      max-file: "3"       
 
 
 
@@ -44,8 +44,8 @@ services:
       - DB_NAME=${DB_NAME}
       - POOL_MODE=transaction
       - MAX_CLIENT_CONN=1000
-      - DEFAULT_POOL_SIZE=150  # Увеличь до 150
-      - RESERVE_POOL_SIZE=10   # Добавь резерв
+      - DEFAULT_POOL_SIZE=150  
+      - RESERVE_POOL_SIZE=10   
       - QUERY_WAIT_TIMEOUT=120
       - LISTEN_PORT=6432
       - AUTH_TYPE=scram-sha-256
@@ -53,9 +53,6 @@ services:
       - "6432:6432"
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-
-
 
 
 
@@ -197,7 +194,7 @@ services:
       - REDIS_HOST=host.docker.internal
     deploy:
       mode: replicated
-      replicas: 1  # <-- Начинаем с 1. Нужно больше? docker compose up -d --scale hh_worker=5
+      replicas: 1  
 
 
   zz_reminders:
@@ -205,7 +202,6 @@ services:
     image: hh_bot_core:latest
     container_name: zz_reminders
     restart: always
-    # Ограничиваем рекрутерами, чтобы не трогать базу Заботы
     command: python run_reminders_worker.py
     volumes:
       - ./logs:/app/logs
@@ -262,7 +258,7 @@ services:
       - ./monitoring/loki/local-config_Z.yaml:/etc/loki/local-config.yaml
       - zz_loki_data:/loki
     depends_on:
-      - zz_pgbouncer # Просто чтобы запускался вместе с основной пачкой
+      - zz_pgbouncer 
 
   # ---------------------------------------------------------------
   # PROMTAIL (Сборщик логов)
@@ -290,11 +286,9 @@ services:
     ports:
       - "3000:3000"
     environment:
-      # Логин и пароль для входа (можешь поменять)
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
-      # Автоматическое подключение Loki
       - ./monitoring/grafana/datasource_Z.yml:/etc/grafana/provisioning/datasources/datasource.yml
       # Сохраняем настройки графаны (дашборды и т.д.) даже после перезапуска
       - zz_grafana_data:/var/lib/grafana
@@ -313,7 +307,6 @@ services:
     depends_on:
       - zz_worker_0
 
-# Не забудь добавить volumes в самый конец файла (корневой уровень)
 volumes:
   zz_grafana_data:
   zz_loki_data:

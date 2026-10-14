@@ -38,13 +38,13 @@ from hr_bot.services.llm_handler import cleanup
 from hr_bot.utils.system_notifier import send_system_alert
 from sqlalchemy import func, select, delete, update  
 from hr_bot.services import interview_reminder_manager
-from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
-# ... остальные импорты
+from sqlalchemy import func, select, delete, and_, case, literal
 
 logger = logging.getLogger(__name__)
 
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 13, 11, 0, 0, tzinfo=datetime.timezone.utc)
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 16, 13, 56, 0, tzinfo=datetime.timezone.utc)
+
 # --- КОНФИГУРАЦИЯ ---
 DEBOUNCE_DELAY_SECONDS = 0
 CYCLE_PAUSE_SECONDS = 1
@@ -59,14 +59,13 @@ REMINDER_END_HOUR_LOCAL = 20 # Например, 20:00 вечера (напом�
 PRICE_PER_MILLION_INPUT_TOKENS = 0.150  # $0.150 за 1M входных токенов (gpt-4o-mini)
 PRICE_PER_MILLION_OUTPUT_TOKENS = 0.600 # $0.600 за 1M выходных токенов (gpt-4o-mini)
 
-# ВОТ ЭТУ СТРОКУ НУЖНО ДОБАВИТЬ:
 shutdown_requested = False
 
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 except ZoneInfoNotFoundError:
     logger.critical("Часовой пояс 'Europe/Moscow' не найден. Убедитесь, что система имеет актуальную базу данных часовых поясов (tzdata).")
-    SPB_TIMEZONE = None # Fallback
+    SPB_TIMEZONE = None 
 
 def signal_handler(sig, frame):
     """Обработчик сигналов для graceful shutdown"""
@@ -86,8 +85,8 @@ def add_to_processing_log(task_obj, dialogue_id, hh_id, action, reason=None):
         "action": action,      # "sent", "skipped", "error"
         "reason": reason       # например: "vacancy_closed", "network_error"
     })
-    task_obj.processing_log = current_log  # Важно: переназначение, чтобы SQLAlchemy увидел изменение
-# ----------------------------------------------------
+    task_obj.processing_log = current_log  
+
 # --- ХЕЛПЕР: Формирование отчёта по задаче рассылки ---
 def format_mailing_report(task_obj) -> str:
     """Формирует читаемый отчёт о завершении задачи рассылки."""
@@ -126,7 +125,7 @@ def format_mailing_report(task_obj) -> str:
             report += f"\n⚠️ Причины пропусков: {reasons_str}"
     
     return report
-# --------------------------------------------------------
+
 async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, semaphore: asyncio.Semaphore):
     """
     Обрабатывает напоминание для одного диалога в изолированной сессии.
@@ -155,8 +154,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                     # Диалог занят или не найден
                     return
 
-                
-
                 recruiter = await db.get(TrackedRecruiter, recruiter_id)
 
                 if not dialogue or not recruiter:
@@ -179,7 +176,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                 now = datetime.datetime.now(datetime.timezone.utc)
                 dialogue_hh_id = dialogue.hh_response_id
 
-                # --- API ЗАПРОС (самое долгое место) ---
                 current_folder_on_hh = await hh_api.get_negotiation_current_folder(
                     recruiter, db, dialogue_hh_id
                 )
@@ -212,7 +208,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                 # Логика времени
                 dialogue_last_updated = dialogue.last_updated or dialogue.created_at
                 time_since_update = now - dialogue_last_updated
-                # --- НОВАЯ ЛОГИКА: ТАЙМАУТ ДЛЯ РЕАКТИВАЦИИ (РАССЫЛОК) ---
                 if dialogue.current_mode == 'reactivation' and dialogue.status == 'in_progress':
                     if time_since_update > datetime.timedelta(hours=3):
                         # Проверяем, что последнее сообщение было от бота (assistant)
@@ -235,7 +230,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                             await log_analytics_event(db, dialogue, 'timed_out')
                             await db.commit()
                             return # Выходим, так как диалог обработан
-                # --- КОНЕЦ НОВОЙ ЛОГИКИ ---
 
                 reminder_messages = []
                 next_level = None
@@ -273,7 +267,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
 
                 # Выполнение действия
                 if should_timeout:
-                    # ТВОЕ ТРЕБОВАНИЕ: Если запись уже есть, ничего не делаем с таблицей молчунов
                     if not dialogue.inactive_alerts:
                         db.add(InactiveNotificationQueue(dialogue_id=dialogue.id, status='pending'))
                         
@@ -283,7 +276,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                         ctx_logger.debug(f"Диалог {dialogue_hh_id} уже зафиксирован в таблице молчунов. Повторная запись не требуется.")
 
                     await log_analytics_event(db, dialogue, 'timed_out')
-                    # ----------------------------------------
                     dialogue.status = 'timed_out'
                     dialogue.reminder_level = 3
                     dialogue.last_updated = now
@@ -296,7 +288,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
 
                     # 1. Определяем типы напоминаний
                     is_long_reminder = next_level in [4, 5, 6]
-                    # ТВОЕ ТРЕБОВАНИЕ: Списываем деньги только один раз (при переходе на 4 уровень)
                     should_charge = (next_level == 4) 
                     
                     settings = None
@@ -341,7 +332,6 @@ async def _process_single_reminder_task(dialogue_id: int, recruiter_id: int, sem
                             
                             dialogue.history = current_history[-150:]
 
-                            # 3. СПИСЫВАЕМ ДЕНЬГИ (только если это уровень 4)
                             # 3. СПИСЫВАЕМ ДЕНЬГИ + СТАТИСТИКА
                             if should_charge and settings:
                                 cost = settings.cost_per_long_reminder
@@ -406,8 +396,6 @@ async def process_reminders(recruiter_id: int, db: AsyncSession):
             select(Dialogue.id)
             .filter(
                 Dialogue.recruiter_id == recruiter_id,
-                # ИЗМЕНЕНИЕ: Разрешаем обработку и для тех, кто уже в статусе timed_out,
-                # но еще не достиг финального уровня напоминаний
                 Dialogue.status.in_(['in_progress']), 
 
                 Dialogue.dialogue_state.notin_(EXCLUDED_REMINDER_STATUSES),
@@ -445,7 +433,6 @@ async def check_and_send_interview_reminders():
     """
     logger.info("Фоновый обработчик напоминаний о собеседованиях запущен.")
 
-    # Шаблоны сообщений (это черновик, нужны будут точные тексты)
     MESSAGE_TEMPLATES = {
         '2_hours_before': (
             "Здравствуйте! Напоминаю, что у вас запланировано собеседование по вакансии "
@@ -464,10 +451,9 @@ async def check_and_send_interview_reminders():
         )
     }
 
-    # Определяем часовой пояс Санкт-Петербурга
     try:
         SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
-    except ZoneInfoNotFoundError: # <--- Нужно импортировать ZoneInfoNotFoundError в hh_worker/main.py тоже
+    except ZoneInfoNotFoundError: 
         logger.critical("Часовой пояс 'Europe/Moscow' не найден. Напоминания не будут отправляться.")
         SPB_TIMEZONE = None
         return
@@ -478,15 +464,12 @@ async def check_and_send_interview_reminders():
             break
 
         if SPB_TIMEZONE is None:
-            await asyncio.sleep(60) # Ждем, если часовой пояс не определен
+            await asyncio.sleep(60) 
             continue
 
         async with SessionLocal() as db_session:
             try:
                 now_utc = datetime.datetime.now(datetime.timezone.utc)
-
-                # Выбираем напоминания, которые пора отправить
-                # Используем selectinload для всех необходимых связей
                 stmt = (
                     select(InterviewReminder)
                     .options(
@@ -501,7 +484,7 @@ async def check_and_send_interview_reminders():
                         InterviewReminder.scheduled_send_time_utc <= now_utc
                     )
                     .limit(20)
-                    .with_for_update(skip_locked=True) # <--- ВАЖНО: Блокируем строки
+                    .with_for_update(skip_locked=True)
                 )
                 
                 result = await db_session.execute(stmt)
@@ -509,7 +492,7 @@ async def check_and_send_interview_reminders():
 
                 if not reminders_to_send:
                     # logger.debug("[Interview Reminders] Нет ожидающих напоминаний. Пауза.")
-                    await asyncio.sleep(30) # Пауза, если нет задач
+                    await asyncio.sleep(30)
                     continue
 
                 logger.info(f"[Interview Reminders] Найдено {len(reminders_to_send)} напоминаний для отправки.")
@@ -517,7 +500,7 @@ async def check_and_send_interview_reminders():
                 for reminder in reminders_to_send:
                     try:
                         dialogue = reminder.dialogue
-                        recruiter = reminder.recruiter # Объект рекрутера уже загружен
+                        recruiter = reminder.recruiter 
                         vacancy = dialogue.vacancy
                         candidate = dialogue.candidate
 
@@ -573,7 +556,6 @@ async def check_and_send_interview_reminders():
                         ctx_logger.info(f"Отправка напоминания типа '{reminder.notification_type}' для диалога {dialogue.hh_response_id} от рекрутера {recruiter.name}.")
 
                         # Отправка сообщения кандидату через HH API
-                        # --- ИЗМЕНЕНИЕ ЗДЕСЬ ---
                         send_result = await hh_api.send_message(
                             recruiter=recruiter,
                             db=db_session,
@@ -585,7 +567,7 @@ async def check_and_send_interview_reminders():
                             # УСПЕХ
                             reminder.status = 'sent'
 
-                            MESSAGES_SENT_TOTAL.inc() # <--- МЕТРИКА
+                            MESSAGES_SENT_TOTAL.inc()
                             ctx_logger.info(
                                 f"Напоминание {reminder.id} успешно отправлено кандидату {candidate.full_name}."
                                 
@@ -608,7 +590,6 @@ async def check_and_send_interview_reminders():
                                 f"Не удалось отправить напоминание {reminder.id} кандидату {candidate.full_name} (API Error)."
                                 
                             )
-                        # -----------------------
 
                         reminder.processed_at = now_utc
                         await db_session.commit() # Коммитим каждое напоминание отдельно для надежности
@@ -660,8 +641,6 @@ async def check_and_send_followups():
         async with SessionLocal() as db_session:
             try:
                 now_utc = datetime.datetime.now(datetime.timezone.utc)
-
-                # Выбираем задачи с блокировкой строки (skip_locked), чтобы воркеры не мешали друг другу
                 stmt = (
                     select(InterviewFollowup)
                     .options(
@@ -744,12 +723,10 @@ async def check_and_send_followups():
                             settings.balance_outbound -= cost
                             settings.total_spent_followup += cost
                             
-                             # --- [ANALYTICS] СТАРТ FOLLOW-UP ---
                             # --- [ANALYTICS] ВХОД В ВОРОНКУ FOLLOW-UP ---
                             dialogue.current_mode = 'followup' # Переключаем режим!
                             dialogue.last_message_at = now_utc
                             await log_analytics_event(db_session, dialogue, 'followup_sent')
-                            # ----------------------------------
 
                             # История
                             new_hist = {
@@ -872,10 +849,8 @@ async def run_reminders_cycle(target_recruiter_ids=None):
     
     async with SessionLocal() as db:
         query = select(TrackedRecruiter.id).filter(TrackedRecruiter.is_auth_active == True)
-        # --- ИЗМЕНЕНИЕ: Фильтрация ---
         if target_recruiter_ids:
             query = query.filter(TrackedRecruiter.id.in_(target_recruiter_ids))
-        # -----------------------------
         result = await db.execute(query)
         recruiter_ids = result.scalars().all()
     
@@ -890,32 +865,6 @@ async def run_reminders_cycle(target_recruiter_ids=None):
             await db_session.commit()
     
     logger.debug(f"Цикл 'дожимов' завершен за {time.monotonic() - start_time:.2f} сек. (Рекрутеров: {len(recruiter_ids)})")
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -1068,17 +1017,6 @@ async def process_single_candidate(d_id, t_id, t_message, semaphore):
 
 
 
-
-
-
-
-
-
-
-
-
-
-
 async def process_mailing_tasks():
     """
     Фоновая задача для обработки массовых рассылок (MailingTask).
@@ -1223,14 +1161,6 @@ async def process_mailing_tasks():
                     await asyncio.sleep(10)
                     continue
 
-
-
-
-
-
-            
-
-
             # 6. ЗАПУСК ПАРАЛЛЕЛЬНОЙ ПАЧКИ
             # Передаем task_id и task_message_text (сохраненные ранее в памяти)
             logger.info("Запускаем обработку каждого диалога")
@@ -1312,40 +1242,6 @@ async def process_mailing_tasks():
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-# --- ИСПРАВЛЕНИЕ: Убрали лишний отступ у main (вынесли из предыдущей функции) ---
 async def main(target_recruiter_ids=None):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)

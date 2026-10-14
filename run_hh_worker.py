@@ -22,8 +22,7 @@ from hr_bot.utils.data_verification_notifier import send_cost_alert
 import re
 from hr_bot.utils.data_verification_notifier import send_date_conflict_alert
 from hr_bot.db.models import InterviewFollowup, RescheduledNotificationQueue, DeclinedInterviewNotificationQueue, RejectedNotificationQueue
-# ... другие импорты
-from hr_bot.utils.data_verification_notifier import send_verification_alert # <--- НОВЫЙ ИМПОРТ
+from hr_bot.utils.data_verification_notifier import send_verification_alert 
 from hr_bot.utils.redis_lock import close_redis 
 from hr_bot.utils.sentry_config import init_sentry
 from hr_bot.utils.logger_config import setup_logging
@@ -44,8 +43,7 @@ from hr_bot.services.llm_handler import cleanup, LlmValidationError
 from sqlalchemy import func, select, delete, update
 from hr_bot.services import interview_reminder_manager
 from hr_bot.utils.metrics import start_metrics_server, E2E_RESPONSE_LATENCY, MESSAGES_SENT_TOTAL
-from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
-# ... остальные импорты
+from sqlalchemy import func, select, delete, and_, case, literal 
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +61,13 @@ def is_collector_vacancy(vacancy_title: str) -> bool:
 
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 13, 11, 0, 0, tzinfo=datetime.timezone.utc)
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 16, 13, 56, 0, tzinfo=datetime.timezone.utc)
-# --- КОНФИГУРАЦИЯ ---
+
 DEBOUNCE_DELAY_SECONDS = 0
 CYCLE_PAUSE_SECONDS = 3
 TEST_NEGOTIATION_ID = None # Установите в None для боевого режима
 MAX_CONCURRENT_RECRUITERS = 5 #одновременно рекрутеров
 MAX_CONCURRENT_DIALOGUES = 10 #одновременно диалогов
 VACANCY_CACHE_DURATION_MINUTES = 2 # Время кэширования списка вакансий для рекрутера
-# Новые константы для окна доставки напоминаний (местное время сервера)
 REMINDER_START_HOUR_LOCAL = 9  # Например, 9:00 утра
 REMINDER_END_HOUR_LOCAL = 20 # Например, 20:00 вечера (напоминания отправляются до 19:59 включительно)
 
@@ -92,7 +89,6 @@ def _format_timestamp_to_msk(timestamp_str: str) -> str:
     Если строка некорректна, возвращает заглушку.
     """
     try:
-        # SPB_TIMEZONE у вас уже определен глобально
         dt_object = datetime.datetime.fromisoformat(timestamp_str)
         msk_dt = dt_object.astimezone(SPB_TIMEZONE)
         return msk_dt.strftime('%Y-%m-%d %H:%M:%S MSK')
@@ -148,7 +144,6 @@ async def _check_restrictions_via_llm(db: AsyncSession, dialogue: Dialogue, recr
             extra_context=log_extra
         )
 
-        # Логируем использование (включая ретраи, как в твоем коде)
         if response:
             await _log_llm_usage(db, dialogue, "Restriction_Check", response.get("usage_stats"))
             if len(attempt_tracker) > 1:
@@ -159,7 +154,6 @@ async def _check_restrictions_via_llm(db: AsyncSession, dialogue: Dialogue, recr
         return parsed.get("has_restrictions", False)
 
     except Exception as e:
-        # Логируем провальные попытки в БД перед вылетом
         for i in range(len(attempt_tracker)):
             await _log_llm_usage(db, dialogue, f"Restriction_Check (FAILED #{i+1}: {type(e).__name__})")
         
@@ -186,10 +180,6 @@ def _validate_age_in_text(text: str, suggested_age: any) -> bool:
         age_to_check = int(suggested_age)
     except (ValueError, TypeError):
         return False
-
-    # 1. ИСПРАВЛЕННАЯ проверка.
-    # Вместо \b используем (?<!\d) и (?!\d) — это означает "нет цифр слева" и "нет цифр справа".
-    # Это позволит найти "51" в строках "51год", "мне 51.", "возраст 51" и т.д., но отсечет "151" или "510".
     if re.search(r'(?<!\d)' + str(age_to_check) + r'(?!\d)', text):
         return True
 
@@ -208,24 +198,17 @@ def _validate_age_in_text(text: str, suggested_age: any) -> bool:
         if word in text.lower():
             return True
 
-    # 3. Дополнительная проверка (оставляем без изменений)
+    # 3. Дополнительная проверка
     all_numbers_in_text = re.findall(r'\b(1[4-9]|[2-6][0-9]|70)\b', text)
-    
     if all_numbers_in_text and str(age_to_check) not in all_numbers_in_text:
-        # Если нашли числа, но нашего среди них нет, пробуем еще раз с мягким поиском
-        # (на случай если re.findall выше что-то упустил из-за границ слов)
         if re.search(r'(?<!\d)' + str(age_to_check) + r'(?!\d)', text):
             return True
         logger.warning(f"AGE VALIDATION FAILED: LLM suggested {age_to_check}, but found {all_numbers_in_text} in text.")
         return False
 
     if not all_numbers_in_text:
-        # Если чисел вообще не нашли (например "мне полтинник"), а LLM нашла - это подозрительно, но
-        # если мы прошли проверку №1, мы бы уже вернули True.
         return False
-
     return True
-
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 except ZoneInfoNotFoundError:
@@ -264,8 +247,6 @@ async def _log_llm_usage(db: AsyncSession, dialogue: Dialogue, context: str, usa
         cost_input_cached = (cached_tokens / 1_000_000) * (pricing["input"] / 2) 
         cost_output = (c_tokens / 1_000_000) * pricing["output"]
         total_call_cost = Decimal(str(cost_input_regular + cost_input_cached + cost_output))
-
-        # 2. Создание записи лога в ТЕКУЩЕЙ сессии
         usage_log = LlmUsageLog(
             dialogue_id=dialogue.id,
             dialogue_state_at_call=f"{context} ({model_name})",
@@ -902,9 +883,6 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
 
     prompt_pieces = [prompt_library.get(key, '') for key in final_block_keys]
     
-    
-
-    # +++ КЛЮЧЕВОЕ ИЗМЕНЕНИЕ +++
     # Определяем состояния, для которых нужен календарь
     SCHEDULING_STATES = [
         'init_scheduling_spb', 'scheduling_spb_day', 'scheduling_spb_time', 'post_qualification_chat', 'interview_scheduled_spb',
@@ -914,8 +892,6 @@ def _assemble_dynamic_prompt(prompt_library: dict, dialogue_state: str, user_mes
     if dialogue_state in SCHEDULING_STATES:
         calendar_block = _generate_calendar_context_2()
         prompt_pieces.append(calendar_block)
-    # +++ КОНЕЦ ИЗМЕНЕНИЯ +++
-
     POST_QUALIFICATION_STATES = ['interview_scheduled_spb', 'post_qualification_chat']
     
     if dialogue_state in POST_QUALIFICATION_STATES:
@@ -1170,8 +1146,8 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
                 'role': 'assistant',
                 'content': response_text,
                 'timestamp_msk': datetime.datetime.now(SPB_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S MSK'),
-                'extracted_data': extracted_data, # Добавлено
-                'state': 'followup'               # Добавлено
+                'extracted_data': extracted_data, 
+                'state': 'followup'           
             }
             
             # Соединяем: Старая история + Новые сообщения юзера + Ответ бота
@@ -1182,7 +1158,7 @@ async def _process_followup_logic(db: AsyncSession, dialogue: Dialogue, recruite
             dialogue.pending_messages = None
             dialogue.last_updated = datetime.datetime.now(datetime.timezone.utc)
             dialogue.last_message_at = datetime.datetime.now(datetime.timezone.utc)
-            await db.commit() # <--- ЕДИНСТВЕННЫЙ COMMIT
+            await db.commit() 
             ctx_logger.info("Follow-up диалог успешно обновлен и сохранен.")
             
         elif send_res == 403:
@@ -1225,15 +1201,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
     if not lock_acquired:
         ctx_logger.debug(f"Dialogue {dialogue_id} is already being processed by another worker. Skipping.")
         return
-    # ==============================
-
     
     dialogue = None
     recruiter = None
-    # --- ЗАГРУЗКА ЗДЕСЬ (значение по умолчанию) ---
     log_dialogue_hh_response_id = f"ID {dialogue_id}"
-    # --- КОНЕЦ ЗАГРУЗКИ ---
-
     try:
         # Проверка активности сессии
         if not db.is_active:
@@ -1266,7 +1237,6 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         if not dialogue:
             ctx_logger.debug(f"Dialogue {dialogue_id} is locked by another worker or not found. Skipping.")
             return
-        # -----------------------------------------
         
         # Загружаем recruiter
         recruiter = await db.get(TrackedRecruiter, recruiter_id)
@@ -1318,16 +1288,10 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
 
         except Exception as cost_err:
             ctx_logger.error(f"Ошибка в блоке контроля стоимости (Redis): {cost_err}")
-        # === КОНЕЦ БЛОКА ===
-        # === КОНЕЦ БЛОКА ===
 
         if dialogue.is_followup:
             await _process_followup_logic(db, dialogue, recruiter, prompt_library, ctx_logger)
-            return # <--- ВЫХОДИМ, ЧТОБЫ ОСНОВНАЯ ЛОГИКА НЕ МЕШАЛА
-        # =========================================================================
-
-
-        # Теперь этот лог выйдет со всеми ID и именами:
+            return 
 
         ctx_logger.debug(f"Processing dialogue {dialogue.hh_response_id}...")
 
@@ -1336,10 +1300,7 @@ async def _process_single_dialogue(dialogue_id: int, recruiter_id: int, prompt_l
         if not dialogue or not recruiter:
             ctx_logger.error(f"Dialogue {dialogue_id} or recruiter {recruiter_id} not found")
             return
-        # --- ЗАГРУЗКА ЗДЕСЬ ---
         log_dialogue_hh_response_id = dialogue.hh_response_id
-        # --- КОНЕЦ ЗАГРУЗКИ ---
-        # Принудительно загружаем связанные объекты в сессию
         await db.refresh(dialogue.candidate)
         await db.refresh(dialogue.vacancy)
 
@@ -3700,7 +3661,6 @@ async def process_pending_dialogues(recruiter_id: int, prompt_library: dict, db:
 
 
 async def handle_single_recruiter(rec_id: int, prompt_library: dict):
-    # Контекст верхнего уровня
     rec_logger = logging.LoggerAdapter(logger, {"recruiter_id": rec_id, "worker": "handler"})
     try:
         async with SessionLocal() as check_db:
@@ -3711,8 +3671,6 @@ async def handle_single_recruiter(rec_id: int, prompt_library: dict):
             if not recruiter_data or not recruiter_data[1]:
                 rec_logger.warning(f"Recruiter {rec_id} has no token or not found")
                 return
-            
-            # Добавим имя в контекст для будущих логов
             rec_logger.extra["recruiter_name"] = recruiter_data[0]
 
         await process_pending_dialogues(rec_id, prompt_library, None)
@@ -3738,7 +3696,7 @@ async def run_worker_cycle(target_recruiter_ids=None):
                 result = await db.execute(query)
                 all_recruiters_ids = result.scalars().all()
             finally:
-                pass # Сессия 'db' закрывается здесь.
+                pass 
 
         if not all_recruiters_ids:
             logger.warning("Нет отслеживаемых рекрутеров в БД. Цикл пропущен.")
@@ -3762,6 +3720,9 @@ async def run_worker_cycle(target_recruiter_ids=None):
         logger.debug(f"Цикл воркера завершен. Общее время: {cycle_end_time - cycle_start_time:.2f} сек.")
         logger.debug("Цикл воркера завершен.")
 
+
+
+
 async def main(target_recruiter_ids=None):
     """Главная асинхронная функция."""
 
@@ -3769,9 +3730,6 @@ async def main(target_recruiter_ids=None):
     signal.signal(signal.SIGTERM, signal_handler)
 
     logger.info("HH-Worker запускается...")
-    # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
-    # interview_reminders_task = asyncio.create_task(check_and_send_interview_reminders())
-    # --- КОНЕЦ ДОБАВЛЕНИЯ ---
     try:
         while not shutdown_requested:
             try:
@@ -3790,17 +3748,10 @@ async def main(target_recruiter_ids=None):
                     await asyncio.sleep(120)
     finally:
         logger.info("Закрываем соединения...")
-        await cleanup() # Очистка LLM ресурсов
-        # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
+        await cleanup()
         await hh_api_real.close_api_client()
         await close_redis()
-        # ---------------------------
-        # --- ДОБАВИТЬ ЭТУ СТРОКУ ---
-        # interview_reminders_task.cancel() # Отмена задачи при завершении
-        # --- КОНЕЦ ДОБАВЛЕНИЯ ---
         logger.info("HH-Worker полностью остановлен.")
-
-
 
 
 if __name__ == "__main__":
@@ -3809,7 +3760,6 @@ if __name__ == "__main__":
     init_sentry()
     start_metrics_server(8000)
 
-    # Настраиваем чтение аргументов
     parser = argparse.ArgumentParser(description="HH Worker instance")
     parser.add_argument('--recruiter_ids', nargs='+', type=int, help='List of recruiter IDs to handle')
     args = parser.parse_args()

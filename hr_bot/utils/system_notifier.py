@@ -8,7 +8,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from hr_bot.db.models import SessionLocal, TelegramUser
 
-# Инициализируем логгер
 logger = logging.getLogger(__name__)
 
 def get_session():
@@ -72,6 +71,5 @@ async def send_system_alert(message_text: str, alert_type: str = "admin_only"):
         except Exception as e:
             logger.error(f"Критическая ошибка в функции send_system_alert: {e}", exc_info=True)
         finally:
-            # Обязательно закрываем сессию бота, чтобы не было утечек памяти
             if bot.session:
                 await bot.session.close()

@@ -1,11 +1,10 @@
 version: '3.8'
-
 x-limits-python: &python-limits
   deploy:
     resources:
       limits:
-        cpus: '0.30'    # Максимум 30% от одного ядра процессора
-        memory: 350M    # Максимум 350 МБ оперативной памяти (этого хватит для воркера)
+        cpus: '0.30'    
+        memory: 350M   
 
 x-monitoring-limits: &monitoring-limits
   deploy:
@@ -18,8 +17,8 @@ x-logging: &default-logging
   logging:
     driver: "json-file"
     options:
-      max-size: "10m"       # Максимальный размер одного файла лога
-      max-file: "3"         # Хранить только 3 последних файла (итого макс 30МБ на контейнер)
+      max-size: "10m"       
+      max-file: "3"        
 
 services:
   # ---------------------------------------------------------------
@@ -43,8 +42,8 @@ services:
       - DB_NAME=${DB_NAME}
       - POOL_MODE=transaction
       - MAX_CLIENT_CONN=1000
-      - DEFAULT_POOL_SIZE=150  # Увеличь до 150
-      - RESERVE_POOL_SIZE=10   # Добавь резерв
+      - DEFAULT_POOL_SIZE=150  
+      - RESERVE_POOL_SIZE=10   
       - QUERY_WAIT_TIMEOUT=120
       - LISTEN_PORT=6432
       - AUTH_TYPE=scram-sha-256
@@ -102,8 +101,6 @@ services:
       - REDIS_HOST=host.docker.internal
 
 
-
-  #---------------------------------------------------------------------------------------------
   # ---------------------------------------------------------------
   # SCANNER
   # ---------------------------------------------------------------
@@ -150,7 +147,6 @@ services:
       - DB_HOST=vv_pgbouncer
       - DB_PORT=6432
       - REDIS_HOST=host.docker.internal
-  #---------------------------------------------------------------------------------------------
   # ---------------------------------------------------------------
   # SCANNER
   # ---------------------------------------------------------------
@@ -396,7 +392,6 @@ services:
     image: hh_bot_core:latest
     container_name: vv_reminders
     restart: always
-    # Ограничиваем рекрутерами, чтобы не трогать базу Заботы
     command: python run_reminders_worker.py
     volumes:
       - ./logs:/app/logs
@@ -447,7 +442,7 @@ services:
     container_name: vv_monitoring_loki
     restart: always
     ports:
-      - "3101:3100" # Внешний порт 3101
+      - "3101:3100" 
     command: -config.file=/etc/loki/local-config.yaml
     volumes:
       - ./monitoring/loki/local-config.yaml:/etc/loki/local-config.yaml
@@ -472,7 +467,7 @@ services:
     container_name: vv_monitoring_grafana
     restart: always
     ports:
-      - "3001:3000" # Внешний порт 3001
+      - "3001:3000" 
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin

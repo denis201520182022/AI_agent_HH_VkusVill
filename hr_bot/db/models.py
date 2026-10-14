@@ -8,24 +8,20 @@ from sqlalchemy.orm import relationship, declarative_base, sessionmaker
 from sqlalchemy.dialects.postgresql import JSONB
 from dotenv import load_dotenv
 import os
-
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy import create_engine
-# Загружаем переменные из .env
+
 load_dotenv()
 
-# Получаем данные из окружения
 DB_USER = os.getenv("DB_USER")
 DB_PASSWORD = os.getenv("DB_PASSWORD")
 DB_HOST = os.getenv("DB_HOST")
 DB_PORT = os.getenv("DB_PORT")
 DB_NAME = os.getenv("DB_NAME")
-
-# Формируем строки подключения динамически
 DATABASE_URL = f"postgresql+asyncpg://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 SYNC_DATABASE_URL = f"postgresql+psycopg2://{DB_USER}:{DB_PASSWORD}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
 
-engine = create_async_engine( # 
+engine = create_async_engine( 
     DATABASE_URL,
     pool_size=11,
     max_overflow=20,
@@ -34,13 +30,11 @@ engine = create_async_engine( #
     pool_pre_ping=True
 )
 
-# Теперь SessionLocal будет возвращать асинхронные сессии (AsyncSession)
 SessionLocal = async_sessionmaker(
-    engine, # Асинхронный движок
-    expire_on_commit=False, # Рекомендуется для асинхронных сессий
-    class_=AsyncSession # Явно указываем класс сессии
+    engine, 
+    expire_on_commit=False, 
+    class_=AsyncSession 
 )
-
 
 
 # --- СИНХРОННЫЙ ДВИЖОК И ФАБРИКА СЕССИЙ (ДЛЯ ТГ-БОТА) ---
@@ -58,11 +52,7 @@ SyncSessionLocal = sessionmaker(
 )
 
 
-
-
-
 Base = declarative_base()
-
 
 class Vacancy(Base):
     __tablename__ = 'vacancies'
@@ -71,16 +61,12 @@ class Vacancy(Base):
     title = Column(String(255), nullable=False)
     city = Column(String(100))
     hh_data_raw = Column(JSONB, nullable=True)
-    extracted_info = Column(JSONB, nullable=True) # Сюда пишем чистые данные
+    extracted_info = Column(JSONB, nullable=True) 
     details_last_synced_at = Column(DateTime(timezone=True), nullable=True)
-    # --- ДОБАВИТЬ ЭТО ПОЛЕ ---
     recruiter_id = Column(Integer, ForeignKey('tracked_recruiters.id'), nullable=True)
-    # --- КОНЕЦ ---
     statistics = relationship("Statistic", back_populates="vacancy")
     dialogues = relationship("Dialogue", back_populates="vacancy")
-    # --- ДОБАВИТЬ ЭТУ СВЯЗЬ ---
     recruiter = relationship("TrackedRecruiter", back_populates="vacancies")
-    # --- КОНЕЦ ---
 
 class Candidate(Base):
     __tablename__ = 'candidates'
@@ -91,9 +77,7 @@ class Candidate(Base):
     citizenship = Column(String(100))
     phone_number = Column(String(50), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=text("now()"))
-    city = Column(String(255), nullable=True) # Поле с прошлого шага
-    
-    # --- ДОБАВЬТЕ ЭТУ СТРОКУ ---
+    city = Column(String(255), nullable=True) 
     readiness_to_start = Column(String(255), nullable=True)
     dialogues = relationship("Dialogue", back_populates="candidate")
 
@@ -110,23 +94,17 @@ class TrackedRecruiter(Base):
     vacancies_last_synced_at = Column(DateTime(timezone=True), nullable=True)
     
     dialogues = relationship("Dialogue", back_populates="recruiter")
-    # --- ДОБАВИТЬ ЭТУ СВЯЗЬ ---
     vacancies = relationship("Vacancy", back_populates="recruiter")
-    # --- КОНЕЦ ---
-    # --- НОВЫЕ ПОЛЯ ДЛЯ НАСТРОЙКИ ЧАТА ---
     telegram_chat_id = Column(BigInteger, nullable=True) # ID группы рекрутера
     topic_qualified_id = Column(Integer, nullable=True)  # ID темы "Подходящие"
     topic_rejected_id = Column(Integer, nullable=True)   # ID темы "Отказники"
     topic_timeout_id = Column(Integer, nullable=True)    # ID темы "Молчуны"
     topic_declined_interview_id = Column(Integer, nullable=True) # ID темы "Отказ от собеседования"
     topic_rescheduled_id = Column(Integer, nullable=True) # ID темы "Переносы / Доработанные"
-    # -------------------------------------
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     dialogues = relationship("Dialogue", back_populates="recruiter")
-    # --- ДОБАВИТЬ ЭТУ СВЯЗЬ ---
     vacancies = relationship("Vacancy", back_populates="recruiter")
-    # --- КОНЕЦ ---
 
 class Dialogue(Base):
     __tablename__ = 'dialogues'
@@ -152,45 +130,30 @@ class Dialogue(Base):
     
     interview_datetime_utc = Column(DateTime(timezone=True), nullable=True)
     metro_station = Column(String(255), nullable=True) 
-    selected_address = Column(String(500), nullable=True) # Полученный адрес (ул. Ленина, 10)
+    selected_address = Column(String(500), nullable=True)
     is_followup = Column(Boolean, default=False, server_default='false')
     need_follow_up_resheduled_sent = Column(Boolean, default=False, server_default='false')
     interview_result = Column(String(50), nullable=True) 
     no_show_reason = Column(Text, nullable=True)
     was_in_followup = Column(Boolean, default=False, server_default='false')
     reschedule_count = Column(Integer, default=0, server_default='0')
-
-    # --- ДОБАВИТЬ ЭТИ ПОЛЯ ДЛЯ СТАТИСТИКИ ТОКЕНОВ ---
     total_prompt_tokens = Column(Integer, nullable=False, default=0, server_default='0')
     total_completion_tokens = Column(Integer, nullable=False, default=0, server_default='0')
     total_cached_tokens = Column(Integer, nullable=False, default=0, server_default='0')
     total_cost = Column(Numeric(12, 6), nullable=False, default=0.0, server_default='0.0')
 
-
-    # --- НОВЫЕ ПОЛЯ ДЛЯ АНАЛИТИКИ И РЕЖИМОВ ---
     # Текущий режим диалога: 'standard', 'reactivation', 'followup'
     current_mode = Column(String(50), default='standard', server_default='standard', nullable=False)
-    
-    # Ссылка на задачу рассылки, если диалог сейчас в режиме 'reactivation'
-    # (чтобы понимать, какая именно рассылка его оживила)
     active_mailing_task_id = Column(Integer, ForeignKey('mailing_tasks.id'), nullable=True)
-    # --- КОНЕЦ ДОБАВЛЕНИЯ ---
-
-
 
     candidate = relationship("Candidate", back_populates="dialogues")
     vacancy = relationship("Vacancy", back_populates="dialogues")
     recruiter = relationship("TrackedRecruiter", back_populates="dialogues")
     declined_interview_alerts = relationship("DeclinedInterviewNotificationQueue", back_populates="dialogue", uselist=False)
-    # --- ДОБАВИТЬ ЭТИ ДВЕ СТРОКИ СВЯЗЕЙ ---
     inactive_alerts = relationship("InactiveNotificationQueue", back_populates="dialogue", uselist=False) # uselist=False, т.к. unique=True на dialogue_id
     rejected_alerts = relationship("RejectedNotificationQueue", back_populates="dialogue", uselist=False) # uselist=False, т.к. unique=True на dialogue_id
-    # --- КОНЕЦ ДОБАВЛЕНИЯ ---
     reminders = relationship("InterviewReminder", back_populates="dialogue")
-    # --- ДОБАВЛЕНА НОВАЯ СВЯЗЬ ---
-    # --- ДОБАВИТЬ НОВУЮ СВЯЗЬ С ЛОГАМИ ---
     llm_usage_logs = relationship("LlmUsageLog", back_populates="dialogue", cascade="all, delete-orphan")
-    # --- КОНЕЦ ДОБАВЛЕНИЯ ---
     followups = relationship("InterviewFollowup", back_populates="dialogue", cascade="all, delete-orphan")
     rescheduled_alerts = relationship("RescheduledNotificationQueue", back_populates="dialogue", uselist=False)
     
@@ -233,9 +196,6 @@ class AppSettings(Base):
     __tablename__ = 'app_settings'
     
     id = Column(Integer, primary_key=True)
-
-    # --- БАЛАНСЫ ---
-    # Для новых диалогов (Scanner)
     balance_standard = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
     # Для Фоллоу-ап и Реактивации (Mailing / Follow-up)
     balance_outbound = Column(Numeric(12, 2), nullable=False, default=0.00, server_default='0.00')
@@ -257,7 +217,6 @@ class AppSettings(Base):
     notified_low_outbound = Column(Boolean, nullable=False, default=False, server_default='false')
 
     
-    # --- НОВАЯ МОДЕЛЬ ДЛЯ УВЕДОМЛЕНИЙ О НЕАКТИВНЫХ КАНДИДАТАХ ---
 class InactiveNotificationQueue(Base):
     __tablename__ = 'inactive_notification_queue'
     id = Column(Integer, primary_key=True, index=True)
@@ -268,7 +227,6 @@ class InactiveNotificationQueue(Base):
     processed_at = Column(DateTime(timezone=True))
     
     dialogue = relationship("Dialogue", back_populates="inactive_alerts")
-# --- КОНЕЦ НОВОЙ МОДЕЛИ ---
 
 # --- НОВАЯ МОДЕЛЬ ДЛЯ УВЕДОМЛЕНИЙ ОБ ОТКЛОНЕННЫХ КАНДИДАТАХ ---
 class RejectedNotificationQueue(Base):
@@ -281,7 +239,6 @@ class RejectedNotificationQueue(Base):
     processed_at = Column(DateTime(timezone=True))
     
     dialogue = relationship("Dialogue", back_populates="rejected_alerts")
-# --- КОНЕЦ НОВОЙ МОДЕЛИ ---
 
 class DeclinedInterviewNotificationQueue(Base):
     __tablename__ = 'declined_interview_notification_queue'
@@ -293,7 +250,6 @@ class DeclinedInterviewNotificationQueue(Base):
     processed_at = Column(DateTime(timezone=True))
     
     dialogue = relationship("Dialogue", back_populates="declined_interview_alerts")
-# -------------------------------------
 
 # --- НОВАЯ МОДЕЛЬ ДЛЯ УВЕДОМЛЕНИЙ О СОБЕСЕДОВАНИЯХ ---
 class InterviewReminder(Base):
@@ -311,8 +267,7 @@ class InterviewReminder(Base):
     processed_at = Column(DateTime(timezone=True))
     
     dialogue = relationship("Dialogue", back_populates="reminders")
-    recruiter = relationship("TrackedRecruiter") # Добавим связь для удобного доступа к рекрутеру
-# --- КОНЕЦ НОВОЙ МОДЕЛИ ---
+    recruiter = relationship("TrackedRecruiter")
 
 # --- НОВАЯ МОДЕЛЬ ДЛЯ ЛОГИРОВАНИЯ ИСПОЛЬЗОВАНИЯ ТОКЕНОВ ---
 class LlmUsageLog(Base):
@@ -339,7 +294,6 @@ class LlmUsageLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
 
     dialogue = relationship("Dialogue", back_populates="llm_usage_logs")
-# --- КОНЕЦ НОВОЙ МОДЕЛИ ---
 
 # --- НОВАЯ МОДЕЛЬ ДЛЯ POST-INTERVIEW FOLLOW-UP (ДОЖИМ ПОСЛЕ СОБЕСЕДОВАНИЯ) ---
 class InterviewFollowup(Base):
@@ -361,7 +315,6 @@ class InterviewFollowup(Base):
     processed_at = Column(DateTime(timezone=True))
     
     dialogue = relationship("Dialogue", back_populates="followups")
-# ---------------------------------------------------------------------------
 
 # --- НОВАЯ МОДЕЛЬ ДЛЯ УВЕДОМЛЕНИЙ О ПЕРЕНОСЕ СОБЕСЕДОВАНИЯ (RESCHEDULED) ---
 class RescheduledNotificationQueue(Base):
@@ -372,9 +325,7 @@ class RescheduledNotificationQueue(Base):
     status = Column(String(50), nullable=False, default='pending') # pending, sent, error
     created_at = Column(DateTime(timezone=True), server_default=func.timezone('UTC', func.now()))
     processed_at = Column(DateTime(timezone=True))
-    
     dialogue = relationship("Dialogue", back_populates="rescheduled_alerts")
-# ---------------------------------------------------------------------------
 
 
 
@@ -407,7 +358,6 @@ class MailingTask(Base):
     # Статистика
     candidates_found = Column(Integer, default=0) # Сколько диалогов попало в выборку
     messages_sent = Column(Integer, default=0)    # Сколько реально отправлено (успешно)
-        # --- НОВЫЕ ПОЛЯ ДЛЯ ДЕТАЛЬНОЙ СТАТИСТИКИ РАССЫЛКИ ---
 
     # Счетчик обработанных диалогов (инкрементальный, показывает текущий прогресс)
     processed_count = Column(Integer, default=0, server_default='0', nullable=False)
@@ -421,7 +371,6 @@ class MailingTask(Base):
     # Детальный лог обработки: список событий в формате
     # [{"ts": "2026-04-28T10:15:30Z", "dialogue_id": 123, "action": "sent|skipped|error", "reason": "vacancy_closed|network_error|..."}]
     processing_log = Column(JSONB, nullable=True, default=lambda: [])
-    # ---------------------------------------------------
     total_cost = Column(Numeric(12, 2), default=0.00) # Сколько денег списано за эту рассылку
     
     created_at = Column(DateTime(timezone=True), server_default=func.now())
@@ -459,6 +408,5 @@ class AnalyticsEvent(Base):
     
     created_at = Column(DateTime(timezone=True), server_default=func.now(), index=True)
 
-    # Опционально: связи для удобства ORM
     dialogue = relationship("Dialogue")
     mailing_task = relationship("MailingTask")

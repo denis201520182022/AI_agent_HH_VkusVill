@@ -21,7 +21,6 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# --- КОНФИГУРАЦИЯ ---
 SPREADSHEET_ID = os.getenv("GOOGLE_SHEETS_SBOR_ID")
 SHEET_NAME_CALENDAR = os.getenv("SHEET_NAME_CALENDAR", "Календарь_8н")
 SHEET_NAME_RECORDS = os.getenv("SHEET_NAME_RECORDS", "Записи")
@@ -30,7 +29,6 @@ CREDENTIALS_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "credentials.json")
 
 SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
 
-# --- ТЕХНИЧЕСКИЕ ФУНКЦИИ ---
 
 def get_service():
     """Инициализация клиента Google Sheets API."""

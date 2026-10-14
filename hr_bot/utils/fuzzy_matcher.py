@@ -54,7 +54,7 @@ async def match_metro(metro_input: str, dialogue_id: int = None, hh_id: str = No
                 f"Схожесть: `{score:.2f}`"
             )
             logger.info(f"Fuzzy Match (Metro): '{metro_input}' -> '{best_match}' (score: {score:.2f})")
-            if score < 0.95: # Не шлем алерт на совсем мелкие опечатки типа "ё"
+            if score < 0.95: 
                 await send_system_alert(msg, alert_type="admin_only")
         return best_match
     

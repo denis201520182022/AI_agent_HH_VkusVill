@@ -3,19 +3,20 @@
 import os
 import json
 import logging
-import asyncio # <--- ДОБАВЛЕНО
+import asyncio
 from dotenv import load_dotenv
 import httpx
-from openai import AsyncOpenAI, APITimeoutError # <--- ДОБАВЛЕНО APITimeoutError
+from openai import AsyncOpenAI, APITimeoutError 
 from tenacity import retry, stop_after_attempt, wait_exponential
 import datetime
-import os # <--- Добавь
-from hr_bot.utils.redis_lock import DistributedSemaphore # <--- Добавь
+import os 
+from hr_bot.utils.redis_lock import DistributedSemaphore 
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import os
 from hr_bot.utils.redis_lock import DistributedSemaphore, get_redis_client, close_redis 
-# --- ЦЕНЫ И КУРС ---
+
+
 MODEL_PRICING = {
     "gpt-4o-mini": {
         "input": 0.150,
@@ -38,25 +39,15 @@ class LlmValidationError(Exception):
 load_dotenv()
 logger = logging.getLogger(__name__)
 
-
-
-
-# Путь теперь ведет в папку /app/logs, которая прокинута в docker-compose
 LOG_DIR = "/app/logs"
 LLM_DEBUG_LOG_PATH = os.path.join(LOG_DIR, "debug_llm_responses.log")
 
-# Создаем папку, если её нет (на всякий случай)
 os.makedirs(LOG_DIR, exist_ok=True)
 
-# Настройка ротируемого логгера
 llm_debug_logger = logging.getLogger("llm_debug")
 llm_debug_logger.setLevel(logging.INFO)
-llm_debug_logger.propagate = False # Чтобы эти логи не дублировались в основной лог
+llm_debug_logger.propagate = False 
 
-# when="midnight" — ротация в полночь
-# interval=1 — каждые 1 сутки
-# backupCount=1 — хранить только 1 старый файл (вчерашний). 
-# Если поставить 0 — удалит сразу при наступлении новых суток.
 handler = TimedRotatingFileHandler(
     LLM_DEBUG_LOG_PATH, 
     when="midnight", 
@@ -64,21 +55,12 @@ handler = TimedRotatingFileHandler(
     backupCount=1, 
     encoding="utf-8"
 )
-formatter = logging.Formatter('%(message)s') # Для этого файла нам не нужен префикс, только тело
+formatter = logging.Formatter('%(message)s') 
 handler.setFormatter(formatter)
 llm_debug_logger.addHandler(handler)
 
-# --- ДОБАВЛЕНО: Глобальный семафор для LLM запросов ---
-# Определяет максимальное количество ОДНОВРЕМЕННЫХ запросов к OpenAI.
-# Начните с небольшого значения, например, 5-10, и постепенно увеличивайте,
-# если производительность позволяет и нет ошибок.
-# MAX_CONCURRENT_LLM_REQUESTS = 40 # Например, 5 одновременных запросов
-# LLM_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_LLM_REQUESTS)
-# ---------------------------------------------------
-# Получаем лимит из ENV
 GLOBAL_LLM_LIMIT = int(os.getenv("GLOBAL_LLM_CONCURRENCY", 30))
 
-# Загружаем настройки прокси из .env
 SQUID_PROXY_HOST = os.getenv("SQUID_PROXY_HOST")
 SQUID_PROXY_PORT = os.getenv("SQUID_PROXY_PORT")
 SQUID_PROXY_USER = os.getenv("SQUID_PROXY_USER")
@@ -180,12 +162,9 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
     """
     Асинхронно отправляет запрос в OpenAI через прокси и получает ответ.
     """
-
-    # --- ДОБАВЛЕНО: СЧЕТЧИК ПОПЫТОК ---
     # При каждом запуске (включая ретраи) добавляем метку в список
     if attempt_tracker is not None:
         attempt_tracker.append(datetime.datetime.now())
-    # ----------------------------------
     # Создаем контекстный логгер
     ctx_logger = logging.LoggerAdapter(logger, extra_context or {})
     messages = [
@@ -208,8 +187,6 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
                 frequency_penalty=0.7,
                 temperature=0.0
             )
-        # ----------------------------------------------------
-        # ----------------------------------------------------
         # 1. Сразу дампим весь ответ в JSON-строку
         full_response_dump = response.model_dump_json(indent=2)
         response_content = response.choices[0].message.content
@@ -227,10 +204,7 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         except Exception as log_error:
             ctx_logger.error(f"Error writing to debug log: {log_error}")
         response_content = response.choices[0].message.content
-        finish_reason = response.choices[0].finish_reason  # ### <--- НОВОЕ: Причина остановки
-
-
-        # Извлекаем информацию о токенах
+        finish_reason = response.choices[0].finish_reason 
         usage = response.usage
 
         # Безопасно получаем кешированные токены
@@ -253,7 +227,6 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
             f"Raw LLM Response: {response_content}..."
         )
         
-        # --- ЛОГИРОВАНИЕ В REDIS ---
         dialogue_id = (extra_context or {}).get("dialogue_id")
         if dialogue_id:
             await _log_usage_to_redis(dialogue_id, "gpt-4o-mini", {
@@ -261,10 +234,7 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
                 "completion_tokens": usage.completion_tokens,
                 "cached_tokens": cached_tokens
             })
-        # ---------------------------
         
-        
-
         refusal_msg = getattr(response.choices[0].message, "refusal", None)
         
         if refusal_msg or not response_content or not response_content.strip():
@@ -287,7 +257,6 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         except json.JSONDecodeError as je:
             raise LlmValidationError(f"LLM returned invalid JSON: {je}") from je
 
-        # --- ИЗМЕНИТЬ ЭТУ ЧАСТЬ (чтобы вернуть статистику наружу) ---
         return {
             "parsed_response": parsed_response,
             "usage_stats": {
@@ -297,10 +266,8 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
                 "cached_tokens": cached_tokens
             }
         }
-        # ------------------------------------------------------------
-
+       
     except Exception as e:
-        # Используем ctx_logger вместо обычного logger
         ctx_logger.warning(
             f"Ошибка при запросе к OpenAI: {type(e).__name__}: {e}. Будет ретрай.", 
             exc_info=True,
@@ -308,7 +275,6 @@ async def get_bot_response(system_prompt: str, dialogue_history: list, user_mess
         )
         raise
 
-# Найти в конце файла или после функции get_bot_response
 
 @retry(
     stop=stop_after_attempt(6),
@@ -321,7 +287,6 @@ async def get_smart_bot_response(system_prompt: str, dialogue_history: list, use
     if attempt_tracker is not None:
         attempt_tracker.append(datetime.datetime.now())
     ctx_logger = logging.LoggerAdapter(logger, extra_context or {})
-    # Рекомендуется использовать роль 'developer' для системных инструкций в GPT-5
     messages = [
         {"role": "developer", "content": system_prompt},
     ]

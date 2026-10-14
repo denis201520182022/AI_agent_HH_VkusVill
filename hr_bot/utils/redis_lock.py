@@ -8,7 +8,6 @@ from redis.asyncio import Redis
 
 logger = logging.getLogger(__name__)
 
-# Инициализация глобального клиента Redis
 _redis_client = None
 
 def get_redis_client():
@@ -50,7 +49,7 @@ class DistributedSemaphore:
     async def acquire(self):
         """Пытается захватить слот. Если слотов нет — ждет."""
         start_wait_time = time.time()
-        log_interval = 5.0 # Логировать ожидание каждые 5 секунд
+        log_interval = 5.0 
         last_log_time = start_wait_time
 
         while True:
@@ -76,7 +75,6 @@ class DistributedSemaphore:
                 if result == 1:
                     return True
                 
-                # --- ДОБАВЛЕНО ЛОГИРОВАНИЕ ОЖИДАНИЯ ---
                 current_time = time.time()
                 if current_time - last_log_time > log_interval:
                     logger.debug(
@@ -84,7 +82,6 @@ class DistributedSemaphore:
                         f"Waiting for {int(current_time - start_wait_time)}s..."
                     )
                     last_log_time = current_time
-                # --------------------------------------
 
             except Exception as e:
                 logger.error(f"Redis error acquiring semaphore: {e}")
@@ -120,8 +117,6 @@ async def close_redis():
         await _redis_client.aclose()
         logger.info("Redis client closed")
 
-
-# === ДОБАВЬ В КОНЕЦ ФАЙЛА redis_lock.py ===
 
 async def acquire_lock(key: str, timeout: int = 120) -> bool:
     """
@@ -159,11 +154,6 @@ async def release_lock(key: str):
     except Exception as e:
         logger.error(f"Redis error releasing lock '{key}': {e}")
 
-
-# hr_bot\utils\redis_lock.py
-
-# ... (импорты и get_redis_client остаются без изменений)
-# ... (DistributedSemaphore остается без изменений)
 
 class DistributedRateLimiter:
     """
@@ -253,7 +243,5 @@ class DistributedRateLimiter:
 
             except Exception as e:
                 logger.error(f"Redis error acquiring rate limit '{self.key_name}': {e}", exc_info=True)
-                await asyncio.sleep(1) # Ждем дольше при ошибке Redis
+                await asyncio.sleep(1) 
 
-
-# ... (остальной код в redis_lock.py, включая close_redis, acquire_lock, release_lock)

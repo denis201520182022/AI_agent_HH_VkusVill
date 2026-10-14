@@ -4,13 +4,10 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
-
-# --- ИЗМЕНЕНИЕ: Добавили InterviewFollowup в импорт ---
 from hr_bot.db.models import InterviewReminder, Dialogue, TrackedRecruiter, InterviewFollowup 
 
 logger = logging.getLogger(__name__)
 
-# Определяем часовой пояс Санкт-Петербурга
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 except ZoneInfoNotFoundError:
@@ -166,5 +163,3 @@ async def schedule_interview_reminders(
     # db_session.add(new_followup)
     
     logger.info(f"Запланирован Follow-up (шаг 1) для {hh_response_id} на {followup_time_utc.isoformat()} (UTC).")
-
-    # Коммит изменений произойдет во внешнем коде (hh_worker), который вызвал эту функцию

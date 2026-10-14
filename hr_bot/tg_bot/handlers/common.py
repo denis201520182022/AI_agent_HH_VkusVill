@@ -11,20 +11,19 @@ from sqlalchemy import func, cast, Date
 from datetime import date, datetime, timedelta, timezone
 from sqlalchemy.orm import Session
 from aiogram.utils.formatting import Text, Bold, Italic
-from aiogram.utils.keyboard import InlineKeyboardBuilder # <-- Добавить
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton # <-- Добавить
-from hr_bot.db.models import MailingTask # <--- Добавь в импорты сверху
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from hr_bot.db.models import MailingTask 
 from hr_bot.db.models import (
     TelegramUser, Statistic, Vacancy, TrackedRecruiter,
     InactiveNotificationQueue, RejectedNotificationQueue, NotificationQueue, Dialogue,
-    AnalyticsEvent # <--- ОБЯЗАТЕЛЬНО ДОБАВИТЬ ЭТО
+    AnalyticsEvent 
 )
 from sqlalchemy import func, cast, Date, Integer, and_
-
 from hr_bot.tg_bot.keyboards import (
     user_keyboard, admin_keyboard, 
-    stats_main_menu_keyboard, stats_regular_keyboard,      # Добавлено
-    stats_followup_keyboard, back_to_stats_main_keyboard,  # Добавлено
+    stats_main_menu_keyboard, stats_regular_keyboard, 
+    stats_followup_keyboard, back_to_stats_main_keyboard, 
     export_date_options_keyboard, 
     cancel_fsm_keyboard, create_stats_export_keyboard
 )
@@ -41,7 +40,6 @@ from hr_bot.tg_bot.keyboards import (
 
 from sqlalchemy import cast, Date, func
 from datetime import date, timedelta
-# Предполагается, что Bold, Italic, Text импортированы из aiogram.utils.formatting или аналогичной библиотеки
 from aiogram.utils.formatting import Bold, Italic, Text
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 import io
@@ -51,12 +49,10 @@ from sqlalchemy import cast, Date
 from sqlalchemy.orm import Session
 from aiogram.types import Message, BufferedInputFile
 from aiogram.fsm.context import FSMContext
-
 from hr_bot.db.models import Dialogue, InactiveNotificationQueue
-from sqlalchemy import func, cast, Date, and_ # <--- Добавь and_
-from zoneinfo import ZoneInfo # <--- Добавь это
+from sqlalchemy import func, cast, Date, and_ 
+from zoneinfo import ZoneInfo 
 
-# И добавь саму переменную часового пояса в начало файла (после логгера)
 SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 
 logger = logging.getLogger(__name__)
@@ -69,19 +65,15 @@ class FollowupExportStates(StatesGroup):
     waiting_for_range = State()
 
 
-# --- FSM для экспорта молчунов ---
 class ReactivationExportStates(StatesGroup):
     waiting_for_range = State()
 
-# 1. Определяем состояния FSM
 class MailingTaskStates(StatesGroup):
     waiting_for_vacancy = State()
     waiting_for_city = State()
     waiting_for_days = State()
     waiting_for_message = State()
     waiting_for_confirmation = State()
-# --- КЛАВИАТУРА: Меню Реактивации ---
-
 
 def get_reactivation_menu_keyboard():
     """Возвращает клавиатуру с двумя кнопками: просмотр задач / создать новую."""
@@ -90,7 +82,6 @@ def get_reactivation_menu_keyboard():
     builder.button(text="✨ Создать новую", callback_data="reactivation_create_new")
     builder.adjust(1)  # Кнопки в одну колонку
     return builder.as_markup()
-# -------------------------------------
 
 
 
@@ -99,7 +90,6 @@ def get_reactivation_menu_keyboard():
 async def start_mailing_task_creation(message: Message, state: FSMContext):
     # Сначала очищаем состояние, если пользователь зашёл из другого потока
     await state.clear()
-    
     await message.answer(
         "🚀 <b>Реактивация кандидатов</b>\n\n"
         "Что вы хотите сделать?",
@@ -256,9 +246,7 @@ async def process_mailing_text(message: Message, state: FSMContext, db_session: 
     await state.update_data(message_text=message.text)
     data = await state.get_data()
     
-    # --- ЛОГИКА РАСЧЕТА (ИДЕНТИЧНА ВОРКЕРУ) ---
-    # Мы используем datetime.now(timezone.utc) для чистого сравнения с last_updated
-    # --- ЛОГИКА РАСЧЕТА (ПОЛНАЯ КОПИЯ БОЕВОГО ВОРКЕРА) ---
+    # --- ЛОГИКА РАСЧЕТА 
     now_utc = datetime.now(timezone.utc)
     cutoff_recent = now_utc - timedelta(days=data['days_min'])
     cutoff_oldest = now_utc - timedelta(days=data['days_max'])
@@ -272,7 +260,6 @@ async def process_mailing_text(message: Message, state: FSMContext, db_session: 
             Dialogue.dialogue_state.notin_(['vacancy_closed_or_resume_not_found', 'refusal']),
             Dialogue.last_message_at <= cutoff_recent,
             Dialogue.last_message_at >= cutoff_oldest,
-            # ФИЛЬТРЫ РЕКРУТЕРА (как в блоке #3 и #4 воркера)
             TrackedRecruiter.is_auth_active == True,
             TrackedRecruiter.access_token.isnot(None) 
         )
@@ -284,9 +271,7 @@ async def process_mailing_text(message: Message, state: FSMContext, db_session: 
     
     if data['city_pattern'] and data['city_pattern'] != '%':
         query = query.filter(Vacancy.city.ilike(f"%{data['city_pattern']}%"))
-
     candidates_count = query.scalar() or 0
-    # ------------------------------------------
 
     preview = (
         f"📋 <b>Проверка параметров рассылки:</b>\n\n"
@@ -299,11 +284,7 @@ async def process_mailing_text(message: Message, state: FSMContext, db_session: 
         f"⚠️ После запуска бот найдет подходящих кандидатов и начнет отправку. "
         f"Списание средств произойдет по тарифу Реактивации за каждое успешное сообщение."
     )
-    
-    # Создаем кнопку подтверждения
     kb = InlineKeyboardBuilder()
-    
-    # Кнопку запуска показываем в любом случае, чтобы пользователь видел результат
     kb.button(text="✅ ЗАПУСТИТЬ", callback_data="confirm_mailing_start")
     kb.button(text="❌ ОТМЕНА", callback_data="cancel_fsm")
     kb.adjust(1)
@@ -426,9 +407,6 @@ def _build_reactivation_7day_stats_content(db_session: Session) -> Text:
                     replied_count += 1
                     
                 # --- САМОИСКЛЮЧАЮЩАЯ ВОРОНКА (ПРИОРИТЕТЫ) ---
-                # Теперь считаем результаты НЕЗАВИСИМО от того, был ли пойман флаг has_reply,
-                # так как КД мог быть переведен в финал альтернативным путем.
-                
                 # ПРИОРИТЕТ 2: Собеседование (Записаны)
                 if d.has_interview:
                     success_count += 1

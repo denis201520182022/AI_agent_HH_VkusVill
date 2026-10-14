@@ -1,5 +1,4 @@
 #run_hh_scanner.py
-
 import asyncio
 import time
 import argparse
@@ -28,7 +27,6 @@ from hr_bot.services.description_vac import sync_vacancy_details
 from hr_bot.services import knowledge_base
 from hr_bot.services import llm_handler
 from hr_bot.db import statistics_manager
-
 from hr_bot.utils.pii_masker import extract_and_mask_pii
 from hr_bot.utils.system_notifier import send_system_alert
 from hr_bot.utils.resh_in_code import check_candidate_eligibility, is_candidate_profile_complete
@@ -38,21 +36,16 @@ from hr_bot.services.llm_handler import cleanup
 from hr_bot.utils.system_notifier import send_system_alert
 from sqlalchemy import func, select, delete, update  
 from hr_bot.services import interview_reminder_manager
-from sqlalchemy import func, select, delete, and_, case, literal # <--- Добавьте case и literal
+from sqlalchemy import func, select, delete, and_, case, literal
 from hr_bot.utils.metrics import start_metrics_server
-# Найти строку с импортами моделей и добавить AnalyticsEvent
 from hr_bot.db.models import (
     SessionLocal, Dialogue, Candidate, Vacancy, NotificationQueue, 
     TrackedRecruiter, AppSettings, InactiveNotificationQueue, 
     RejectedNotificationQueue, InterviewReminder, LlmUsageLog,
-    AnalyticsEvent  # <--- ДОБАВИТЬ ЭТО
+    AnalyticsEvent 
 )
 from hr_bot.utils.analytics import log_analytics_event
-# Если в metrics.py еще нет этих метрик, их лучше добавить туда.
-# Но для простоты предположим, что мы добавляем их или используем универсальные.
-# Давай добавим специфичные метрики для сканера:
 from prometheus_client import Counter, Gauge
-# ... остальные импорты
 
 logger = logging.getLogger(__name__)
 
@@ -62,28 +55,26 @@ MESSAGES_RECEIVED_TOTAL = Counter('hh_bot_messages_received_total', 'Total incom
 
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 13, 11, 0, 0, tzinfo=datetime.timezone.utc)
 #CUTOFF_DATE_FOR_RESPONSES = datetime.datetime(2025, 11, 16, 13, 56, 0, tzinfo=datetime.timezone.utc)
-# --- КОНФИГУРАЦИЯ ---
+
 DEBOUNCE_DELAY_SECONDS = 0
 CYCLE_PAUSE_SECONDS = 0.5
 TEST_NEGOTIATION_ID = None # Установите в None для боевого режима
 MAX_CONCURRENT_RECRUITERS = 10 #одновременно рекрутеров
 MAX_CONCURRENT_DIALOGUES = 40 #одновременно диалогов
 VACANCY_CACHE_DURATION_MINUTES = 2 # Время кэширования списка вакансий для рекрутера
-# Новые константы для окна доставки напоминаний (местное время сервера)
 REMINDER_START_HOUR_LOCAL = 9  # Например, 9:00 утра
 REMINDER_END_HOUR_LOCAL = 20 # Например, 20:00 вечера (напоминания отправляются до 19:59 включительно)
 
 PRICE_PER_MILLION_INPUT_TOKENS = 0.150  # $0.150 за 1M входных токенов (gpt-4o-mini)
 PRICE_PER_MILLION_OUTPUT_TOKENS = 0.600 # $0.600 за 1M выходных токенов (gpt-4o-mini)
 
-# ВОТ ЭТУ СТРОКУ НУЖНО ДОБАВИТЬ:
 shutdown_requested = False
 
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 except ZoneInfoNotFoundError:
     logger.critical("Часовой пояс 'Europe/Moscow' не найден. Убедитесь, что система имеет актуальную базу данных часовых поясов (tzdata).")
-    SPB_TIMEZONE = None # Fallback
+    SPB_TIMEZONE = None 
 
 def signal_handler(sig, frame):
     """Обработчик сигналов для graceful shutdown"""
@@ -92,15 +83,12 @@ def signal_handler(sig, frame):
     shutdown_requested = True
 
 
-
-
 def _format_timestamp_to_msk(timestamp_str: str) -> str:
     """
     Преобразует строку времени из формата ISO в читаемую строку по МСК.
     Если строка некорректна, возвращает заглушку.
     """
     try:
-        # SPB_TIMEZONE у вас уже определен глобально
         dt_object = datetime.datetime.fromisoformat(timestamp_str)
         msk_dt = dt_object.astimezone(SPB_TIMEZONE)
         return msk_dt.strftime('%Y-%m-%d %H:%M:%S MSK')
@@ -182,11 +170,9 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 db.add(vacancy_in_db)
                 await db.flush()
             else:
-                # === ВАКАНСИЯ УЖЕ ЕСТЬ В БД ===
                 vacancy_in_db.title = vacancy_data.get("name", "Без названия")
                 vacancy_in_db.city = actual_city
                 
-                # 🔥 КЛЮЧЕВОЕ ИЗМЕНЕНИЕ: проверка смены владельца
                 if vacancy_in_db.recruiter_id != current_recruiter.id:
 
                     # Просто запоминаем ID и меняем поле в модели Vacancy
@@ -228,7 +214,7 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                     #     }
                     # )
 
-            # --- ЛОГИКА ОБНОВЛЕНИЯ ДЕТАЛЕЙ (ДОБАВЛЯЕМ ЛОГИ ЗДЕСЬ) ---
+            # --- ЛОГИКА ОБНОВЛЕНИЯ ДЕТАЛЕЙ 
             need_details_sync = False
             reason = ""
 
@@ -256,7 +242,6 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 except Exception as e:
                     rec_logger.error(f"Вакансия {hh_vacancy_id}: ошибка при скачивании деталей: {e}")
             else:
-                # Этот лог покажет, что сканер видит вакансию, но сознательно её пропускает
                 rec_logger.debug(f"Вакансия {hh_vacancy_id}: обновление не требуется (свежая).")
 
         # 4. Обработка неактивных вакансий
@@ -306,11 +291,9 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
                 .execution_options(synchronize_session=False)
             )
             rec_logger.info(f"Освобождено диалогов для {len(vacancies_to_release)} вакансий")
-        # ------------------------------------------------------
 
         current_recruiter.vacancies_last_synced_at = now
         await db.commit() 
-        
         return all_vacancies_from_api
 
     except Exception as e:
@@ -319,16 +302,6 @@ async def get_all_active_vacancies_for_recruiter(recruiter_id: int, db: AsyncSes
         raise 
     finally:
         rec_logger.debug(f"Время выполнения: {time.monotonic() - function_start_time:.2f} sec.")
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -346,11 +319,9 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
         "worker": "scanner"
     })
     try:
-        
         if not recruiter:
             rec_logger.warning(f"process_new_responses: Рекрутер с ID {recruiter_id} не найден.")
             return
-        
         
         recruiter_name_for_logging = recruiter.name
         cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
@@ -380,7 +351,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 candidate_last_name = resume_info.get('last_name', '')
                 candidate_full_name = f"{candidate_first_name} {candidate_last_name}".strip()
                 candidate_hh_resume_id = resume_info.get('id')
-                # -----------------------------------------
+
                 # 2. СОЗДАЕМ ПОЛНЫЙ ЛОГГЕР ДЛЯ КОНКРЕТНОГО ОТКЛИКА
                 # Он содержит ID рекрутера, ID отклика, ID вакансии и имя кандидата
                 scan_logger = logging.LoggerAdapter(logger, {
@@ -393,7 +364,6 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                     "worker": "scanner",
                     "action": "new_response_found"
                 })
-                # -----------------------------------------
                 scan_logger.debug(f"Начинаю детальную обработку отклика. Вакансия (HH ID): {associated_vacancy_id_str}")
                 if not response_id or (TEST_NEGOTIATION_ID and response_id != TEST_NEGOTIATION_ID):
                     scan_logger.info("Пропуск отклика")
@@ -478,7 +448,6 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                         response_created_at_dt = datetime.datetime.fromisoformat(response_created_at_str)
                     except (ValueError, TypeError):
                         scan_logger.warning(f"Не удалось распознать дату отклика: {response_created_at_str}")
-                # <<< КОНЕЦ ИСПРАВЛЕНИЯ >>>
 
                 # Создаем диалог
                 dialogue = Dialogue(
@@ -498,13 +467,8 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                 await db.flush() # Важно, чтобы у диалога появился ID
                 from hr_bot.utils.analytics import log_analytics_event # Если нет в импортах сверху
                 await log_analytics_event(db, dialogue, 'response_created')
-                
-                
-                # --- КРИТИЧЕСКИЙ МОМЕНТ: ПЕРЕМЕЩЕНИЕ ---
-                # Сначала перемещаем, чтобы зафиксировать намерение
                 await hh_api.move_response_to_folder(recruiter, db, response_id, 'consider')
                 scan_logger.info("Перемещен в консидер")
-                # СПИСАНИЕ СРЕДСТВ + СТАТИСТИКА
                 cost = settings.cost_per_dialogue
                 settings.balance_standard -= cost
                 settings.total_spent_standard += cost # Обновляем новый накопительный счетчик
@@ -518,7 +482,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                             'message_id': str(m.get('id')),
                             'role': 'user',
                             'content': m['text'],
-                            'timestamp_msk': _format_timestamp_to_msk(m.get('created_at')) # <-- ДОБАВЛЕНО
+                            'timestamp_msk': _format_timestamp_to_msk(m.get('created_at'))
                         }
                         for m in messages_data if m.get('text')
                     ]
@@ -533,7 +497,7 @@ async def process_new_responses(recruiter_id: int, vacancy_ids: list, db: AsyncS
                         'message_id': f'no_msg_{response_id}',
                         'role': 'user',
                         'content': "[SYSTEM COMMAND] Кандидат откликнулся без сопроводительного письма. Поздоровайся и предложи задать вопросы",
-                        'timestamp_msk': _format_timestamp_to_msk(resp.get('created_at', now_msk)) # <-- ДОБАВЛЕНО
+                        'timestamp_msk': _format_timestamp_to_msk(resp.get('created_at', now_msk))
                     }]
 
                 dialogue.pending_messages = messages
@@ -590,7 +554,8 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
     function_start_time = time.monotonic()
 
     recruiter = None
-    recruiter_name_for_logging = f"ID {recruiter_id}" # Значение по умолчанию на случай, если рекрутер не найден
+    recruiter_name_for_logging = f"ID {recruiter_id}" 
+
     # 1. Получаем рекрутера
     recruiter = await db.get(TrackedRecruiter, recruiter_id)
     
@@ -606,9 +571,7 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
             rec_logger.warning(f"process_ongoing_responses: Рекрутер с ID {recruiter_id} не найден.")
             return
 
-        # --- ЗАГРУЗКА ЗДЕСЬ ---
         recruiter_name_for_logging = recruiter.name
-        # --- КОНЕЦ ЗАГРУЗКИ ---
         cutoff_date = recruiter.created_at or (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1))
 
         if not vacancy_ids:
@@ -750,7 +713,6 @@ async def process_ongoing_responses(recruiter_id: int, vacancy_ids: list, db: As
         await db.commit()
         
     except Exception as e:
-        # Используем rec_logger для общих ошибок
         rec_logger.error(
             f"Error in process_ongoing_responses: {e}", 
             exc_info=True,
@@ -808,7 +770,7 @@ async def handle_scanner_recruiter(rec_id: int):
             await db.rollback()
 
 
-async def main(target_recruiter_ids=None): # Добавь аргумент
+async def main(target_recruiter_ids=None):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     logger.info(f"HH-Scanner запущен для рекрутеров: {target_recruiter_ids if target_recruiter_ids else 'Всех'}")

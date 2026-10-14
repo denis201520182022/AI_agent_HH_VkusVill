@@ -6,7 +6,7 @@ positions:
   filename: /tmp/positions.yaml
 
 clients:
-  - url: http://vv_monitoring_loki:3100/loki/api/v1/push  # <--- ИСПРАВЛЕНО: адрес новой Loki
+  - url: http://vv_monitoring_loki:3100/loki/api/v1/push 
 
 scrape_configs:
   - job_name: vkusvill_docker
@@ -17,6 +17,5 @@ scrape_configs:
       - source_labels: ['__meta_docker_container_name']
         regex: '/(vv_.*)'
         target_label: 'container'
-      # ДОБАВЬ ЭТО: удалять все, что не подошло под regex выше
       - source_labels: ['container']
         action: keep

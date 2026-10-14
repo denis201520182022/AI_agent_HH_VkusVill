@@ -14,10 +14,10 @@ from tenacity import (
     retry_if_exception_type
 )
 from hr_bot.utils.redis_lock import DistributedRateLimiter
-# Настройка логирования
+
 logger = logging.getLogger(__name__)
 
-# Константы
+
 SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 
 class GoogleSheetsManager:
@@ -28,7 +28,6 @@ class GoogleSheetsManager:
         if not self.spreadsheet_id or not self.json_path:
             logger.error("Google Sheets configuration is missing in .env")
             
-        # Менеджер клиента для асинхронной работы
         self.agcm = gspread_asyncio.AsyncioGspreadClientManager(self._get_credentials)
         # --- ИНИЦИАЛИЗАЦИЯ РАСПРЕДЕЛЕННОГО ЛИМИТЕРА ---
         # Лимит: 25 кандидатов в 60 секунд (это ~50 API запросов)

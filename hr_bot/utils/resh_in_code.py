@@ -6,12 +6,10 @@ def is_candidate_profile_complete(candidate) -> bool:
     if not candidate:
         return False
         
-    # Проверяем наличие значений (не None и не пустая строка)
     has_phone = bool(candidate.phone_number)
     has_city = bool(candidate.city)
     
     has_citizenship = bool(candidate.citizenship)
-    # Возраст проверяем именно на None, так как 0 — это теоретически валидное число (хоть и не для работы)
     has_age = candidate.age is not None 
 
     return all([has_citizenship, has_age])

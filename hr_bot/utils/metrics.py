@@ -3,7 +3,6 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-# --- 1. СЧЕТЧИКИ (То, что постоянно растет) ---
 
 # Ошибки (с разбивкой по типу ошибки и месту возникновения)
 ERRORS_TOTAL = Counter(
@@ -31,23 +30,20 @@ MESSAGES_SENT_TOTAL = Counter(
     'Total messages sent to candidates'
 )
 
-# --- 2. ГИСТОГРАММЫ (Распределение времени) ---
-
 # Длительность запроса к OpenAI
 LLM_REQUEST_DURATION = Histogram(
     'hh_bot_llm_request_duration_seconds', 
     'Time spent waiting for OpenAI response',
-    buckets=[1, 2, 5, 10, 20, 30, 60] # Корзины времени в секундах
+    buckets=[1, 2, 5, 10, 20, 30, 60] 
 )
 
-# Самая важная метрика: Задержка ответа (сколько времени прошло с момента написания сообщения кандидатом до нашего ответа)
+# Задержка ответа (сколько времени прошло с момента написания сообщения кандидатом до нашего ответа)
 E2E_RESPONSE_LATENCY = Histogram(
     'hh_bot_e2e_response_latency_seconds',
     'Time from candidate message created_at to bot reply',
     buckets=[60, 300, 600, 1800, 3600, 7200, 18000] # 1мин, 5мин, 10мин, 30мин, 1ч, 2ч, 5ч
 )
 
-# --- 3. ДАТЧИКИ (То, что скачет вверх-вниз) ---
 
 # Очередь диалогов (сколько сейчас необработанных)
 PENDING_DIALOGUES_GAUGE = Gauge(

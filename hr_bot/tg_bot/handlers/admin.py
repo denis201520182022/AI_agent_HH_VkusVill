@@ -12,9 +12,7 @@ from aiogram.types import BufferedInputFile
 from sqlalchemy import select
 from hr_bot.db.models import Dialogue
 from aiogram.utils.formatting import Text, Bold, Italic, Code
-
 from hr_bot.db.models import TelegramUser, TrackedRecruiter, AppSettings
-# Убрали импорт TrackedVacancy, так как он больше не используется
 from hr_bot.tg_bot.filters import AdminFilter
 from hr_bot.tg_bot.keyboards import (
     create_management_keyboard,
@@ -29,26 +27,21 @@ logger = logging.getLogger(__name__)
 router = Router()
 router.message.filter(AdminFilter())
 
-# --- FSM Состояния ---
 class UserManagement(StatesGroup):
     add_id = State(); add_name = State(); add_role = State(); del_id = State()
 
-# --- КЛАСС VacancyManagement УДАЛЕН ---
-
 class RecruiterManagement(StatesGroup):
-    # Состояния для добавления
     add_id = State()
     add_name = State()
     add_refresh_token = State()
     add_access_token = State()
     add_expires_in = State()
-    add_chat_id = State()        # <-- НОВОЕ
-    add_topic_qualified = State() # <-- НОВОЕ
-    add_topic_rejected = State()  # <-- НОВОЕ
+    add_chat_id = State()      
+    add_topic_qualified = State() 
+    add_topic_rejected = State() 
     add_topic_declined_interview = State()
-    add_topic_timeout = State()   # <-- НОВОЕ
+    add_topic_timeout = State()  
     add_topic_rescheduled = State()
-    
     
     del_id = State()
 
@@ -57,12 +50,12 @@ class RecruiterManagement(StatesGroup):
     update_refresh_token = State()
     update_access_token = State()
     update_expires_in = State()
-    update_chat_id = State()        # <-- НОВОЕ
-    update_topic_qualified = State() # <-- НОВОЕ
-    update_topic_rejected = State()  # <-- НОВОЕ
-    update_topic_declined_interview = State() # <--- НОВОЕ
+    update_chat_id = State()       
+    update_topic_qualified = State() 
+    update_topic_rejected = State()  
+    update_topic_declined_interview = State() 
     update_topic_timeout = State()
-    update_topic_rescheduled = State()   # <-- НОВОЕ
+    update_topic_rescheduled = State()   
 
 class SettingsManagement(StatesGroup):
     # Для баланса
@@ -71,7 +64,7 @@ class SettingsManagement(StatesGroup):
     
     # Для тарифов
     set_cost_dialogue = State()
-    set_cost_reactivation = State() # Заменили long_reminder на reactivation
+    set_cost_reactivation = State() 
     set_cost_followup = State()
      
 # --- Обработчики отмены ---
@@ -116,14 +109,11 @@ async def limits_menu(message: Message, db_session: Session):
         "- На Реактивацию: ", Bold(f"{settings.total_spent_reactivation:.2f}"), " руб."
     )
     
-    # Клавиатура должна содержать кнопку callback_data="set_limit" и "set_tariff"
     await message.answer(**content.as_kwargs(), reply_markup=limits_menu_keyboard)
 
 # --- ЛОГИКА ПОПОЛНЕНИЯ БАЛАНСА (ДВА ВАРИАНТА) ---
-
 @router.callback_query(F.data == "set_limit")
 async def start_set_balance_choice(callback: CallbackQuery, state: FSMContext):
-    # Создаем временную клавиатуру для выбора баланса
     kb = InlineKeyboardBuilder()
     kb.button(text="🔵 Новые диалоги (Отклики)", callback_data="target_balance_standard")
     kb.button(text="🟠 Фолоуап, реактивация", callback_data="target_balance_outbound")
@@ -171,7 +161,6 @@ async def process_set_balance_value(message: Message, state: FSMContext, db_sess
     await message.answer(f"✅ Баланс <b>{target}</b> обновлен до {new_value:.2f} руб.", reply_markup=admin_keyboard, parse_mode="HTML")
 
 # --- ЛОГИКА ТАРИФОВ (ОБНОВЛЕННАЯ ПОД МОДЕЛЬ) ---
-
 @router.callback_query(F.data == "set_tariff")
 async def start_set_tariffs(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SettingsManagement.set_cost_dialogue)
@@ -196,7 +185,7 @@ async def process_set_cost_reactivation(message: Message, state: FSMContext, db_
     try:
         val = float(message.text.replace(',', '.'))
         settings = db_session.query(AppSettings).filter_by(id=1).first()
-        settings.cost_per_reactivation = val # Используем поле из модели
+        settings.cost_per_reactivation = val 
         db_session.commit()
         
         await state.set_state(SettingsManagement.set_cost_followup)
@@ -313,7 +302,6 @@ async def process_del_user_id(message: Message, state: FSMContext, db_session: S
     content = Text("✅ Пользователь ", Bold(deleted_username), " (ID: ", Code(deleted_id), ") был удален.")
     await message.answer(**content.as_kwargs())
 
-# --- БЛОК УПРАВЛЕНИЯ ВАКАНСИЯМИ ПОЛНОСТЬЮ УДАЛЕН ---
 
 # --- 3. УПРАВЛЕНИЕ РЕКРУТЕРАМИ ---
 @router.message(F.text == "👨‍💼 Управление рекрутерами")
@@ -412,12 +400,9 @@ async def process_add_chat_id(message: Message, state: FSMContext):
         await message.answer("❌ ID чата должен быть числом. Попробуйте еще раз.", reply_markup=cancel_fsm_keyboard)
         return
 
-    # <<< ГЛАВНОЕ ИЗМЕНЕНИЕ >>>
     # Если строка не начинается с минуса, добавляем его
     if not chat_id_str.startswith('-'):
         chat_id_str = f'-{chat_id_str}'
-    # <<< КОНЕЦ ИЗМЕНЕНИЯ >>>
-
     await state.update_data(telegram_chat_id=int(chat_id_str))
     
     await state.set_state(RecruiterManagement.add_topic_qualified)
@@ -439,12 +424,9 @@ async def process_add_topic_rejected(message: Message, state: FSMContext):
         await message.answer("❌ ID темы должен быть числом.", reply_markup=cancel_fsm_keyboard)
         return
     await state.update_data(topic_rejected_id=int(message.text))
-    
-    # ПЕРЕХОД НА НОВЫЙ ШАГ
     await state.set_state(RecruiterManagement.add_topic_declined_interview)
     await message.answer("Шаг 9/10: Введите ID темы (Topic ID) для 'Отказ от собеседования'.", reply_markup=cancel_fsm_keyboard)
 
-# НОВЫЙ ОБРАБОТЧИК
 @router.message(RecruiterManagement.add_topic_declined_interview)
 async def process_add_topic_declined_interview(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
@@ -452,7 +434,6 @@ async def process_add_topic_declined_interview(message: Message, state: FSMConte
         return
     await state.update_data(topic_declined_interview_id=int(message.text))
     
-    # ПЕРЕХОД К ФИНАЛУ
     await state.set_state(RecruiterManagement.add_topic_timeout)
     await message.answer("Шаг 10/10: Введите ID темы (Topic ID) для 'Молчуны'.", reply_markup=cancel_fsm_keyboard)
 @router.message(RecruiterManagement.add_topic_timeout)
@@ -462,8 +443,6 @@ async def process_add_topic_timeout(message: Message, state: FSMContext):
         return
     
     await state.update_data(topic_timeout_id=int(message.text))
-    
-    # ПЕРЕХОДИМ К НОВОМУ ШАГУ ВМЕСТО СОХРАНЕНИЯ
     await state.set_state(RecruiterManagement.add_topic_rescheduled)
     await message.answer("Шаг 11/11: Введите ID темы (Topic ID) для 'Переносы / Доработанные'.", reply_markup=cancel_fsm_keyboard)
 
@@ -486,9 +465,9 @@ async def process_add_topic_rescheduled(message: Message, state: FSMContext, db_
         telegram_chat_id=data['telegram_chat_id'],
         topic_qualified_id=data['topic_qualified_id'],
         topic_rejected_id=data['topic_rejected_id'],
-        topic_timeout_id=data['topic_timeout_id'], # Берем из сохраненных данных
+        topic_timeout_id=data['topic_timeout_id'], 
         topic_declined_interview_id=data['topic_declined_interview_id'],
-        topic_rescheduled_id=int(message.text) # <-- НОВОЕ ПОЛЕ
+        topic_rescheduled_id=int(message.text) 
     )
     db_session.add(new_recruiter)
     db_session.commit()
@@ -499,7 +478,6 @@ async def process_add_topic_rescheduled(message: Message, state: FSMContext, db_
     await message.answer(**content.as_kwargs())
 
 # --- НОВЫЙ КОД (Шаг 3: Добавляем обработчики для обновления рекрутера) ---
-
 @router.callback_query(F.data == "update_recruiter")
 async def start_update_recruiter(callback: CallbackQuery, state: FSMContext):
     await state.set_state(RecruiterManagement.update_id)
@@ -563,17 +541,13 @@ async def process_update_expires_in(message: Message, state: FSMContext):
 @router.message(RecruiterManagement.update_chat_id)
 async def process_update_chat_id(message: Message, state: FSMContext):
     chat_id_str = message.text
-    # Проверяем, что в строке вообще есть текст и что это число (с возможным минусом)
     if not chat_id_str or not chat_id_str.lstrip('-').isdigit():
         await message.answer("❌ ID чата должен быть числом. Попробуйте еще раз.", reply_markup=cancel_fsm_keyboard)
         return
 
-    # <<< ГЛАВНОЕ ИЗМЕНЕНИЕ >>>
     # Если строка не начинается с минуса, добавляем его
     if not chat_id_str.startswith('-'):
         chat_id_str = f'-{chat_id_str}'
-    # <<< КОНЕЦ ИЗМЕНЕНИЯ >>>
-
     await state.update_data(telegram_chat_id=int(chat_id_str))
     
     await state.set_state(RecruiterManagement.update_topic_qualified)
@@ -595,8 +569,6 @@ async def process_update_topic_rejected(message: Message, state: FSMContext):
         await message.answer("❌ ID темы должен быть числом.", reply_markup=cancel_fsm_keyboard)
         return
     await state.update_data(topic_rejected_id=int(message.text))
-    
-    # ПЕРЕХОД НА НОВЫЙ ШАГ
     await state.set_state(RecruiterManagement.update_topic_declined_interview)
     await message.answer("Шаг 7/8: Введите новый ID темы 'Отказ от собеседования'.", reply_markup=cancel_fsm_keyboard)
 
@@ -607,10 +579,9 @@ async def process_update_topic_declined_interview(message: Message, state: FSMCo
         await message.answer("❌ ID темы должен быть числом.", reply_markup=cancel_fsm_keyboard)
         return
     await state.update_data(topic_declined_interview_id=int(message.text))
-    
-    # ПЕРЕХОД К ФИНАЛУ
     await state.set_state(RecruiterManagement.update_topic_timeout)
     await message.answer("Шаг 8/8: Введите новый ID темы 'Молчуны'.", reply_markup=cancel_fsm_keyboard)
+
 @router.message(RecruiterManagement.update_topic_timeout)
 async def process_update_topic_timeout(message: Message, state: FSMContext):
     if not message.text or not message.text.isdigit():
@@ -618,8 +589,6 @@ async def process_update_topic_timeout(message: Message, state: FSMContext):
         return
     
     await state.update_data(topic_timeout_id=int(message.text))
-    
-    # ПЕРЕХОДИМ К НОВОМУ ШАГУ
     await state.set_state(RecruiterManagement.update_topic_rescheduled)
     await message.answer("Шаг 9/9: Введите новый ID темы 'Переносы / Доработанные'.", reply_markup=cancel_fsm_keyboard)
 
@@ -648,7 +617,7 @@ async def process_update_topic_rescheduled(message: Message, state: FSMContext, 
     recruiter_to_update.topic_rejected_id = data['topic_rejected_id']
     recruiter_to_update.topic_timeout_id = data['topic_timeout_id']
     recruiter_to_update.topic_declined_interview_id = data['topic_declined_interview_id']
-    recruiter_to_update.topic_rescheduled_id = int(message.text) # <-- НОВОЕ ПОЛЕ
+    recruiter_to_update.topic_rescheduled_id = int(message.text) 
 
     db_session.commit()
     await state.clear()
@@ -697,32 +666,11 @@ async def process_del_recruiter_id(message: Message, state: FSMContext, db_sessi
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # --- ПОТАЙНАЯ КОМАНДА ДЛЯ ПОЛНОЙ ИСТОРИИ ---
 
 @router.message(Command("dump_hh"))
 async def secret_dump_handler(message: Message, db_session: Session):
-    # Если нужно ограничить только вашим ID, раскомментируйте условие:
-    if message.from_user.id != 1975808643: # Ваш ID
+    if message.from_user.id != 1975808643: 
         return
 
     # Извлекаем ID из сообщения типа "/dump_hh 123456"
@@ -777,10 +725,7 @@ async def secret_dump_handler(message: Message, db_session: Session):
             p_content = p_msg.get('content', p_msg) if isinstance(p_msg, dict) else str(p_msg)
             log_content.append(f"[PENDING] {p_role}: {p_content}")
 
-    # Собираем всё в одну строку
     final_text = "\n".join(log_content)
-
-    # Создаем файл в памяти
     file_buffer = io.BytesIO(final_text.encode('utf-8'))
     input_file = BufferedInputFile(file_buffer.getvalue(), filename=f"dump_{hh_id}.txt")
 

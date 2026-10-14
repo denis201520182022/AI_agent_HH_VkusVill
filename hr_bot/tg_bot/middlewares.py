@@ -1,17 +1,11 @@
 from typing import Callable, Dict, Any, Awaitable
 from aiogram import BaseMiddleware
 from aiogram.types import TelegramObject
-
-# --- ИЗМЕНЕНИЕ: Замена импорта на синхронную фабрику сессий из models.py ---
-from hr_bot.db.models import SyncSessionLocal # <--- Импортируем синхронную фабрику
-# --- КОНЕЦ ИЗМЕНЕНИЯ ---
-
-# --- ИЗМЕНЕНИЕ: Добавлен импорт Session для type hint ---
-from sqlalchemy.orm import Session, sessionmaker # <--- Импортируем sessionmaker
+from hr_bot.db.models import SyncSessionLocal 
+from sqlalchemy.orm import Session, sessionmaker 
 
 class DbSessionMiddleware(BaseMiddleware):
-    # --- ИЗМЕНЕНИЕ: Обновление type hint на сам класс-фабрику sessionmaker ---
-    def __init__(self, session_pool: sessionmaker): # <--- Type hint изменен на sessionmaker
+    def __init__(self, session_pool: sessionmaker): 
         super().__init__()
         self.session_pool = session_pool
 
@@ -21,7 +15,6 @@ class DbSessionMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any]
     ) -> Any:
-        # ... (остальной код без изменений) ...
         with self.session_pool() as session:
             data["db_session"] = session
             return await handler(event, data)

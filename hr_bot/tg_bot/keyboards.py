@@ -10,11 +10,10 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 from typing import List, Any
 
 # --- Основные Reply-клавиатуры ---
-
 user_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Баланс")],
-        [KeyboardButton(text="🚀 Реактивация")], # <--- Добавили
+        [KeyboardButton(text="🚀 Реактивация")],
         [KeyboardButton(text="❓ Помощь")]
     ],
     resize_keyboard=True
@@ -23,7 +22,7 @@ user_keyboard = ReplyKeyboardMarkup(
 admin_keyboard = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text="📊 Статистика"), KeyboardButton(text="⚙️ Баланс и Тариф")],
-        [KeyboardButton(text="🚀 Реактивация")], # <--- Добавили
+        [KeyboardButton(text="🚀 Реактивация")], 
         [KeyboardButton(text="👤 Управление пользователями")],
         [KeyboardButton(text="👨‍💼 Управление рекрутерами")],
         [KeyboardButton(text="❓ Помощь")]
@@ -32,9 +31,6 @@ admin_keyboard = ReplyKeyboardMarkup(
     input_field_placeholder="Выберите действие:"
 )
 
-# --- Inline-клавиатуры для Статистики ---
-
-# --- Новое меню статистики ---
 
 # Главный уровень
 stats_main_menu_keyboard = InlineKeyboardMarkup(
@@ -55,7 +51,6 @@ stats_regular_keyboard = InlineKeyboardMarkup(
 )
 
 # Подменю: Follow up
-# Подменю: Follow up (ИСПРАВЛЕНО)
 stats_followup_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [InlineKeyboardButton(text="👁️ Посмотреть за 7 дней (текст)", callback_data="followup_7days_stats")],

@@ -36,7 +36,7 @@ async def send_verification_alert(
     llm_citizenship: str,
     history_text: str,
     pending_messages_json: str,
-    reasoning: str = "не указано"  # <--- НОВЫЙ АРГУМЕНТ
+    reasoning: str = "не указано" 
 ):
     """
     Отправляет уведомление о несовпадении анкетных данных с полем reasoning.
@@ -63,7 +63,7 @@ async def send_verification_alert(
                 f"Возраст: {esc(llm_age)}\n"
                 f"Гражданство: {esc(llm_citizenship)}\n\n"
                 f"🧐 **Обоснование модели:**\n"
-                f"_{esc(reasoning)}_\n\n" # <--- ВЫВОД REASONING
+                f"_{esc(reasoning)}_\n\n" 
                 f"💾 **Спасенный PENDING (JSON):**\n"
                 f"```json\n{pending_messages_json}\n```\n\n"
                 f"⛔ *Данные в БД обновлены на основе Deep Check.*"
@@ -91,7 +91,7 @@ async def send_date_conflict_alert(
     llm_suggested: str,
     verified_date: str,
     history_text: str,
-    reasoning: str = "не указано" # <--- НОВЫЙ АРГУМЕНТ
+    reasoning: str = "не указано" 
 ):
     """
     Отправляет уведомление об ошибке в дате с полем reasoning.
@@ -116,7 +116,7 @@ async def send_date_conflict_alert(
                 f"🤖 **LLM предложила:** `{esc(llm_suggested)}`\n"
                 f"✅ **Аудитор исправил на:** `{esc(verified_date)}`\n\n"
                 f"🧐 **Обоснование аудитора:**\n"
-                f"_{esc(reasoning)}_\n\n" # <--- ВЫВОД REASONING
+                f"_{esc(reasoning)}_\n\n" 
                 f"🔄 *Диалог отправлен на повторную генерацию.*"
             )
 
@@ -136,8 +136,8 @@ async def send_date_conflict_alert(
 async def send_cost_alert(
     dialogue_id: int,
     hh_response_id: str,
-    total_cost_rub: float,         # Поменял местами и сделал главными
-    total_cost_usd: float = 0.0,   # Сделал значение по умолчанию
+    total_cost_rub: float,         
+    total_cost_usd: float = 0.0,  
     history: list = None,
     recruiter_name: str = "Неизвестен",
     vacancy_title: str = "Неизвестна"
@@ -156,7 +156,6 @@ async def send_cost_alert(
         session = get_session()
         async with Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN), session=session) as bot:
             
-            # Ссылка на диалог в HH (для быстрого перехода)
             hh_link = f"https://spb.hh.ru/negotiations/{hh_response_id}"
             
             alert_text = (
@@ -166,7 +165,6 @@ async def send_cost_alert(
                 f"Вакансия: *{esc(vacancy_title)}*\n\n"
                 f"💵 **Затраты:**\n"
                 f"Итого в RUB: `{esc(round(total_cost_rub, 2))} руб.`\n"
-                # Добавим проверку USD
                 + (f"Итого в USD: `${esc(round(total_cost_usd, 4))}`\n\n" if total_cost_usd else "\n") +
                 f"🔗 [Открыть переписку на HH]({hh_link})\n\n"
                 f"⚠️ *Рекомендуется проверить историю на предмет зацикливания.*"

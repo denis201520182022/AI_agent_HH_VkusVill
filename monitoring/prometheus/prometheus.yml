@@ -10,7 +10,7 @@ scrape_configs:
 
   # 2. Мониторинг всех воркеров и сканеров ВкусВилл
   - job_name: 'vkusvill_bots'
-    metrics_path: '/metrics' # Стандартный путь для большинства библиотек прометеуса
+    metrics_path: '/metrics' 
     static_configs:
       - targets:
           # Группа 36, 49, 47
@@ -45,7 +45,6 @@ scrape_configs:
           - 'vv_reminders:8000'
           - 'vv_tg_bot:8000'
 
-    # Переименовываем метку instance, чтобы в Графане было удобно фильтровать
     relabel_configs:
       - source_labels: [__address__]
         target_label: instance

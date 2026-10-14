@@ -3,10 +3,8 @@ auth_enabled: false
 server:
   http_listen_port: 3100
   grpc_listen_port: 9096
-  # --- ИСПРАВЛЕНИЕ ОШИБКИ ResourceExhausted (увеличиваем лимит до 16МБ) ---
   grpc_server_max_recv_msg_size: 16777216
   grpc_server_max_send_msg_size: 16777216
-  # -------------------------------------------------------------------------
 
 common:
   path_prefix: /loki
@@ -46,7 +44,6 @@ limits_config:
   ingestion_rate_mb: 20          # Лимит скорости приема
   ingestion_burst_size_mb: 40    # Разрешенные всплески
   max_entries_limit_per_query: 5000
-# -------------------------------------------------------------------
 
 
 

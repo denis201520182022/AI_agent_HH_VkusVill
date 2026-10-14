@@ -7,7 +7,6 @@ from aiogram import Bot, Dispatcher
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
-
 from dotenv import load_dotenv
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,13 +14,10 @@ from aiogram.types import FSInputFile
 from sqlalchemy import select, update
 from zoneinfo import ZoneInfo
 from hr_bot.services.google_sheets_manager import GoogleSheetsManager
-# --- ДОБАВЛЕН НОВЫЙ ИМПОРТ ДЛЯ РАБОТЫ С ФАЙЛАМИ В ПАМЯТИ ---
 from aiogram.types import BufferedInputFile
 import shutil
 import subprocess
-# --- КОНЕЦ НОВОГО ИМПОРТА ---
 from hr_bot.utils.sentry_config import init_sentry
-
 from hr_bot.utils.logger_config import setup_logging
 from hr_bot.db.models import SessionLocal, SyncSessionLocal, Candidate, NotificationQueue, Dialogue, Vacancy, InactiveNotificationQueue, RejectedNotificationQueue, DeclinedInterviewNotificationQueue, RescheduledNotificationQueue
 
@@ -30,11 +26,9 @@ from hr_bot.tg_bot.handlers import main_router
 from hr_bot.utils.formatters import mask_fio
 
 
-# --- КОНСТАНТЫ ДЛЯ БЕКАПА ---
 BACKUP_RUN_HOUR_UTC = 12  # Запускать в 2 часа ночи по UTC
 BACKUP_DIR = "backups"   # Папка для бекапов
-# ----------------------------
-# Создаем константу для часового пояса
+
 try:
     SPB_TIMEZONE = ZoneInfo("Europe/Moscow")
 except Exception:
@@ -42,16 +36,11 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 gs_manager = GoogleSheetsManager()
-# --- КОНСТАНТЫ ДЛЯ ОЧИСТКИ ИСТОРИИ ---
 HISTORY_RETENTION_DAYS = 30
 CLEANUP_RUN_HOUR_UTC = 3
 CLEANUP_CHECK_INTERVAL_SECONDS = 6000
-# --- КОНЕЦ КОНСТАНТ ---
-
-# --- КОНСТАНТЫ МОНИТОРИНГА ---
-HEALTH_CHECK_INTERVAL = 60  # Проверка раз в минуту
+HEALTH_CHECK_INTERVAL = 60  
 MAX_STUCK_TIME = 600        # Перезапуск, если нет пульса 5 минут
-# -----------------------------
 
 class TaskHealthMonitor:
     def __init__(self, bot: Bot):
@@ -119,7 +108,7 @@ async def check_and_send_notifications(bot: Bot, health_monitor: TaskHealthMonit
     logger.info(f"Фоновый обработчик уведомлений запущен.")
     iteration_count = 0  # Счетчик итераций для отладки
     while True:
-        health_monitor.heartbeat('qualified') # Добавили пульс
+        health_monitor.heartbeat('qualified') 
         iteration_count += 1
         logger.info(f"[Qualified] Итерация #{iteration_count}: начало цикла проверки очереди.")
         
@@ -145,13 +134,11 @@ async def check_and_send_notifications(bot: Bot, health_monitor: TaskHealthMonit
                     dialogue = None
                     candidate = None
                     vacancy = None
-
-                    # --- ИЗМЕНЁННЫЙ БЛОК КОДА: Теперь берем кандидата и его ПОСЛЕДНИЙ ОБНОВЛЕННЫЙ ДИАЛОГ ---
                     candidate_result = await db_session.execute(
                         select(Candidate)
                         .options(
                             selectinload(Candidate.dialogues).selectinload(Dialogue.vacancy),
-                            selectinload(Candidate.dialogues).selectinload(Dialogue.recruiter)    # И их вакансии
+                            selectinload(Candidate.dialogues).selectinload(Dialogue.recruiter)
                         )
                         .filter_by(id=task.candidate_id) # Фильтруем по candidate_id из задачи NotificationQueue
                     )
@@ -173,9 +160,7 @@ async def check_and_send_notifications(bot: Bot, health_monitor: TaskHealthMonit
 
                     dialogue = sorted_dialogues[0] # Берем самый свежий диалог
                     vacancy = dialogue.vacancy     # Вакансия, связанная с этим диалогом
-                    # --- КОНЕЦ ИЗМЕНЁННОГО БЛОКА КОДА ---
                     recruiter = dialogue.recruiter
-
 
                     # --- ПРОВЕРКА НАСТРОЕК РЕКРУТЕРА ---
                     if not recruiter or not recruiter.telegram_chat_id or not recruiter.topic_qualified_id:
@@ -183,7 +168,7 @@ async def check_and_send_notifications(bot: Bot, health_monitor: TaskHealthMonit
                             f"Для рекрутера {recruiter.name if recruiter else 'Unknown'} не настроен чат или топик 'qualified'. "
                             f"Уведомление {task.id} не может быть отправлено."
                         )
-                        task.status = 'skipped_no_chat' # Или error, как удобнее
+                        task.status = 'skipped_no_chat' 
                         await db_session.commit()
                         continue
                     
@@ -219,26 +204,21 @@ async def check_and_send_notifications(bot: Bot, health_monitor: TaskHealthMonit
                     chat_transcript_file = None
                     if dialogue.history:
                         formatted_history_lines = []
-                        # Улучшенная шапка
                         formatted_history_lines.append(f"=== ИСТОРИЯ ДИАЛОГА ===")
                         formatted_history_lines.append(f"ID отклика: {dialogue.hh_response_id}")
-                        # <<< НАЧАЛО НОВОГО БЛОКА >>>
                         if dialogue.response_created_at:
-                            # Конвертируем UTC время из БД в МСК
                             response_time_msk = dialogue.response_created_at.astimezone(SPB_TIMEZONE)
-                            # Форматируем в красивую строку
                             formatted_time_str = response_time_msk.strftime('%d.%m.%Y в %H:%M:%S')
                             formatted_history_lines.append(f"Время отклика (МСК): {formatted_time_str}")
-                        # <<< КОНЕЦ НОВОГО БЛОКА >>>
                         formatted_history_lines.append(f"Кандидат: {safe_masked_name}")
                         formatted_history_lines.append(f"Вакансия: {safe_vacancy_title}, {safe_city}")
                         formatted_history_lines.append("--------------------------------------------------")
-                        formatted_history_lines.append("") # Пустая строка после шапки для лучшего отделения
+                        formatted_history_lines.append("") 
 
                         for entry in dialogue.history:
                             role = entry.get('role')
                             content = entry.get('content')
-                            if not content:  # Пропускаем пустые сообщения
+                            if not content: 
                                 continue
 
                             if is_system_command(content):
@@ -404,14 +384,12 @@ async def check_and_send_inactive_alerts(bot: Bot, health_monitor: TaskHealthMon
                         formatted_history_lines = []
                         formatted_history_lines.append(f"=== ИСТОРИЯ ДИАЛОГА ===")
                         formatted_history_lines.append(f"ID отклика: {dialogue.hh_response_id}")
-                        # <<< НАЧАЛО НОВОГО БЛОКА >>>
                         if dialogue.response_created_at:
                             # Конвертируем UTC время из БД в МСК
                             response_time_msk = dialogue.response_created_at.astimezone(SPB_TIMEZONE)
                             # Форматируем в красивую строку
                             formatted_time_str = response_time_msk.strftime('%d.%m.%Y в %H:%M:%S')
                             formatted_history_lines.append(f"Время отклика (МСК): {formatted_time_str}")
-                        # <<< КОНЕЦ НОВОГО БЛОКА >>>
                         formatted_history_lines.append(f"Кандидат: {safe_masked_name}")
                         formatted_history_lines.append(f"Вакансия: {safe_vacancy_title}, {safe_city}")
                         formatted_history_lines.append("--------------------------------------------------")
@@ -558,7 +536,6 @@ async def check_and_send_rejected_alerts(bot: Bot, health_monitor: TaskHealthMon
                     
                     target_chat_id = recruiter.telegram_chat_id
                     target_thread_id = recruiter.topic_rejected_id
-                    # -----------------------------------
 
                     candidate = dialogue.candidate
                     vacancy = dialogue.vacancy
@@ -586,14 +563,12 @@ async def check_and_send_rejected_alerts(bot: Bot, health_monitor: TaskHealthMon
                         formatted_history_lines = []
                         formatted_history_lines.append(f"=== ИСТОРИЯ ДИАЛОГА ===")
                         formatted_history_lines.append(f"ID отклика: {dialogue.hh_response_id}")
-                        # <<< НАЧАЛО НОВОГО БЛОКА >>>
                         if dialogue.response_created_at:
                             # Конвертируем UTC время из БД в МСК
                             response_time_msk = dialogue.response_created_at.astimezone(SPB_TIMEZONE)
                             # Форматируем в красивую строку
                             formatted_time_str = response_time_msk.strftime('%d.%m.%Y в %H:%M:%S')
                             formatted_history_lines.append(f"Время отклика (МСК): {formatted_time_str}")
-                        # <<< КОНЕЦ НОВОГО БЛОКА >>>
                         formatted_history_lines.append(f"Кандидат: {safe_masked_name}")
                         formatted_history_lines.append(f"Вакансия: {safe_vacancy_title}, {safe_city}")
                         formatted_history_lines.append("--------------------------------------------------")
@@ -742,7 +717,6 @@ async def check_and_send_declined_interview_alerts(bot: Bot, health_monitor: Tas
                     
                     target_chat_id = recruiter.telegram_chat_id
                     target_thread_id = recruiter.topic_declined_interview_id
-                    # -----------------------------------
 
                     candidate = dialogue.candidate
                     vacancy = dialogue.vacancy
@@ -913,7 +887,6 @@ async def check_and_send_rescheduled_alerts(bot: Bot, health_monitor: TaskHealth
                     
                     target_chat_id = recruiter.telegram_chat_id
                     target_thread_id = recruiter.topic_rescheduled_id
-                    # -----------------------------------
 
                     candidate = dialogue.candidate
                     vacancy = dialogue.vacancy
@@ -1043,12 +1016,9 @@ async def run_history_cleanup_task(health_monitor: TaskHealthMonitor):
                     last_run_date = now_utc
             except Exception as e:
                 logger.error(f"Ошибка при очистке истории: {e}", exc_info=True)
-
-        # Спим короткими интервалами (например, 60 сек), 
-        # чтобы цикл прокручивался и обновлял heartbeat чаще, чем MAX_STUCK_TIME
         await asyncio.sleep(60)
 
-# --- КОНЕЦ ФУНКЦИИ ОЧИСТКИ ---
+
 
 
 
@@ -1073,11 +1043,7 @@ async def run_db_backup_task(health_monitor: TaskHealthMonitor):
             db_name = os.getenv("DB_NAME")
             # Для бекапа идем НАПРЯМУЮ к хосту, а не к контейнеру pgbouncer
             host = "host.docker.internal"
-            # ВАЖНО: укажи порт РЕАЛЬНОЙ базы (обычно 5432). 
-            # Если в .env DB_PORT=6432 (это пуллер), то здесь лучше жестко 5432 или завести отдельную переменную
             port = "5432" 
-            
-            # Подготовка окружения для пароля (самый надежный способ для pg_dump)
             env_vars = os.environ.copy()
             env_vars["PGPASSWORD"] = password
             
@@ -1143,7 +1109,6 @@ async def main():
         proxy_url = f"http://{user}:{password}@{host}:{port}"
         bot_session = AiohttpSession(proxy=proxy_url)
         logger.info(f"Telegram-бот запущен через прокси: {host}:{port}")
-    # -------------------------------------------
 
     bot = Bot(
         token=os.getenv("TELEGRAM_BOT_TOKEN"),
